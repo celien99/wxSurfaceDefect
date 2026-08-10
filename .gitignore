@@ -12,5 +12,5 @@ docs/superpowers/
 docs/plans/
 .cursor/
 *.egg-info/
-dataSets/
+/dataSets/
 results/

@@ -9,7 +9,6 @@ from easydict import EasyDict
 from hiad.checkpoints import begin_generation, publish_generation
 from hiad.constants import TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_THUMBNAIL
 from hiad.data import HRSample
-from hiad.data.preparation import prepared_source_session
 from hiad.preprocessing import (
     PREPROCESSING_DIRECTORY,
     PREPROCESSING_CONFIG_FILE,
@@ -219,7 +218,10 @@ class HRTrainer:
             runtime_config=preprocessing_config,
             logger=main_logger,
         )
-        with prepared_source_session(training_samples, preprocessors):
+        # Task 4 will stream via StreamingTaskDataset in workers.
+        # Full-image prepared_source_session residency has been removed.
+        preprocessors.release_gpu()
+        try:
             results = []
             process_pool = mp.Pool(processes=len(tasks_in_device))
             try:
@@ -252,6 +254,7 @@ class HRTrainer:
                 if message is not None:
                     main_logger.info(message)
 
+            # Task 5: collect_checkpoint_evidence must stream without open samples.
             calibration_evidence, scoring_identity = collect_checkpoint_evidence(
                 samples=training_samples,
                 gpu_ids=gpu_ids,
@@ -301,6 +304,8 @@ class HRTrainer:
                 )
             for warning in calibration["warnings"]:
                 main_logger.warning(f"Calibration warning: {warning}")
+        finally:
+            preprocessors.close()
 
         required_files = {
             "tasks.json",

@@ -1,6 +1,4 @@
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
 
 from hiad.constants import (
     SUPPORTED_TASK_TYPES,
@@ -8,7 +6,6 @@ from hiad.constants import (
     TASK_TYPE_THUMBNAIL,
 )
 from hiad.data import (
-    HRImage,
     HRSample,
     create_dynamic_patch,
     split_multiresolution_regions,
@@ -71,68 +68,11 @@ class PreparedInputRecord:
             raise ValueError("Dynamic records require positive valid_source_hw")
 
 
-def prepare_source_samples(samples, preprocessors, *, display_size=None) -> dict[str, dict[str, Any]]:
-    if not isinstance(samples, list) or not samples:
-        raise ValueError("Source preprocessing requires a non-empty sample list")
-    if preprocessors is None:
-        raise ValueError("preprocessors must not be None")
-    if any(not isinstance(sample, HRSample) for sample in samples):
-        raise TypeError("Every source sample must be an HRSample")
-
-    paths = [sample.image.image_path for sample in samples]
-    duplicates = sorted({path for path in paths if paths.count(path) > 1})
-    if duplicates:
-        raise ValueError(f"Duplicate source image path: {duplicates[0]}")
-
-    metadata = {}
-    prepared = []
-    try:
-        for sample in samples:
-            preprocessor = preprocessors.get(sample.clsname)
-            HRImage.bind_preprocessor(preprocessor)
-            try:
-                sample.image.open(sample.clsname)
-            finally:
-                HRImage.clear_preprocessor()
-            prepared.append(sample)
-            sample.image.share_memory_()
-            entry = {"image_size": sample.image.size()}
-            if display_size is not None:
-                entry["display_image"] = preprocessor.inverse_normalize(
-                    sample.image.image,
-                    output_size=display_size,
-                )
-            metadata[sample.image.image_path] = entry
-    except Exception:
-        for sample in prepared:
-            sample.image.close()
-        raise
-    return metadata
-
-
-def close_prepared_sources(samples) -> None:
-    for sample in samples:
-        sample.image.close()
-
-
-@contextmanager
-def prepared_source_session(samples, preprocessors, *, display_size=None):
-    try:
-        metadata = prepare_source_samples(
-            samples,
-            preprocessors,
-            display_size=display_size,
-        )
-        preprocessors.release_gpu()
-        yield metadata
-    finally:
-        try:
-            preprocessors.close()
-        finally:
-            close_prepared_sources(samples)
-
-
 def build_task_inputs_from_open_samples(samples, tasks, *, logger=None):
+    """Transitional helper for Task 4/5 callers that still expect open samples.
+
+    Prefer ``StreamingTaskDataset`` for new training/inference paths.
+    """
     if not isinstance(samples, list) or not samples:
         raise ValueError("Task input creation requires a non-empty sample list")
     if not isinstance(tasks, list) or not tasks:
