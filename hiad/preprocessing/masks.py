@@ -74,6 +74,8 @@ def validate_warped_mask(
     warped_mask: np.ndarray,
     reference_mask: np.ndarray,
     config: Mapping[str, Any],
+    *,
+    affine_abs_det: float,
 ) -> tuple[np.ndarray, dict[str, float]]:
     metrics: dict[str, float] = {}
 
@@ -89,6 +91,13 @@ def validate_warped_mask(
         or reference_mask.ndim != 2
     ):
         reject("invalid_gate_mask_geometry")
+    if (
+        isinstance(affine_abs_det, bool)
+        or not isinstance(affine_abs_det, (int, float))
+        or not math.isfinite(float(affine_abs_det))
+        or float(affine_abs_det) <= 0
+    ):
+        reject("invalid_affine_abs_det")
 
     image_height, image_width = warped_mask.shape
     warped_area = int(np.count_nonzero(warped_mask))
@@ -96,8 +105,13 @@ def validate_warped_mask(
     if warped_area == 0 or reference_area == 0:
         reject("zero_area_gate_mask")
 
-    # Area ratio vs reference mask (warped/reference may differ in spatial size).
-    reference_coverage = warped_area / reference_area
+    # Scale-normalize: expected input area ≈ reference_area * |det(A[:2,:2])|.
+    abs_det = float(affine_abs_det)
+    expected_input_area = reference_area * abs_det
+    metrics["affine_abs_det"] = abs_det
+    metrics["expected_input_area"] = float(expected_input_area)
+
+    reference_coverage = warped_area / expected_input_area
     if not math.isfinite(reference_coverage):
         reject("nonfinite_reference_coverage")
     metrics["reference_coverage"] = float(reference_coverage)

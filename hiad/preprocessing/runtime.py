@@ -143,6 +143,7 @@ class ForegroundPreprocessor:
                 warped_mask,
                 self.reference_mask,
                 self.config,
+                affine_abs_det=float(metrics["affine_abs_det"]),
             )
             metrics.update(mask_metrics)
             return cleaned_mask

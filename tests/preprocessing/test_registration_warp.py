@@ -34,7 +34,7 @@ def test_register_and_warp_mask_rejects_empty_matches(monkeypatch):
             [[8.0, 8.0], [24.0, 8.0], [8.0, 24.0], [24.0, 24.0]],
         ),
     }
-    # Background prototype aligns with features; foreground is opposite → no FG matches.
+    # Background prototype aligns with features; foreground is opposite -> no FG matches.
     prototypes = {
         "foreground": F.normalize(-torch.ones(8), dim=0),
         "background": F.normalize(torch.ones(8), dim=0),
@@ -53,5 +53,4 @@ def test_register_and_warp_mask_rejects_empty_matches(monkeypatch):
             device=device,
         )
 
-    message = str(exc_info.value).lower()
-    assert "insufficient" in message or "reason" in message or "match" in message
+    assert str(exc_info.value) == "insufficient_dino_matches"

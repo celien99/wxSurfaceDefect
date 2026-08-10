@@ -105,6 +105,7 @@ def register_and_warp_mask(
         np.float64
     ).eps:
         reject("singular_affine")
+    metrics["affine_abs_det"] = float(abs(linear_determinant))
 
     inliers = np.asarray(inlier_mask).reshape(-1).astype(bool, copy=False)
     if inliers.shape != (match_count,):
