@@ -9,4 +9,8 @@ __pycache__/
 .worktrees/
 docs/.superpowers/
 docs/superpowers/
+docs/plans/
 .cursor/
+*.egg-info/
+dataSets/
+results/
