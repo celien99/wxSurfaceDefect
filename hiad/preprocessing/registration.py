@@ -87,7 +87,11 @@ def generate_registration_prompts(
     if match_count < config["min_dino_matches"]:
         return reject("insufficient_dino_matches")
 
-    reference_foreground_indices = torch.flatnonzero(foreground_cells)
+    # torch has no flatnonzero; match numpy.flatnonzero semantics.
+    reference_foreground_indices = torch.nonzero(
+        foreground_cells.reshape(-1),
+        as_tuple=True,
+    )[0]
     reference_points = template["centers_xy"][
         reference_foreground_indices[matched_reference_indices]
     ].numpy()

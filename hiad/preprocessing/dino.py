@@ -58,7 +58,13 @@ def extract_dino_grid(
         encoder.patch_size,
     )
 
-    source_tensor = torch.from_numpy(source).permute(2, 0, 1).unsqueeze(0).float()
+    # Copy so from_numpy yields a writable tensor (OpenCV/read-only views warn otherwise).
+    source_tensor = (
+        torch.from_numpy(np.array(source, copy=True, order="C"))
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+    )
     source_tensor.div_(config["input_scale"])
     resized = F.interpolate(
         source_tensor,
