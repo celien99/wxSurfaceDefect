@@ -17,7 +17,9 @@ from hiad.preprocessing import (
     PROTOTYPES_FILE,
     REFERENCE_MASK_FILE,
     REFERENCE_TEMPLATE_FILE,
+    ForegroundPreprocessorRegistry,
     calibrate_preprocessing_registry,
+    filter_registerable_samples,
     validate_preprocessing_registry,
 )
 from hiad.runtime.devices import validate_gpu_ids
@@ -181,6 +183,29 @@ class HRTrainer:
         validate_preprocessing_registry(
             str(generation_root),
             runtime_config=preprocessing_config,
+        )
+
+        filter_device = torch.device(f"cuda:{gpu_ids[0]}")
+        filter_preprocessors = ForegroundPreprocessorRegistry.from_checkpoint(
+            str(generation_root),
+            filter_device,
+            runtime_config=preprocessing_config,
+            logger=main_logger,
+        )
+        try:
+            training_samples = filter_registerable_samples(
+                training_samples,
+                filter_preprocessors,
+                logger=main_logger,
+            )
+        finally:
+            filter_preprocessors.close()
+
+        categories = tuple(sorted({sample.clsname for sample in training_samples}))
+        main_logger.info(
+            "Samples after registration filter: "
+            f"training_and_calibration={len(training_samples)}, "
+            f"categories={list(categories)}"
         )
 
         tasks_save_path = os.path.join(generation_root, "tasks.json")

@@ -12,6 +12,7 @@ from .constants import (
     REFERENCE_MASK_FILE,
     REFERENCE_TEMPLATE_FILE,
 )
+from .filtering import filter_registerable_samples
 from .registry import ForegroundPreprocessorRegistry
 from .runtime import ForegroundPreprocessor
 
@@ -19,6 +20,7 @@ __all__ = [
     "ForegroundPreprocessor",
     "ForegroundPreprocessorRegistry",
     "calibrate_preprocessing_registry",
+    "filter_registerable_samples",
     "validate_preprocessing_bundle",
     "validate_preprocessing_registry",
     "canonicalize_preprocessing_config",
