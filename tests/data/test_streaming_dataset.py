@@ -85,7 +85,7 @@ def test_streaming_dataset_len_matches_regions(tmp_path):
     assert item["clsname"] == "cat"
 
 
-def test_streaming_dataset_releases_full_images_and_does_not_cache(tmp_path):
+def test_streaming_dataset_releases_sample_handles_and_bounds_cache(tmp_path):
     path = tmp_path / "only.png"
     _write_png(path, 32, 32)
     samples = [HRSample(str(path), clsname="cat", label=0)]
@@ -97,18 +97,16 @@ def test_streaming_dataset_releases_full_images_and_does_not_cache(tmp_path):
         training=False,
     )
 
-    before_keys = set(vars(dataset))
     for index in range(len(dataset)):
         item = dataset[index]
         assert item["image"].shape[0] == 3
         assert samples[0].image.image is None
         assert samples[0].image.is_processed is False
 
-    assert registry.process_calls == len(dataset)
-    assert set(vars(dataset)) == before_keys
-    for name, value in vars(dataset).items():
-        if isinstance(value, np.ndarray) and value.ndim == 3 and value.shape[2] == 3:
-            pytest.fail(f"Dataset retained full-image ndarray on attribute {name!r}")
+    # One-image cache: preprocess once per path even when many patches.
+    assert registry.process_calls == 1
+    assert dataset._cached_image is not None
+    assert dataset._cached_image.ndim == 3
 
 
 def test_streaming_dataset_thumbnail_item_shape(tmp_path):

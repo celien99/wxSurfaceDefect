@@ -4,7 +4,7 @@ import torch
 import torch.multiprocessing as mp
 
 from hiad.detectors.config import detector_config_for_task
-from hiad.data.preparation import build_task_inputs_from_open_samples
+from hiad.preprocessing import ForegroundPreprocessorRegistry
 from hiad.runtime.evidence import collect_task_evidence
 from hiad.runtime.logging import create_logger
 from hiad.runtime.partition import round_robin_partition
@@ -31,9 +31,14 @@ def _collect_checkpoint_evidence_in_device(
         f"calibration_logger_device{gpu_id}",
         os.path.join(log_root, f"calibration_log_device{gpu_id}.log"),
     )
-    task_inputs, image_metadata = build_task_inputs_from_open_samples(
-        samples,
-        tasks,
+    preprocessing_config = getattr(config, "preprocessing", None)
+    if preprocessing_config is None:
+        raise ValueError("Calibration worker requires preprocessing config")
+
+    preprocessors = ForegroundPreprocessorRegistry.from_checkpoint(
+        str(checkpoint_root),
+        device,
+        runtime_config=preprocessing_config,
         logger=logger,
     )
 
@@ -58,14 +63,17 @@ def _collect_checkpoint_evidence_in_device(
         detector.to_device(torch.device("cpu"))
         torch.cuda.empty_cache()
 
-    return collect_task_evidence(
-        task_inputs,
-        image_metadata,
-        tasks,
-        detector_provider,
-        batch_size,
-        detector_releaser=detector_releaser,
-    )
+    try:
+        return collect_task_evidence(
+            samples,
+            tasks,
+            preprocessors,
+            detector_provider,
+            batch_size,
+            detector_releaser=detector_releaser,
+        )
+    finally:
+        preprocessors.close()
 
 
 def collect_checkpoint_evidence(

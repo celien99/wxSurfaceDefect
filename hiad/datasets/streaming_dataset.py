@@ -48,6 +48,10 @@ class StreamingTaskDataset(Dataset):
         self.training = training
         self._entries: list[tuple[int, Any]] = []
         self.records: list[PreparedInputRecord] = []
+        # At most one preprocessed full image is retained between consecutive
+        # patches from the same path (bounded memory, avoids N× DINO cost).
+        self._cached_path: str | None = None
+        self._cached_image: numpy.ndarray | None = None
         self._build_index()
 
     @staticmethod
@@ -132,14 +136,12 @@ class StreamingTaskDataset(Dataset):
     def __len__(self) -> int:
         return len(self._entries)
 
-    def __getitem__(self, index: int) -> dict:
-        sample_index, region = self._entries[index]
-        sample = self.samples[sample_index]
+    def _processed_image(self, sample: HRSample) -> numpy.ndarray:
+        path = sample.image.image_path
+        if self._cached_path == path and self._cached_image is not None:
+            return self._cached_image
         preprocessor = self.preprocessor_registry.get(sample.clsname)
-        image_array = preprocessor.process_file(
-            sample.image.image_path,
-            sample.clsname,
-        )
+        image_array = preprocessor.process_file(path, sample.clsname)
         if (
             not isinstance(image_array, numpy.ndarray)
             or image_array.dtype != numpy.float32
@@ -148,6 +150,14 @@ class StreamingTaskDataset(Dataset):
             or not numpy.isfinite(image_array).all()
         ):
             raise ValueError("process_file must return finite HWC float32 RGB")
+        self._cached_path = path
+        self._cached_image = image_array
+        return image_array
+
+    def __getitem__(self, index: int) -> dict:
+        sample_index, region = self._entries[index]
+        sample = self.samples[sample_index]
+        image_array = self._processed_image(sample)
 
         sample.image.image = image_array
         sample.image._is_processed = True
@@ -165,6 +175,9 @@ class StreamingTaskDataset(Dataset):
                 task_name=self.task["name"],
             )[0]
         finally:
-            sample.image.close()
+            # Detach without freeing the one-image cache; clear sample handle only.
+            sample.image.image = None
+            sample.image._is_processed = False
+            sample.image._shared_tensor = None
             if sample.mask is not None:
                 sample.mask.close()

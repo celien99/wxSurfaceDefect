@@ -8,10 +8,9 @@ from easydict import EasyDict
 from tqdm import tqdm
 
 from hiad.constants import TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_THUMBNAIL
-from hiad.data import HRImage, HRSample
+from hiad.data import HRSample
 from hiad.inferencer.modelmanager import ModelManager
 from hiad.checkpoints import resolve_current_generation
-from hiad.data.preparation import build_task_inputs_from_open_samples
 from hiad.preprocessing import (
     ForegroundPreprocessorRegistry,
     validate_preprocessing_registry,
@@ -29,19 +28,15 @@ from hiad.scoring import (
 from hiad.task import load_tasks
 
 
-def inference_in_device(test_samples, tasks, model_manager, batch_size):
-    task_inputs, image_metadata = build_task_inputs_from_open_samples(
-        test_samples,
-        tasks,
-    )
+def inference_in_device(test_samples, tasks, model_manager, batch_size, preprocessors):
     sorted_names = (
         model_manager.get_device_task_names(gpu=True)
         + model_manager.get_device_task_names(gpu=False)
     )
     device_results, _ = collect_task_evidence(
-        task_inputs,
-        image_metadata,
+        test_samples,
         tasks,
+        preprocessors,
         lambda task: model_manager.get_detector(task["name"]),
         batch_size,
         task_names=sorted_names,
@@ -162,15 +157,9 @@ class HRInferencer:
         self._inference_lock = Lock()
         self._closed = False
 
-    def _prepare_samples(
-        self,
-        test_samples: List[HRSample],
-        *,
-        display_size=None,
-    ):
+    def _validate_samples(self, test_samples: List[HRSample]) -> None:
         if not isinstance(test_samples, list) or not test_samples:
             raise ValueError("test_samples must be a non-empty list")
-
         for sample in test_samples:
             if not isinstance(sample, HRSample):
                 raise TypeError("Every test sample must be an HRSample")
@@ -183,119 +172,56 @@ class HRInferencer:
             if sample.mask is not None:
                 raise ValueError("Local inference does not accept mask images")
 
-        resident_task_names = [
-            manager.get_device_task_names(gpu=True)
-            for manager in self.model_managers
-        ]
-        owned_image_indexes = []
+    def _build_display_images(self, test_samples: List[HRSample], display_size):
         display_images = {}
-
-        try:
-            for manager, expected_task_names in zip(
-                self.model_managers,
-                resident_task_names,
-            ):
-                offloaded_task_names = manager.offload_all()
-                if offloaded_task_names != expected_task_names:
-                    raise RuntimeError("Detector GPU residency changed during offload")
-
-            for sample_index, sample in enumerate(test_samples):
-                image = sample.image
-                preprocessor = self.preprocessors.get(sample.clsname)
-                HRImage.bind_preprocessor(preprocessor)
-                try:
-                    if image.image is None:
-                        sample.open()
-                        owned_image_indexes.append(sample_index)
-                    elif not image.is_processed:
-                        raw_image = image.image
-                        image.set_image(raw_image, sample.clsname)
-                        owned_image_indexes.append(sample_index)
-
-                    if display_size is not None:
-                        display_images[image.image_path] = (
-                            preprocessor.inverse_normalize(
-                                image.image,
-                                output_size=display_size,
-                            )
-                        )
-                    image.share_memory_()
-                finally:
-                    HRImage.clear_preprocessor()
-        except Exception:
-            for sample_index in owned_image_indexes:
-                test_samples[sample_index].image.close()
-            raise
-        finally:
-            cleanup_error = None
-            try:
-                self.preprocessors.release_gpu()
-            except Exception as error:
-                cleanup_error = error
-            HRImage.clear_preprocessor()
-
-            for manager, task_names in zip(
-                self.model_managers,
-                resident_task_names,
-            ):
-                try:
-                    manager.restore_gpu_tasks(task_names)
-                except Exception as error:
-                    if cleanup_error is None:
-                        cleanup_error = error
-
-            if cleanup_error is not None:
-                for sample_index in owned_image_indexes:
-                    test_samples[sample_index].image.close()
-                raise cleanup_error
-
-        return test_samples, owned_image_indexes, display_images
-
-    def _inference_prepared(self, prepared_samples: List[HRSample]):
-        if self._closed:
-            raise RuntimeError("HRInferencer is closed")
-        batch_size = self.batch_size or len(prepared_samples)
-        pending_results = [
-            self._executor.submit(
-                inference_in_device,
-                prepared_samples,
-                tasks,
-                model_manager,
-                batch_size,
+        for sample in test_samples:
+            preprocessor = self.preprocessors.get(sample.clsname)
+            processed = preprocessor.process_file(
+                sample.image.image_path,
+                sample.clsname,
             )
-            for model_manager, tasks in zip(
-                self.model_managers,
-                self.tasks_in_devices,
+            display_images[sample.image.image_path] = preprocessor.inverse_normalize(
+                processed,
+                output_size=display_size,
             )
-        ]
-
-        wait(pending_results)
-        worker_results = [pending_result.result() for pending_result in pending_results]
-        image_paths = [sample.image.image_path for sample in prepared_samples]
-        evidence_by_path = merge_worker_evidence(worker_results, image_paths)
-        return build_batch_output(
-            evidence_by_path,
-            image_paths,
-            self.scorer,
-            self.calibration,
-        )
+        return display_images
 
     def inference(self, test_samples: List[HRSample], *, display_size=None):
         with self._inference_lock:
             if self._closed:
                 raise RuntimeError("HRInferencer is closed")
-            prepared_samples, owned_image_indexes, display_images = self._prepare_samples(
-                test_samples,
-                display_size=display_size,
+            self._validate_samples(test_samples)
+            batch_size = self.batch_size or len(test_samples)
+            pending_results = [
+                self._executor.submit(
+                    inference_in_device,
+                    test_samples,
+                    tasks,
+                    model_manager,
+                    batch_size,
+                    self.preprocessors,
+                )
+                for model_manager, tasks in zip(
+                    self.model_managers,
+                    self.tasks_in_devices,
+                )
+            ]
+            wait(pending_results)
+            worker_results = [pending_result.result() for pending_result in pending_results]
+            image_paths = [sample.image.image_path for sample in test_samples]
+            evidence_by_path = merge_worker_evidence(worker_results, image_paths)
+            result = build_batch_output(
+                evidence_by_path,
+                image_paths,
+                self.scorer,
+                self.calibration,
             )
-            try:
-                result = self._inference_prepared(prepared_samples)
-                if display_size is not None:
-                    result["display_images"] = display_images
-                return result
-            finally:
-                for sample_index in owned_image_indexes:
-                    prepared_samples[sample_index].image.close()
+            if display_size is not None:
+                result["display_images"] = self._build_display_images(
+                    test_samples,
+                    display_size,
+                )
+            return result
 
     def close(self) -> None:
         with self._inference_lock:

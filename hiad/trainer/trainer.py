@@ -17,7 +17,6 @@ from hiad.preprocessing import (
     PROTOTYPES_FILE,
     REFERENCE_MASK_FILE,
     REFERENCE_TEMPLATE_FILE,
-    ForegroundPreprocessorRegistry,
     calibrate_preprocessing_registry,
     validate_preprocessing_registry,
 )
@@ -212,100 +211,87 @@ class HRTrainer:
             if task_group
         ]
 
-        preprocessors = ForegroundPreprocessorRegistry.from_checkpoint(
-            str(generation_root),
-            torch.device(f"cuda:{gpu_ids[0]}"),
-            runtime_config=preprocessing_config,
-            logger=main_logger,
-        )
-        # Task 4 will stream via StreamingTaskDataset in workers.
-        # Full-image prepared_source_session residency has been removed.
-        preprocessors.release_gpu()
+        results = []
+        process_pool = mp.Pool(processes=len(tasks_in_device))
         try:
-            results = []
-            process_pool = mp.Pool(processes=len(tasks_in_device))
-            try:
-                for gpu_id, task_group in zip(gpu_ids, tasks_in_device):
-                    results.append(
-                        process_pool.apply_async(
-                            train_tasks_in_device,
-                            args=(
-                                gpu_id,
-                                self.detector_class,
-                                self.config,
-                                training_samples,
-                                task_group,
-                                self.batch_size,
-                                str(generation_root),
-                                self.log_root,
-                                self.seed,
-                                self.fusion_weights,
-                            ),
-                        )
+            for gpu_id, task_group in zip(gpu_ids, tasks_in_device):
+                results.append(
+                    process_pool.apply_async(
+                        train_tasks_in_device,
+                        args=(
+                            gpu_id,
+                            self.detector_class,
+                            self.config,
+                            training_samples,
+                            task_group,
+                            self.batch_size,
+                            str(generation_root),
+                            self.log_root,
+                            self.seed,
+                            self.fusion_weights,
+                        ),
                     )
-                process_pool.close()
-                process_pool.join()
-            except Exception:
-                process_pool.terminate()
-                process_pool.join()
-                raise
-            for result in results:
-                message = result.get()
-                if message is not None:
-                    main_logger.info(message)
+                )
+            process_pool.close()
+            process_pool.join()
+        except Exception:
+            process_pool.terminate()
+            process_pool.join()
+            raise
+        for result in results:
+            message = result.get()
+            if message is not None:
+                main_logger.info(message)
 
-            # Task 5: collect_checkpoint_evidence must stream without open samples.
-            calibration_evidence, scoring_identity = collect_checkpoint_evidence(
-                samples=training_samples,
-                gpu_ids=gpu_ids,
-                tasks=self.tasks,
-                detector_class=self.detector_class,
-                config=self.config,
-                batch_size=self.batch_size,
-                checkpoint_root=generation_root,
-                log_root=self.log_root,
-                seed=self.seed,
+        calibration_evidence, scoring_identity = collect_checkpoint_evidence(
+            samples=training_samples,
+            gpu_ids=gpu_ids,
+            tasks=self.tasks,
+            detector_class=self.detector_class,
+            config=self.config,
+            batch_size=self.batch_size,
+            checkpoint_root=generation_root,
+            log_root=self.log_root,
+            seed=self.seed,
+        )
+        checkpoint_scoring_config = MultiRiskConfig.from_runtime(
+            self.config.scoring,
+            self.tasks,
+            anomaly_distance=scoring_identity["anomaly_distance"],
+            use_fp16=scoring_identity["use_fp16"],
+            fusion_weights=scoring_identity["fusion_weights"],
+        )
+        if checkpoint_scoring_config.fingerprint != self.scoring_config.fingerprint:
+            raise ValueError(
+                "Trained dynamic checkpoint identity differs from the scoring configuration"
             )
-            checkpoint_scoring_config = MultiRiskConfig.from_runtime(
-                self.config.scoring,
-                self.tasks,
-                anomaly_distance=scoring_identity["anomaly_distance"],
-                use_fp16=scoring_identity["use_fp16"],
-                fusion_weights=scoring_identity["fusion_weights"],
-            )
-            if checkpoint_scoring_config.fingerprint != self.scoring_config.fingerprint:
-                raise ValueError(
-                    "Trained dynamic checkpoint identity differs from the scoring configuration"
-                )
-            self.scoring_config = checkpoint_scoring_config
-            calibration_paths = [
-                sample.image.image_path for sample in training_samples
-            ]
-            scorer = MultiRiskScorer(self.scoring_config)
-            raw_scores = score_batch_evidence(
-                calibration_evidence,
-                calibration_paths,
-                scorer,
-            )
-            calibration = build_calibration(raw_scores, self.scoring_config)
-            save_calibration(calibration, generation_root)
+        self.scoring_config = checkpoint_scoring_config
+        calibration_paths = [
+            sample.image.image_path for sample in training_samples
+        ]
+        scorer = MultiRiskScorer(self.scoring_config)
+        raw_scores = score_batch_evidence(
+            calibration_evidence,
+            calibration_paths,
+            scorer,
+        )
+        calibration = build_calibration(raw_scores, self.scoring_config)
+        save_calibration(calibration, generation_root)
+        main_logger.info(
+            "Multi-risk calibration complete: "
+            f"domain={MULTIRISK_CALIBRATION_DOMAIN}, "
+            f"normal_images={calibration['normal_image_count']}, "
+            f"decision_percentile={calibration['decision_percentile']:.4f}, "
+            f"fingerprint={calibration['scoring_config_sha256']}"
+        )
+        for key, diagnostic in calibration["raw_diagnostics"].items():
             main_logger.info(
-                "Multi-risk calibration complete: "
-                f"domain={MULTIRISK_CALIBRATION_DOMAIN}, "
-                f"normal_images={calibration['normal_image_count']}, "
-                f"decision_percentile={calibration['decision_percentile']:.4f}, "
-                f"fingerprint={calibration['scoring_config_sha256']}"
+                f"Raw calibration {key}: "
+                f"count={diagnostic['count']}, "
+                f"p99.9={diagnostic['p99_9']:.6f}"
             )
-            for key, diagnostic in calibration["raw_diagnostics"].items():
-                main_logger.info(
-                    f"Raw calibration {key}: "
-                    f"count={diagnostic['count']}, "
-                    f"p99.9={diagnostic['p99_9']:.6f}"
-                )
-            for warning in calibration["warnings"]:
-                main_logger.warning(f"Calibration warning: {warning}")
-        finally:
-            preprocessors.close()
+        for warning in calibration["warnings"]:
+            main_logger.warning(f"Calibration warning: {warning}")
 
         required_files = {
             "tasks.json",

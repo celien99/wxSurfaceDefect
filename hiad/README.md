@@ -42,7 +42,9 @@ HiAD 要求 Python 3.10 或更高版本。训练和当前推理流程需要 CUDA
 python -m pip install -e .
 ```
 
-主要依赖包括 PyTorch、timm、Transformers、OpenCV、NumPy、scikit-learn 和 scikit-image，完整声明见 [`pyproject.toml`](../pyproject.toml)。DINOv3 和 SAM2 权重首次使用时由 timm/Transformers 解析；离线环境需要提前缓存对应权重。
+主要依赖包括 PyTorch、timm、OpenCV、NumPy、scikit-learn 和 scikit-image，完整声明见 [`pyproject.toml`](../pyproject.toml)。DINOv3 权重首次使用时由 timm 解析；离线环境需要提前缓存对应权重。
+
+训练与推理按图流式预处理（DINO 配准后 warp 参考 mask），不再把全部图像驻留进共享内存，也不再依赖 SAM2。
 
 ## 快速开始
 
@@ -393,12 +395,16 @@ hiad/
 │   ├── artifacts.py                  # 参考资产、RLE、哈希和 bundle 校验/加载
 │   ├── calibration.py                # 生成前景原型、模板、参考 mask 和 manifest
 │   ├── dino.py                       # 冻结 DINO 编码器创建和特征网格提取
-│   ├── sam.py                        # SAM2 加载、批处理和 mask 预测
-│   ├── registration.py               # DINO 对应、几何注册和 SAM prompt 生成
-│   ├── masks.py                      # 前景 mask 清理、拓扑和质量门控
+│   ├── registration.py               # DINO 对应、几何注册与参考 mask warp
+│   ├── masks.py                      # warped mask 清理与面积门控
 │   ├── images.py                     # 图像格式校验、归一化和逆归一化
 │   ├── registry.py                   # 按 clsname 延迟加载和释放前景预处理器
 │   └── runtime.py                    # ForegroundPreprocessor 生命周期和推理入口
+│
+├── datasets/                         # 训练/推理 Dataset
+│   ├── __init__.py
+│   ├── patch_dataset.py              # LRPatch 列表 Dataset
+│   └── streaming_dataset.py          # 按需读图/预处理/切块 Dataset
 │
 ├── task/                             # 高分辨率 task 协议
 │   ├── __init__.py                   # task 公共导出
@@ -467,11 +473,12 @@ hiad/
 
 1. **DINO 始终冻结。** `TimmDinoV3Encoder` 会关闭梯度并保持 eval 模式，预处理与 detector 都只将其作为特征提取器。
 2. **统一训练与全局校准。** 所有 `train_uni.jsonl` 正常记录先参与共享权重训练，再共同建立全局校准；`test_uni.jsonl` 只用于本地评估。
-3. **推理输入不携带 mask。** Ground Truth mask 只能传给 `HREvaluator`。
-4. **配置身份必须一致。** DINO backbone、`use_fp16`、异常距离、融合权重和评分配置均会参与产物验证或校准指纹。
-5. **不要绕过 generation。** `HRInferencer` 应接收包含 `current.json` 的共享 checkpoint 根目录，而不是直接指向某个权重文件。
-6. **显存按阶段管理。** 预处理模型和 detector 会顺序使用 GPU；训练 worker 在 task 间释放 detector，推理器通过 `ModelManager` 管理驻留模型数量。
-7. **源图坐标保持一致。** 局部窗口可填充或缩放到模型尺寸，但最终异常图和候选位置会映射回原图坐标系。
+3. **流式数据，禁止全量驻留。** 训练/校准/推理通过 `StreamingTaskDataset` 按需读图；不对整集做 `share_memory_`。
+4. **每视野一张参考 mask。** 预处理用 DINO 配准后 warp 参考 mask，不再使用 SAM2。
+5. **推理输入不携带 mask。** Ground Truth mask 只能传给 `HREvaluator`。
+6. **配置身份必须一致。** DINO backbone、`use_fp16`、异常距离、融合权重和评分配置均会参与产物验证或校准指纹。
+7. **不要绕过 generation。** `HRInferencer` 应接收包含 `current.json` 的共享 checkpoint 根目录，而不是直接指向某个权重文件。
+8. **源图坐标保持一致。** 局部窗口可填充或缩放到模型尺寸，但最终异常图和候选位置会映射回原图坐标系。
 
 ## 进一步阅读
 
