@@ -7,7 +7,6 @@ PREPROCESSING_MANIFEST_FILE = "preprocessing_manifest.json"
 PROTOTYPES_FILE = "foreground_prototypes.pt"
 REFERENCE_TEMPLATE_FILE = "reference_feature_template.pt"
 REFERENCE_MASK_FILE = "reference_foreground.rle"
-MAX_SAM_POSITIVE_POINTS = 16
 
 CONFIG_KEYS = (
     "schema_version",

@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
-from transformers import Sam2Model, Sam2Processor
 
 from hiad.models import TimmDinoV3Encoder
 
@@ -25,9 +24,8 @@ from .images import (
     normalize_with_foreground,
     validate_image_array,
 )
-from .masks import MaskRejected, validate_and_clean_mask
-from .registration import generate_registration_prompts
-from .sam import load_sam2_components, run_sam2, sam2_longest_edge
+from .masks import MaskRejected, validate_warped_mask
+from .registration import register_and_warp_mask
 
 
 class ForegroundPreprocessor:
@@ -50,11 +48,6 @@ class ForegroundPreprocessor:
         self.template = dict(template)
         self.reference_mask = reference_mask
         self.dino_encoder: TimmDinoV3Encoder | None = None
-        self.sam2_model: Sam2Model | None = None
-        self.sam2_processor: Sam2Processor | None = None
-        self.sam2_torch_dtype = (
-            torch.float16 if self.config["sam2_dtype"] == "float16" else torch.float32
-        )
         self._closed = False
 
     @classmethod
@@ -84,7 +77,6 @@ class ForegroundPreprocessor:
         if eager_runtime_load:
             try:
                 instance._ensure_dino()
-                instance._ensure_sam2()
             except Exception:
                 instance.close()
                 raise
@@ -107,22 +99,6 @@ class ForegroundPreprocessor:
         self.dino_encoder.requires_grad_(False)
         self.dino_encoder.eval()
         return self.dino_encoder
-
-    def _ensure_sam2(self) -> tuple[Sam2Model, Sam2Processor]:
-        self._ensure_open()
-        if self.sam2_model is None or self.sam2_processor is None:
-            model, processor = load_sam2_components(self.config["sam2_model_id"])
-            if sam2_longest_edge(processor) != self.template["working_longest_edge"]:
-                raise ValueError("Loaded SAM2 processor size does not match preprocessing bundle")
-            revision = getattr(model.config, "_commit_hash", None)
-            if revision != self.manifest["sam2"]["revision"]:
-                raise ValueError("Loaded SAM2 revision does not match preprocessing bundle")
-            weights_hash = sha256_state_dict(model.state_dict())
-            if weights_hash != self.manifest["sam2"]["weights_sha256"]:
-                raise ValueError("Loaded SAM2 weights do not match preprocessing bundle")
-            self.sam2_processor = processor
-            self.sam2_model = model
-        return self.sam2_model, self.sam2_processor
 
     def _validate_dino_metrics(self, metrics: Mapping[str, Any]) -> None:
         required_dino_metrics = ("match_count", "inlier_ratio", "reprojection_ratio")
@@ -148,44 +124,24 @@ class ForegroundPreprocessor:
             raise MaskRejected("dino_reprojection_ratio_above_threshold")
 
     def _effective_mask(self, rgb: np.ndarray, source_identity: str) -> np.ndarray:
-        image_height, image_width = rgb.shape[:2]
         metrics: dict[str, Any] = {}
         try:
-            box_xyxy, positive_points_xy, warped_prior, dino_metrics = (
-                generate_registration_prompts(
-                    rgb,
-                    encoder=self._ensure_dino(),
-                    prototypes=self.prototypes,
-                    template=self.template,
-                    reference_mask=self.reference_mask,
-                    config=self.config,
-                    device=self.device,
-                )
+            warped_mask, dino_metrics = register_and_warp_mask(
+                rgb,
+                encoder=self._ensure_dino(),
+                prototypes=self.prototypes,
+                template=self.template,
+                reference_mask=self.reference_mask,
+                config=self.config,
+                device=self.device,
             )
             metrics.update(dino_metrics)
-            prompt_reason = metrics.pop("reason", None)
-            if prompt_reason is not None:
-                raise MaskRejected(str(prompt_reason))
-            if box_xyxy is None or positive_points_xy is None or warped_prior is None:
-                raise MaskRejected("missing_dino_prompts")
+            metrics.pop("reason", None)
             self._validate_dino_metrics(metrics)
 
-            model, processor = self._ensure_sam2()
-            runtime_dtype = (
-                self.sam2_torch_dtype if self.device.type == "cuda" else torch.float32
-            )
-            sam_mask = run_sam2(
-                rgb,
-                box_xyxy,
-                positive_points_xy,
-                model=model,
-                processor=processor,
-                device=self.device,
-                runtime_dtype=runtime_dtype,
-            )
-            cleaned_mask, mask_metrics = validate_and_clean_mask(
-                sam_mask,
-                warped_prior,
+            cleaned_mask, mask_metrics = validate_warped_mask(
+                warped_mask,
+                self.reference_mask,
                 self.config,
             )
             metrics.update(mask_metrics)
@@ -204,7 +160,6 @@ class ForegroundPreprocessor:
                         {
                             "category": self.category,
                             "event": "foreground_mask_rejected",
-                            "fallback": "full_image",
                             "metrics": finite_metrics,
                             "reason": str(error),
                             "source": str(source_identity),
@@ -213,7 +168,7 @@ class ForegroundPreprocessor:
                         separators=(",", ":"),
                     )
                 )
-            return np.ones((image_height, image_width), dtype=np.bool_)
+            raise
 
     def _process_rgb(self, rgb: np.ndarray, source_identity: str) -> np.ndarray:
         effective_mask = self._effective_mask(rgb, source_identity)
@@ -272,8 +227,6 @@ class ForegroundPreprocessor:
             self.dino_encoder.requires_grad_(False)
             self.dino_encoder.eval()
             self.dino_encoder.cpu()
-        if self.sam2_model is not None:
-            self.sam2_model.cpu()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -282,8 +235,6 @@ class ForegroundPreprocessor:
             return
         self.release_gpu()
         self.dino_encoder = None
-        self.sam2_model = None
-        self.sam2_processor = None
         self.prototypes = None
         self.template = None
         self.reference_mask = None

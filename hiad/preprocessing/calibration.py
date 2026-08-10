@@ -37,7 +37,10 @@ from .constants import (
 )
 from .dino import build_frozen_dino_encoder, extract_dino_grid
 from .images import validate_image_array
-from .sam import load_sam2_components, sam2_longest_edge
+
+# Interim default matching historical SAM2 processor longest edge.
+# Task 2 moves this into preprocessing config schema v3.
+_DEFAULT_WORKING_LONGEST_EDGE = 1024
 
 
 def _validate_categories(categories: Sequence[str]) -> tuple[str, ...]:
@@ -60,8 +63,6 @@ def _write_preprocessing_bundle(
     encoder,
     working_longest_edge: int,
     dino_weights_hash: str,
-    sam2_weights_hash: str,
-    sam2_revision: str | None,
     logger=None,
 ) -> None:
     reference_rgb = None
@@ -182,10 +183,12 @@ def _write_preprocessing_bundle(
                 "patch_size": encoder.patch_size,
                 "weights_sha256": dino_weights_hash,
             },
+            # Placeholder SAM2 metadata kept for schema v2 artifact validation.
+            # Task 2 drops sam2_* from config/manifest.
             "sam2": {
                 "model_id": canonical_config["sam2_model_id"],
-                "revision": sam2_revision,
-                "weights_sha256": sam2_weights_hash,
+                "revision": None,
+                "weights_sha256": "0" * 64,
             },
             "normalization": {
                 "input_scale": canonical_config["input_scale"],
@@ -222,19 +225,10 @@ def calibrate_preprocessing_registry(
     os.makedirs(generation_root, exist_ok=True)
 
     encoder = None
-    processor = None
-    sam2_model = None
     try:
         encoder = build_frozen_dino_encoder(canonical_config)
-        sam2_model, processor = load_sam2_components(canonical_config["sam2_model_id"])
-        working_longest_edge = sam2_longest_edge(processor)
+        working_longest_edge = _DEFAULT_WORKING_LONGEST_EDGE
         dino_weights_hash = sha256_state_dict(encoder.state_dict())
-        sam2_weights_hash = sha256_state_dict(sam2_model.state_dict())
-        sam2_revision = getattr(sam2_model.config, "_commit_hash", None)
-        if sam2_revision is not None and (
-            not isinstance(sam2_revision, str) or not sam2_revision.strip()
-        ):
-            raise ValueError("Loaded SAM2 revision metadata is invalid")
 
         for category in categories:
             _write_preprocessing_bundle(
@@ -245,8 +239,6 @@ def calibrate_preprocessing_registry(
                 encoder=encoder,
                 working_longest_edge=working_longest_edge,
                 dino_weights_hash=dino_weights_hash,
-                sam2_weights_hash=sam2_weights_hash,
-                sam2_revision=sam2_revision,
                 logger=logger,
             )
         atomic_write_json(
@@ -262,8 +254,6 @@ def calibrate_preprocessing_registry(
             encoder.requires_grad_(False)
             encoder.eval()
             encoder.cpu()
-        if sam2_model is not None:
-            sam2_model.cpu()
-        del encoder, processor, sam2_model
+        del encoder
         if torch.device(device).type == "cuda":
             torch.cuda.empty_cache()

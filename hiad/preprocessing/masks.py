@@ -8,8 +8,6 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
-from hiad.foreground import compute_reference_coverage
-
 
 class MaskRejected(RuntimeError):
     def __init__(self, reason: str, metrics: Mapping[str, float] | None = None):
@@ -17,25 +15,20 @@ class MaskRejected(RuntimeError):
         self.metrics = dict(metrics or {})
 
 
-def clean_foreground_mask(
-    sam_mask: np.ndarray,
-    warped_prior: np.ndarray,
+def clean_warped_mask(
+    warped_mask: np.ndarray,
     boundary_expand_ratio: float,
 ) -> np.ndarray:
     if (
-        not isinstance(sam_mask, np.ndarray)
-        or not isinstance(warped_prior, np.ndarray)
-        or sam_mask.dtype != np.bool_
-        or warped_prior.dtype != np.bool_
-        or sam_mask.ndim != 2
-        or warped_prior.shape != sam_mask.shape
-        or not sam_mask.any()
-        or not warped_prior.any()
+        not isinstance(warped_mask, np.ndarray)
+        or warped_mask.dtype != np.bool_
+        or warped_mask.ndim != 2
+        or not warped_mask.any()
     ):
         raise MaskRejected("invalid_mask_cleanup_input")
 
-    occupied_rows = np.flatnonzero(warped_prior.any(axis=1))
-    occupied_columns = np.flatnonzero(warped_prior.any(axis=0))
+    occupied_rows = np.flatnonzero(warped_mask.any(axis=1))
+    occupied_columns = np.flatnonzero(warped_mask.any(axis=0))
     if occupied_rows.size == 0 or occupied_columns.size == 0:
         raise MaskRejected("invalid_cleanup_prior_box")
     prior_height = int(occupied_rows[-1] - occupied_rows[0] + 1)
@@ -44,7 +37,8 @@ def clean_foreground_mask(
         math.ceil(boundary_expand_ratio * max(prior_width, prior_height))
     )
 
-    cleaned = np.logical_or(sam_mask, warped_prior)
+    cleaned = np.ascontiguousarray(warped_mask, dtype=np.bool_)
+    kernel = None
     if expand_radius > 0:
         kernel_size = 2 * expand_radius + 1
         kernel = cv2.getStructuringElement(
@@ -56,7 +50,7 @@ def clean_foreground_mask(
             cv2.MORPH_CLOSE,
             kernel,
         ).view(np.bool_)
-        np.logical_or(cleaned, closed, out=cleaned)
+        cleaned = np.logical_or(cleaned, closed)
 
     cleaned = np.ascontiguousarray(ndimage.binary_fill_holes(cleaned), dtype=np.bool_)
     if expand_radius > 0:
@@ -65,7 +59,7 @@ def clean_foreground_mask(
             kernel,
             iterations=1,
         ).view(np.bool_)
-        np.logical_or(cleaned, expanded, out=cleaned)
+        cleaned = np.logical_or(cleaned, expanded)
     cleaned = np.ascontiguousarray(ndimage.binary_fill_holes(cleaned), dtype=np.bool_)
 
     hole_filled = ndimage.binary_fill_holes(cleaned)
@@ -76,9 +70,9 @@ def clean_foreground_mask(
     return cleaned
 
 
-def validate_and_clean_mask(
-    sam_mask: np.ndarray,
-    warped_prior: np.ndarray,
+def validate_warped_mask(
+    warped_mask: np.ndarray,
+    reference_mask: np.ndarray,
     config: Mapping[str, Any],
 ) -> tuple[np.ndarray, dict[str, float]]:
     metrics: dict[str, float] = {}
@@ -87,44 +81,39 @@ def validate_and_clean_mask(
         raise MaskRejected(reason, metrics)
 
     if (
-        sam_mask.dtype != np.bool_
-        or warped_prior.dtype != np.bool_
-        or sam_mask.ndim != 2
-        or warped_prior.shape != sam_mask.shape
+        not isinstance(warped_mask, np.ndarray)
+        or not isinstance(reference_mask, np.ndarray)
+        or warped_mask.dtype != np.bool_
+        or reference_mask.dtype != np.bool_
+        or warped_mask.ndim != 2
+        or reference_mask.ndim != 2
     ):
         reject("invalid_gate_mask_geometry")
-    image_height, image_width = sam_mask.shape
-    sam_area = int(np.count_nonzero(sam_mask))
-    prior_area = int(np.count_nonzero(warped_prior))
-    if sam_area == 0 or prior_area == 0:
+
+    image_height, image_width = warped_mask.shape
+    warped_area = int(np.count_nonzero(warped_mask))
+    reference_area = int(np.count_nonzero(reference_mask))
+    if warped_area == 0 or reference_area == 0:
         reject("zero_area_gate_mask")
 
-    intersection = int(np.count_nonzero(sam_mask & warped_prior))
-    reference_coverage = compute_reference_coverage(sam_mask, warped_prior)
+    # Area ratio vs reference mask (warped/reference may differ in spatial size).
+    reference_coverage = warped_area / reference_area
     if not math.isfinite(reference_coverage):
         reject("nonfinite_reference_coverage")
     metrics["reference_coverage"] = float(reference_coverage)
     if reference_coverage < config["min_reference_coverage"]:
         reject("reference_coverage_below_threshold")
 
-    union = sam_area + prior_area - intersection
-    if union <= 0:
-        reject("zero_union_gate_mask")
-    sam_prior_iou = intersection / union
-    area_ratio_deviation = abs(sam_area / prior_area - 1.0)
-    if not math.isfinite(sam_prior_iou) or not math.isfinite(area_ratio_deviation):
-        reject("nonfinite_sam_gate_metrics")
-    metrics["sam_prior_iou"] = float(sam_prior_iou)
+    area_ratio_deviation = abs(reference_coverage - 1.0)
+    if not math.isfinite(area_ratio_deviation):
+        reject("nonfinite_area_ratio_deviation")
     metrics["area_ratio_deviation"] = float(area_ratio_deviation)
-    if sam_prior_iou < config["min_sam_prior_iou"]:
-        reject("sam_prior_iou_below_threshold")
     if area_ratio_deviation > config["max_area_ratio_deviation"]:
-        reject("sam_area_ratio_deviation_above_threshold")
+        reject("area_ratio_deviation_above_threshold")
 
     try:
-        cleaned_mask = clean_foreground_mask(
-            sam_mask,
-            warped_prior,
+        cleaned_mask = clean_warped_mask(
+            warped_mask,
             config["boundary_expand_ratio"],
         )
     except MaskRejected as error:
