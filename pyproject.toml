@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hiad"
+version = "0.2.0"
+description = "Native-resolution anomaly detection with timm DINOv3 and Dinomaly"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "torchmetrics",
+    "numpy",
+    "PyYAML",
+    "easydict",
+    "opencv-python",
+    "Pillow",
+    "scikit-learn",
+    "scikit-image",
+    "imgaug",
+    "tabulate",
+    "kornia",
+    "matplotlib",
+    "timm>=1.0.22",
+    "transformers>=4.57,<5",
+    "pandas",
+    "scipy",
+    "tqdm",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]

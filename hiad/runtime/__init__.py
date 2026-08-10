@@ -1,0 +1,1 @@
+"""Shared detector execution primitives."""

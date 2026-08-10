@@ -1,0 +1,4 @@
+# Add exactly one normal reference image and one complete binary foreground mask
+# for each trained category before calibration. Runtime inference never reads a mask.
+# Each category value must contain the keys "image" and "mask".
+categories: {}

@@ -1,0 +1,49 @@
+# timm DINOv3 backbone; pretrained weights are resolved by timm.
+backbone_name: vit_base_patch16_dinov3.lvd1689m
+total_iters: 5000
+eval_per_steps: 500
+log_per_steps: 50
+
+# Recall-first training defaults. Set use_fp16=true only after a GPU recall comparison.
+use_fp16: false
+bottleneck_dropout: 0.1
+grad_clip_norm: 1.0
+
+# Zero disables hard mining; nonzero values progressively emphasize hard tokens.
+hard_mining_final: 0.0
+hard_mining_warmup_iters: 1000
+easy_grad_factor: 0.1
+
+# normalized_l2 is the FP32 distance between normalized feature vectors.
+anomaly_distance: normalized_l2
+
+scoring:
+  peak_top_k: 4
+  region_kernels: [2, 4, 8]
+  line_lengths: [4, 8]
+  line_weight_floor: 0.25
+  line_center_weight: 0.75
+  line_peak_weight: 0.25
+  context_kernels: [4, 8, 16]
+  decision_percentile: 0.99
+  branch_order: [peak, line, region, context]
+
+preprocessing:
+  schema_version: 2
+  array_color_space: RGB
+  input_scale: 255.0
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  reference_manifest: configs/foreground_references.yaml
+  dino_backbone_name: vit_base_patch16_dinov3.lvd1689m
+  dino_feature_layer: -1
+  sam2_model_id: facebook/sam2.1-hiera-small
+  sam2_dtype: float16
+  sam2_batch_size: 1
+  boundary_expand_ratio: 0.01
+  min_dino_matches: 8
+  min_dino_inlier_ratio: 0.50
+  max_dino_reprojection_ratio: 0.03
+  min_sam_prior_iou: 0.50
+  max_area_ratio_deviation: 0.35
+  min_reference_coverage: 1.0

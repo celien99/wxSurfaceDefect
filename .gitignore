@@ -1,0 +1,12 @@
+.claude/
+.pytest_cache/
+.vscode/
+__pycache__/
+.DS_Store
+.cache/
+.venv/
+.superpowers/
+.worktrees/
+docs/.superpowers/
+docs/superpowers/
+.cursor/
