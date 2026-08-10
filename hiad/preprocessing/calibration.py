@@ -38,10 +38,6 @@ from .constants import (
 from .dino import build_frozen_dino_encoder, extract_dino_grid
 from .images import validate_image_array
 
-# Interim default matching historical SAM2 processor longest edge.
-# Task 2 moves this into preprocessing config schema v3.
-_DEFAULT_WORKING_LONGEST_EDGE = 1024
-
 
 def _validate_categories(categories: Sequence[str]) -> tuple[str, ...]:
     if isinstance(categories, (str, bytes)):
@@ -183,13 +179,6 @@ def _write_preprocessing_bundle(
                 "patch_size": encoder.patch_size,
                 "weights_sha256": dino_weights_hash,
             },
-            # Placeholder SAM2 metadata kept for schema v2 artifact validation.
-            # Task 2 drops sam2_* from config/manifest.
-            "sam2": {
-                "model_id": canonical_config["sam2_model_id"],
-                "revision": None,
-                "weights_sha256": "0" * 64,
-            },
             "normalization": {
                 "input_scale": canonical_config["input_scale"],
                 "mean": canonical_config["mean"],
@@ -227,7 +216,7 @@ def calibrate_preprocessing_registry(
     encoder = None
     try:
         encoder = build_frozen_dino_encoder(canonical_config)
-        working_longest_edge = _DEFAULT_WORKING_LONGEST_EDGE
+        working_longest_edge = canonical_config["working_longest_edge"]
         dino_weights_hash = sha256_state_dict(encoder.state_dict())
 
         for category in categories:

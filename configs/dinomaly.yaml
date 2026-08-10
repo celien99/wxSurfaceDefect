@@ -29,7 +29,7 @@ scoring:
   branch_order: [peak, line, region, context]
 
 preprocessing:
-  schema_version: 2
+  schema_version: 3
   array_color_space: RGB
   input_scale: 255.0
   mean: [0.485, 0.456, 0.406]
@@ -37,13 +37,10 @@ preprocessing:
   reference_manifest: configs/foreground_references.yaml
   dino_backbone_name: vit_base_patch16_dinov3.lvd1689m
   dino_feature_layer: -1
-  sam2_model_id: facebook/sam2.1-hiera-small
-  sam2_dtype: float16
-  sam2_batch_size: 1
+  working_longest_edge: 1024
   boundary_expand_ratio: 0.01
   min_dino_matches: 8
   min_dino_inlier_ratio: 0.50
   max_dino_reprojection_ratio: 0.03
-  min_sam_prior_iou: 0.50
   max_area_ratio_deviation: 0.35
   min_reference_coverage: 1.0

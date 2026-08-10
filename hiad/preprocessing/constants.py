@@ -1,4 +1,4 @@
-PREPROCESSING_SCHEMA_VERSION = 2
+PREPROCESSING_SCHEMA_VERSION = 3
 PREPROCESSING_REGISTRY_SCHEMA_VERSION = 1
 PREPROCESSING_DIRECTORY = "preprocessing"
 PREPROCESSING_REGISTRY_FILE = "preprocessing_registry.json"
@@ -17,14 +17,11 @@ CONFIG_KEYS = (
     "reference_manifest",
     "dino_backbone_name",
     "dino_feature_layer",
-    "sam2_model_id",
-    "sam2_dtype",
-    "sam2_batch_size",
+    "working_longest_edge",
     "boundary_expand_ratio",
     "min_dino_matches",
     "min_dino_inlier_ratio",
     "max_dino_reprojection_ratio",
-    "min_sam_prior_iou",
     "max_area_ratio_deviation",
     "min_reference_coverage",
 )

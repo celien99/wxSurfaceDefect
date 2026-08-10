@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+from hiad.constants import DINO_PATCH_SIZE
+
 from .constants import CONFIG_KEYS, PREPROCESSING_SCHEMA_VERSION
 
 
@@ -81,15 +83,17 @@ def canonicalize_preprocessing_config(config: Mapping[str, Any]) -> dict[str, An
     if isinstance(feature_layer, bool) or not isinstance(feature_layer, int):
         raise TypeError("dino_feature_layer must be an integer")
 
-    sam2_dtype = require_nonempty_string(config["sam2_dtype"], "sam2_dtype").lower()
-    if sam2_dtype not in {"float16", "float32"}:
-        raise ValueError("sam2_dtype must be float16 or float32")
-
-    sam2_batch_size = config["sam2_batch_size"]
-    if isinstance(sam2_batch_size, bool) or not isinstance(sam2_batch_size, int):
-        raise TypeError("sam2_batch_size must be an integer")
-    if sam2_batch_size != 1:
-        raise ValueError("sam2_batch_size must be 1")
+    working_longest_edge = config["working_longest_edge"]
+    if isinstance(working_longest_edge, bool) or not isinstance(
+        working_longest_edge, int
+    ):
+        raise TypeError("working_longest_edge must be an integer")
+    if working_longest_edge <= 0:
+        raise ValueError("working_longest_edge must be positive")
+    if working_longest_edge % DINO_PATCH_SIZE != 0:
+        raise ValueError(
+            f"working_longest_edge must be a positive multiple of {DINO_PATCH_SIZE}"
+        )
 
     min_dino_matches = config["min_dino_matches"]
     if isinstance(min_dino_matches, bool) or not isinstance(min_dino_matches, int):
@@ -109,10 +113,6 @@ def canonicalize_preprocessing_config(config: Mapping[str, Any]) -> dict[str, An
         "max_dino_reprojection_ratio": _finite_float(
             config["max_dino_reprojection_ratio"],
             "max_dino_reprojection_ratio",
-        ),
-        "min_sam_prior_iou": _finite_float(
-            config["min_sam_prior_iou"],
-            "min_sam_prior_iou",
         ),
         "min_reference_coverage": _finite_float(
             config["min_reference_coverage"],
@@ -145,17 +145,11 @@ def canonicalize_preprocessing_config(config: Mapping[str, Any]) -> dict[str, An
             "dino_backbone_name",
         ),
         "dino_feature_layer": feature_layer,
-        "sam2_model_id": require_nonempty_string(
-            config["sam2_model_id"],
-            "sam2_model_id",
-        ),
-        "sam2_dtype": sam2_dtype,
-        "sam2_batch_size": sam2_batch_size,
+        "working_longest_edge": working_longest_edge,
         "boundary_expand_ratio": ratios["boundary_expand_ratio"],
         "min_dino_matches": min_dino_matches,
         "min_dino_inlier_ratio": ratios["min_dino_inlier_ratio"],
         "max_dino_reprojection_ratio": ratios["max_dino_reprojection_ratio"],
-        "min_sam_prior_iou": ratios["min_sam_prior_iou"],
         "max_area_ratio_deviation": max_area_ratio_deviation,
         "min_reference_coverage": ratios["min_reference_coverage"],
     }

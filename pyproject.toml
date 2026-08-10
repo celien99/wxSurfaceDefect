@@ -23,9 +23,7 @@ dependencies = [
     "kornia",
     "matplotlib",
     "timm>=1.0.22",
-    "transformers>=4.57,<5",
-    "pandas",
-    "scipy",
+    "pandas",    "scipy",
     "tqdm",
 ]
 

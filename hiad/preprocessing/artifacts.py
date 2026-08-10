@@ -252,11 +252,12 @@ def validate_preprocessing_bundle(
         "category",
         "created_at_utc",
         "dino",
-        "sam2",
         "normalization",
         "reference_sha256",
         "asset_sha256",
     }
+    if "sam2" in manifest:
+        raise ValueError("Preprocessing manifest must not contain sam2 metadata")
     if set(manifest) != required_manifest_keys:
         raise ValueError("Preprocessing manifest has unexpected or missing keys")
     if manifest["schema_version"] != PREPROCESSING_SCHEMA_VERSION:
@@ -289,20 +290,6 @@ def validate_preprocessing_bundle(
         raise ValueError("Checkpoint DINO patch size must be positive")
     _require_sha256(dino["weights_sha256"], "DINO weights hash")
 
-    sam2 = manifest["sam2"]
-    if not isinstance(sam2, Mapping) or set(sam2) != {
-        "model_id",
-        "revision",
-        "weights_sha256",
-    }:
-        raise ValueError("Preprocessing manifest SAM2 metadata is invalid")
-    if sam2["model_id"] != saved_config["sam2_model_id"]:
-        raise ValueError("Checkpoint SAM2 model ID does not match preprocessing config")
-    if sam2["revision"] is not None and (
-        not isinstance(sam2["revision"], str) or not sam2["revision"].strip()
-    ):
-        raise ValueError("Checkpoint SAM2 revision is invalid")
-    _require_sha256(sam2["weights_sha256"], "SAM2 weights hash")
     expected_normalization = {
         "input_scale": saved_config["input_scale"],
         "mean": saved_config["mean"],
@@ -367,7 +354,6 @@ def validate_preprocessing_registry(
         )
         bundle_identity = {
             "dino": bundle["manifest"]["dino"],
-            "sam2": bundle["manifest"]["sam2"],
         }
         if identity is None:
             identity = bundle_identity
