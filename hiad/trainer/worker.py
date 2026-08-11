@@ -2,9 +2,8 @@ import os
 
 import torch
 
-from hiad.datasets import StreamingTaskDataset
+from hiad.datasets import SourceGroupedRandomSampler, StreamingTaskDataset
 from hiad.detectors.config import detector_config_for_task
-from hiad.preprocessing import ForegroundPreprocessorRegistry
 from hiad.runtime.logging import create_logger
 from hiad.runtime.randomness import seed_everything
 
@@ -23,66 +22,56 @@ def train_tasks_in_device(
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = torch.device("cuda")
-    cpu_device = torch.device("cpu")
     seed_everything(seed)
     logger = create_logger(
         f"train_logger_device{gpu_id}",
         os.path.join(log_root, f"train_log_device{gpu_id}.log"),
     )
-    logger.info(f"Device {gpu_id} start training")
+    logger.info("Device %s start training", gpu_id)
+    logger.info("Task Num: %d", len(tasks))
 
-    preprocessing_config = getattr(config, "preprocessing", None)
-    if preprocessing_config is None:
-        raise ValueError("Training worker requires preprocessing config")
+    for index, task in enumerate(tasks, start=1):
+        task_name = task["name"]
+        logger.info("[%d/%d] Task %s start loading images", index, len(tasks), task_name)
 
-    preprocessors = ForegroundPreprocessorRegistry.from_checkpoint(
-        str(checkpoint_root),
-        device,
-        runtime_config=preprocessing_config,
-        logger=logger,
-    )
-    try:
-        for task in tasks:
-            task_name = task["name"]
-            logger.info(f"Task {task_name} streaming dataset")
+        dataset = StreamingTaskDataset(
+            list(train_samples),
+            task,
+            training=True,
+        )
+        if len(dataset) == 0:
+            raise ValueError(f"Task {task_name} has no training samples")
 
-            detector_config = detector_config_for_task(config, task)
-            dataset = StreamingTaskDataset(
-                train_samples,
-                task,
-                preprocessors,
-                training=True,
-            )
-            detector = detector_class(
-                **detector_config,
-                logger=logger,
-                device=device,
-                seed=seed,
-                fusion_weights=fusion_weights,
-            )
-            logger.info(f"Task {task_name}: {len(dataset)} patches for training")
-            train_dataloader = torch.utils.data.DataLoader(
+        detector_config = detector_config_for_task(config, task)
+        detector = detector_class(
+            **detector_config,
+            logger=logger,
+            device=device,
+            seed=seed,
+            fusion_weights=fusion_weights,
+        )
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(seed)
+        train_dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=SourceGroupedRandomSampler(
                 dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=0,
-                pin_memory=True,
-                drop_last=len(dataset) >= batch_size,
-            )
-            if len(train_dataloader) == 0:
-                raise ValueError(f"Task {task_name} has no training batches")
+                generator=sampler_generator,
+            ),
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
 
-            checkpoint_path = os.path.join(
-                checkpoint_root,
-                f"{task_name}_weight.pt",
-            )
-            detector.train_step(train_dataloader, task_name)
-            detector.save_checkpoint(checkpoint_path)
-            logger.info(f"Task {task_name} checkpoint saved as {checkpoint_path}")
-            detector.to_device(cpu_device)
-            del detector
-            torch.cuda.empty_cache()
-    finally:
-        preprocessors.close()
+        logger.info("Task %s train dataset len is: %d", task_name, len(dataset))
+        checkpoint_path = os.path.join(checkpoint_root, f"{task_name}_weight.pkl")
+        detector.train_step(train_dataloader, task_name)
+        detector.save_checkpoint(checkpoint_path)
+        logger.info("Task %s checkpoint saved as %s", task_name, checkpoint_path)
+
+        detector.to_device(torch.device("cpu"))
+        del detector
+        torch.cuda.empty_cache()
 
     logger.info("All tasks are done.")

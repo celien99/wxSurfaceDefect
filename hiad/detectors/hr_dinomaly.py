@@ -9,16 +9,6 @@ from torch.utils.data import DataLoader
 from typing import List
 
 from .base import BaseDetector
-from hiad.checkpoints import atomic_torch_save, safe_torch_load
-from hiad.checkpoint_schema import (
-    DETECTOR_CHECKPOINT_KEYS,
-    validate_detector_checkpoint,
-)
-from hiad.constants import (
-    ANOMALY_DISTANCE_NORMALIZED_L2,
-    SUPPORTED_ANOMALY_DISTANCES,
-)
-from hiad.scoring.contracts import DetectorEvidence
 from .dinomaly.models.vision_transformer import Block as VitBlock, bMlp, LinearAttention2
 from .dinomaly.models.uad import ViTill
 from .dinomaly.optimizers import StableAdamW
@@ -32,10 +22,13 @@ def _positive_int(value, name: str) -> int:
     return value
 
 
+def effective_training_iters(configured_iters: int, dataloader_length: int) -> int:
+    configured_iters = _positive_int(configured_iters, "configured_iters")
+    dataloader_length = _positive_int(dataloader_length, "dataloader_length")
+    return max(configured_iters, dataloader_length)
+
+
 class HRDinomaly(BaseDetector):
-
-    CHECKPOINT_SCHEMA_VERSION = 4
-
     def __init__(self,
                  backbone_name,
                  total_iters,
@@ -46,21 +39,17 @@ class HRDinomaly(BaseDetector):
                  device: torch.device,  # base
                  seed: int = 0,  #base
                  fusion_weights = None,
-                 use_fp16: bool = False,
                  bottleneck_dropout: float = 0.1,
                  grad_clip_norm: float = 1.0,
                  hard_mining_final: float = 0.0,
                  hard_mining_warmup_iters: int = 1000,
                  easy_grad_factor: float = 0.1,
-                 anomaly_distance: str = ANOMALY_DISTANCE_NORMALIZED_L2,
+                 score_top_k: int = 4,
                  **kwargs):
 
         total_iters = _positive_int(total_iters, "total_iters")
         eval_per_steps = _positive_int(eval_per_steps, "eval_per_steps")
         log_per_steps = _positive_int(log_per_steps, "log_per_steps")
-        if not isinstance(use_fp16, bool):
-            raise TypeError("use_fp16 must be a boolean")
-
         super().__init__(patch_size, device, fusion_weights, logger, seed)
 
         bottleneck_dropout = float(bottleneck_dropout)
@@ -83,25 +72,19 @@ class HRDinomaly(BaseDetector):
             )
         if not 0 <= easy_grad_factor <= 1:
             raise ValueError(f"easy_grad_factor must be in [0, 1], got {easy_grad_factor}")
-        if anomaly_distance not in SUPPORTED_ANOMALY_DISTANCES:
-            raise ValueError(
-                f"anomaly_distance must be 'normalized_l2' or 'cosine', got {anomaly_distance}"
-            )
-
+        score_top_k = _positive_int(score_top_k, "score_top_k")
         self.total_iters = total_iters
         self.grad_clip_norm = grad_clip_norm
         self.hard_mining_final = hard_mining_final
         self.hard_mining_warmup_iters = hard_mining_warmup_iters
         self.easy_grad_factor = easy_grad_factor
-        self.anomaly_distance = anomaly_distance
-        self.use_fp16 = use_fp16
+        self.score_top_k = score_top_k
         self.target_layers = [2, 3, 4, 5, 6, 7, 8, 9]
         self.fuse_layer_encoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
         self.fuse_layer_decoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
         self.encoder = TimmDinoV3Encoder(
             model_name=backbone_name,
             intermediate_layers=self.target_layers,
-            use_fp16=self.use_fp16,
         )
         embed_dim = self.encoder.embed_dim
         if embed_dim == 384:
@@ -133,6 +116,8 @@ class HRDinomaly(BaseDetector):
         self.to_device(device)
         self.eval_per_steps = eval_per_steps
         self.log_per_steps = log_per_steps
+        self.max_anomaly_score = None
+        self.min_anomaly_score = None
 
     @torch.no_grad()
     def embedding(self, input_tensor: torch.Tensor ) -> List[torch.Tensor]:
@@ -144,8 +129,7 @@ class HRDinomaly(BaseDetector):
 
     def train_step(self,
                    train_dataloader: DataLoader,
-                   task_name: str,
-                   validation_callback=None) -> None:
+                   task_name: str) -> None:
 
         trainable = nn.ModuleList([self.bottleneck, self.decoder])
 
@@ -160,11 +144,27 @@ class HRDinomaly(BaseDetector):
 
         optimizer = StableAdamW([{'params': trainable.parameters()}], lr=2e-3,
                                 betas=(0.9, 0.999), weight_decay=1e-4, amsgrad=False, eps=1e-10)
-        lr_scheduler = WarmCosineScheduler(optimizer, base_value=2e-3, final_value=2e-4, total_iters=self.total_iters, warmup_iters=100)
+        training_iters = effective_training_iters(self.total_iters, len(train_dataloader))
+        warmup_iters = min(100, max(training_iters - 1, 0))
+        lr_scheduler = WarmCosineScheduler(
+            optimizer,
+            base_value=2e-3,
+            final_value=2e-4,
+            total_iters=training_iters,
+            warmup_iters=warmup_iters,
+        )
+        if self.logger is not None:
+            self.logger.info(
+                "Task %s effective training iterations: %d "
+                "(configured=%d, full_epoch=%d)",
+                task_name,
+                training_iters,
+                self.total_iters,
+                len(train_dataloader),
+            )
 
         it = 0
-        last_validation_iteration = None
-        for epoch in range(int(np.ceil(self.total_iters / len(train_dataloader)))):
+        for epoch in range(int(np.ceil(training_iters / len(train_dataloader)))):
             torch.cuda.empty_cache()
 
             for data in train_dataloader:
@@ -197,136 +197,114 @@ class HRDinomaly(BaseDetector):
                 it += 1
 
                 if it % self.log_per_steps == 0:
-                    log_message = 'iter [{}/{}], loss:{:.4f}'.format(it, self.total_iters, loss.item())
+                    log_message = 'iter [{}/{}], loss:{:.4f}'.format(it, training_iters, loss.item())
                     if grad_norm is not None:
                         log_message += ', grad_norm:{:.4f}'.format(grad_norm.item())
-                    self.logger.info(log_message)
+                    if self.logger is not None:
+                        self.logger.info(log_message)
 
-                if it % self.eval_per_steps == 0 and validation_callback is not None:
-                    last_validation_iteration = it
-                    if validation_callback():
-                        return
-
-                if it == self.total_iters:
+                if it >= training_iters:
                     break
-
-        if (
-            validation_callback is not None
-            and last_validation_iteration != it
-        ):
-            validation_callback()
         return None
 
 
     @torch.no_grad()
-    def predict_evidence(
+    def inference_step(
         self,
         test_dataloader: DataLoader,
         task_name: str,
-    ) -> list[DetectorEvidence]:
+    ) -> list[dict]:
         self.model.eval()
-        evidence = []
+        predictions = []
         for data in test_dataloader:
             en = self.get_multi_resolution_fusion_embeddings(data)
             en, de = self.model.distillation(en)
-            raw_token_maps, raw_pixel_maps = self._build_anomaly_evidence_maps(
-                en,
-                de,
-                self.patch_size,
+            anomaly_map, token_map = self.cal_anomaly_maps(en, de, self.patch_size)
+            pixel_batch = anomaly_map[:, 0].cpu().numpy()
+            score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
+            predictions.extend(
+                {
+                    "anomaly_map": self.patch_post_processing(pixel_map),
+                    "score": float(score),
+                }
+                for pixel_map, score in zip(pixel_batch, score_batch)
             )
-            token_batch = raw_token_maps.cpu().numpy()
-            pixel_batch = raw_pixel_maps.cpu().numpy()
-            for index in range(token_batch.shape[0]):
-                evidence.append(DetectorEvidence(
-                    raw_token_map=np.ascontiguousarray(
-                        token_batch[index, 0],
-                        dtype=np.float32,
-                    ),
-                    raw_pixel_map=np.ascontiguousarray(
-                        pixel_batch[index, 0],
-                        dtype=np.float32,
-                    ),
-                ))
-        return evidence
+        return predictions
 
-    def _build_anomaly_evidence_maps(
-        self,
-        encoder_features,
-        decoder_features,
-        output_size,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def cal_anomaly_maps(self, encoder_features, decoder_features, output_size):
         if not encoder_features or len(encoder_features) != len(decoder_features):
             raise ValueError("Encoder and decoder feature lists must be non-empty and aligned")
-
         token_layer_maps = []
         pixel_layer_maps = []
-        token_shape = None
         for encoder_feature, decoder_feature in zip(encoder_features, decoder_features):
-            fs = encoder_feature.float()
-            ft = decoder_feature.float()
-            if self.anomaly_distance == ANOMALY_DISTANCE_NORMALIZED_L2:
-                fs = F.normalize(fs, p=2, dim=1)
-                ft = F.normalize(ft, p=2, dim=1)
-                distance = torch.linalg.vector_norm(fs - ft, ord=2, dim=1)
-            else:
-                distance = torch.clamp(
-                    1 - F.cosine_similarity(fs, ft),
-                    min=0.0,
-                    max=2.0,
-                )
+            distance = torch.clamp(
+                1 - F.cosine_similarity(encoder_feature.float(), decoder_feature.float()),
+                min=0.0,
+                max=2.0,
+            )
             distance = distance.unsqueeze(1)
-            if token_shape is None:
-                token_shape = distance.shape[-2:]
-            elif distance.shape[-2:] != token_shape:
-                raise ValueError("Selected detector layers must share one token geometry")
             token_layer_maps.append(distance)
             pixel_layer_maps.append(F.interpolate(
                 distance,
                 size=(output_size[1], output_size[0]),
-                mode='bilinear',
+                mode="bilinear",
                 align_corners=True,
             ))
+        token_map = torch.cat(token_layer_maps, dim=1).amax(dim=1, keepdim=True)
+        anomaly_map = torch.cat(pixel_layer_maps, dim=1).amax(dim=1, keepdim=True)
+        return anomaly_map, token_map
 
-        raw_token_maps = torch.cat(token_layer_maps, dim=1).max(
-            dim=1,
-            keepdim=True,
-        ).values
-        raw_pixel_maps = torch.cat(pixel_layer_maps, dim=1).max(
-            dim=1,
-            keepdim=True,
-        ).values
-        return raw_token_maps, raw_pixel_maps
+    @staticmethod
+    def _top_k_token_scores(token_maps: torch.Tensor, top_k: int) -> torch.Tensor:
+        top_k = _positive_int(top_k, "top_k")
+        if token_maps.ndim != 4 or token_maps.shape[1] != 1:
+            raise ValueError("token_maps must have shape [batch, 1, height, width]")
+        values = token_maps.flatten(start_dim=1)
+        count = min(top_k, values.shape[1])
+        return torch.topk(values, k=count, dim=1).values.mean(dim=1)
+
+    def patch_post_processing(self, anomaly_map, eps=1e-4):
+        if self.min_anomaly_score is None or self.max_anomaly_score is None:
+            return anomaly_map
+        anomaly_map = (anomaly_map - self.min_anomaly_score) / (
+            self.max_anomaly_score - self.min_anomaly_score + eps
+        )
+        return np.clip(anomaly_map, 0, 1)
 
 
     def save_checkpoint(self, checkpoint_path: str):
-        atomic_torch_save(
-            {
-                'schema_version': self.CHECKPOINT_SCHEMA_VERSION,
-                'bottleneck': self.bottleneck.state_dict(),
-                'decoder': self.decoder.state_dict(),
-                'anomaly_distance': self.anomaly_distance,
-                'fusion_weights': self.fusion_weights,
-                'use_fp16': self.use_fp16,
-            },
-            checkpoint_path,
-        )
+        torch.save({
+            "bottleneck": self.bottleneck.state_dict(),
+            "decoder": self.decoder.state_dict(),
+            "max_anomaly_score": self.max_anomaly_score,
+            "min_anomaly_score": self.min_anomaly_score,
+            "fusion_weights": self.fusion_weights,
+            "score_top_k": self.score_top_k,
+            "layer_aggregation": "max",
+        }, checkpoint_path)
 
 
     def load_checkpoint(self, checkpoint_path: str):
-        state_dict = safe_torch_load(
-            checkpoint_path,
-            required_keys=DETECTOR_CHECKPOINT_KEYS,
-            map_location=self.device,
-        )
-        state_dict = validate_detector_checkpoint(
-            state_dict,
-            expected_version=self.CHECKPOINT_SCHEMA_VERSION,
-        )
-        if state_dict['use_fp16'] != self.use_fp16:
-            raise ValueError(
-                "Detector checkpoint use_fp16 does not match runtime configuration"
-            )
+        state_dict = torch.load(checkpoint_path, map_location=self.device)
         self.bottleneck.load_state_dict(state_dict['bottleneck'])
         self.decoder.load_state_dict(state_dict['decoder'])
-        self.anomaly_distance = state_dict['anomaly_distance']
-        self.fusion_weights = state_dict['fusion_weights']
+        self.min_anomaly_score = state_dict.get("min_anomaly_score")
+        self.max_anomaly_score = state_dict.get("max_anomaly_score")
+        self.fusion_weights = state_dict.get("fusion_weights")
+        aggregation = state_dict.get("layer_aggregation", "max")
+        if aggregation != "max":
+            raise ValueError(f"Unsupported checkpoint layer aggregation: {aggregation}")
+        self.score_top_k = _positive_int(
+            state_dict.get("score_top_k", self.score_top_k),
+            "checkpoint score_top_k",
+        )
+
+    @staticmethod
+    def get_image_score(task_score_groups):
+        scores = []
+        for task_scores in task_score_groups:
+            values = np.asarray(task_scores, dtype=np.float32).reshape(-1)
+            if values.size == 0 or not np.isfinite(values).all():
+                raise ValueError("Every image requires finite task anomaly scores")
+            scores.append(float(values.max()))
+        return np.asarray(scores, dtype=np.float32)

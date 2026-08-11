@@ -1,72 +1,29 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, List, Union
+from typing import List, Union
 
 import cv2
 import numpy as np
-import torch
 from PIL import Image
 
 from .geometry import HRImageIndex, MultiResolutionIndex
 
-if TYPE_CHECKING:
-    from hiad.preprocessing import ForegroundPreprocessor
-
 
 class HRImage:
-    _preprocessor: ClassVar["ForegroundPreprocessor | None"] = None
-
     def __init__(self, image_path: str, is_mask: bool = False):
         self.image_path = image_path
         self.is_mask = is_mask
         self.image = None
-        self._is_processed = False
-        self._shared_tensor = None
 
-    @classmethod
-    def bind_preprocessor(cls, preprocessor: "ForegroundPreprocessor"):
-        if preprocessor is None:
-            raise ValueError("preprocessor must not be None")
-        if cls._preprocessor is not None and cls._preprocessor is not preprocessor:
-            raise RuntimeError("A different ForegroundPreprocessor is already bound")
-        cls._preprocessor = preprocessor
-
-    @classmethod
-    def clear_preprocessor(cls):
-        cls._preprocessor = None
-
-    @property
-    def is_processed(self):
-        return self._is_processed
-
-    def open(self, category=None):
-        if self.image is not None:
-            if self.is_mask or self._is_processed:
-                return
-            raise RuntimeError("RGB image is assigned but has not been preprocessed")
+    def open(self):
         if self.is_mask:
             with Image.open(self.image_path) as image_file:
                 self.image = np.array(image_file.convert("L"), copy=True)
-            self._is_processed = False
         else:
-            if self._preprocessor is None:
-                raise RuntimeError("No ForegroundPreprocessor is bound for RGB images")
-            self.image = self._preprocessor.process_file(self.image_path, category)
-            self._is_processed = True
-        self._shared_tensor = None
-
-    def set_image(self, image, category=None):
-        if self.is_mask:
-            raise RuntimeError("Mask images cannot be assigned through RGB preprocessing")
-        if self._preprocessor is None:
-            raise RuntimeError("No ForegroundPreprocessor is bound for RGB images")
-        self.image = self._preprocessor.process_array(image, category)
-        self._is_processed = True
-        self._shared_tensor = None
+            with Image.open(self.image_path) as image_file:
+                self.image = np.array(image_file.convert("RGB"), copy=True)
 
     def close(self):
         self.image = None
-        self._shared_tensor = None
-        self._is_processed = False
 
     def size(self):
         if self.image is None:
@@ -78,26 +35,11 @@ class HRImage:
             raise RuntimeError("Image must be open before resizing")
         if isinstance(image_size, int):
             output_size = (image_size, image_size)
-        else:
-            if not isinstance(image_size, (tuple, list)) or len(image_size) != 2:
-                raise TypeError("image_size must be an integer or width-height pair")
+        elif isinstance(image_size, (tuple, list)) and len(image_size) == 2:
             output_size = tuple(image_size)
-        if any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in output_size
-        ):
-            raise ValueError("image_size dimensions must be positive integers")
-
-        if self.is_mask:
-            if self.image.dtype.kind not in "biu":
-                raise TypeError("Mask images must use an integer or boolean dtype")
-            interpolation = cv2.INTER_NEAREST
         else:
-            if not self._is_processed or self.image.dtype != np.float32:
-                raise TypeError(
-                    "RGB images must be preprocessed float32 arrays before resizing"
-                )
-            interpolation = cv2.INTER_LINEAR
+            raise TypeError("image_size must be an integer or width-height pair")
+        interpolation = cv2.INTER_NEAREST if self.is_mask else cv2.INTER_LINEAR
         return cv2.resize(self.image, output_size, interpolation=interpolation)
 
     def __getitem__(self, item: HRImageIndex):
@@ -105,70 +47,26 @@ class HRImage:
             raise RuntimeError("Image must be open before extracting a region")
         if item.x < 0 or item.y < 0 or item.width <= 0 or item.height <= 0:
             raise ValueError(f"Invalid patch geometry: {item}")
+
         image_height, image_width = self.image.shape[:2]
         if item.x >= image_width or item.y >= image_height:
             raise ValueError(f"Patch origin is outside image bounds: {item}")
 
-        image_patch = self.image[
-            item.y:item.y + item.height,
-            item.x:item.x + item.width,
-        ]
-        patch_height, patch_width = image_patch.shape[:2]
-        pad_height = item.height - patch_height
-        pad_width = item.width - patch_width
+        patch = self.image[item.y:item.y + item.height, item.x:item.x + item.width]
+        pad_height = item.height - patch.shape[0]
+        pad_width = item.width - patch.shape[1]
         if pad_height < 0 or pad_width < 0:
-            raise ValueError(
-                f"Invalid patch geometry: requested {item}, got {image_patch.shape}"
-            )
+            raise ValueError(f"Requested patch is larger than its source crop: {item}")
         if pad_height or pad_width:
             padding = ((0, pad_height), (0, pad_width))
-            if image_patch.ndim == 3:
+            if patch.ndim == 3:
                 padding += ((0, 0),)
-            if self.is_mask:
-                image_patch = np.pad(
-                    image_patch,
-                    padding,
-                    mode="constant",
-                    constant_values=0,
-                )
-            else:
-                image_patch = np.pad(image_patch, padding, mode="edge")
-        return image_patch
-
-    def share_memory_(self):
-        if self.is_mask:
-            raise RuntimeError("Mask images are not shared through the RGB image path")
-        if (
-            self.image is None
-            or not self._is_processed
-            or self.image.dtype != np.float32
-            or self.image.ndim != 3
-            or self.image.shape[2] != 3
-            or not self.image.flags.c_contiguous
-            or not np.isfinite(self.image).all()
-        ):
-            raise ValueError(
-                "Only processed contiguous finite float32 RGB images can be shared"
+            patch = np.pad(
+                patch,
+                padding,
+                mode="constant" if self.is_mask else "edge",
             )
-        if self._shared_tensor is None:
-            shared_tensor = torch.from_numpy(self.image)
-            shared_tensor.share_memory_()
-            self._shared_tensor = shared_tensor
-            self.image = shared_tensor.numpy()
-        return self
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        if self._shared_tensor is not None:
-            state["image"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._is_processed = state.get("_is_processed", False)
-        self._shared_tensor = state.get("_shared_tensor")
-        if self._shared_tensor is not None:
-            self.image = self._shared_tensor.numpy()
+        return np.array(patch, copy=True)
 
 
 @dataclass
@@ -196,26 +94,10 @@ class LRPatch:
             (main_width, main_height),
         )
         mapped_index = HRImageIndex(
-            x=int(
-                (self.main_index.x - low_resolution_index.x)
-                / low_width
-                * main_width
-            ),
-            y=int(
-                (self.main_index.y - low_resolution_index.y)
-                / low_height
-                * main_height
-            ),
-            width=int(
-                self.main_index.width
-                / low_resolution_index.width
-                * main_width
-            ),
-            height=int(
-                self.main_index.height
-                / low_resolution_index.height
-                * main_height
-            ),
+            x=int((self.main_index.x - low_resolution_index.x) / low_width * main_width),
+            y=int((self.main_index.y - low_resolution_index.y) / low_height * main_height),
+            width=int(self.main_index.width / low_resolution_index.width * main_width),
+            height=int(self.main_index.height / low_resolution_index.height * main_height),
         )
         if self.low_resolution_indexes is None:
             self.low_resolution_indexes = []
@@ -255,7 +137,7 @@ class HRSample:
         return LRPatch(**values)
 
     def open(self):
-        self.image.open(self.clsname)
+        self.image.open()
         if self.mask is not None:
             self.mask.open()
 
@@ -276,11 +158,12 @@ class HRSample:
         )
 
 
-def create_dynamic_patch(
-    sample: HRSample,
-    index: MultiResolutionIndex,
-) -> LRPatch:
+def create_dynamic_patch(sample: HRSample, index: MultiResolutionIndex) -> LRPatch:
     patch = sample[index.main_index]
+    patch.valid_source_hw = (
+        min(index.main_index.height, sample.image.image.shape[0] - index.main_index.y),
+        min(index.main_index.width, sample.image.image.shape[1] - index.main_index.x),
+    )
     if index.low_resolution_indexes is not None:
         for low_resolution_index in index.low_resolution_indexes:
             patch.add_low_resolution_images(low_resolution_index, sample.image)

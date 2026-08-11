@@ -12,7 +12,6 @@ from hiad.constants import (
     TASK_TYPE_THUMBNAIL,
 )
 from hiad.data import HRSample, create_dynamic_patch, split_multiresolution_regions
-from hiad.data.preparation import PreparedInputRecord
 from hiad.datasets.patch_dataset import PatchDataset
 
 
@@ -23,7 +22,6 @@ class StreamingTaskDataset(Dataset):
         self,
         samples: list[HRSample],
         task: dict,
-        preprocessor_registry: Any,
         *,
         training: bool,
     ) -> None:
@@ -34,9 +32,6 @@ class StreamingTaskDataset(Dataset):
             raise TypeError("Every streaming sample must be an HRSample")
         if not isinstance(task, dict) or task.get("type") not in SUPPORTED_TASK_TYPES:
             raise ValueError(f"Unsupported task: {task}")
-        if preprocessor_registry is None:
-            raise ValueError("preprocessor_registry must not be None")
-
         paths = [sample.image.image_path for sample in samples]
         duplicates = sorted({path for path in paths if paths.count(path) > 1})
         if duplicates:
@@ -44,12 +39,11 @@ class StreamingTaskDataset(Dataset):
 
         self.samples = samples
         self.task = task
-        self.preprocessor_registry = preprocessor_registry
         self.training = training
         self._entries: list[tuple[int, Any]] = []
-        self.records: list[PreparedInputRecord] = []
-        # At most one preprocessed full image is retained between consecutive
-        # patches from the same path (bounded memory, avoids N× DINO cost).
+        self.records = []
+        # At most one decoded full image is retained between consecutive
+        # patches from the same path to bound worker memory.
         self._cached_path: str | None = None
         self._cached_image: numpy.ndarray | None = None
         self._build_index()
@@ -100,22 +94,15 @@ class StreamingTaskDataset(Dataset):
                     valid_height = min(source.height, image_height - source.y)
                     valid_width = min(source.width, image_width - source.x)
                     self._entries.append((sample_index, region))
-                    self.records.append(
-                        PreparedInputRecord(
-                            task_name=task_name,
-                            task_type=task_type,
-                            image_path=path,
-                            image_size=image_size,
-                            model_input_size=(source.width, source.height),
-                            source_xywh=(
-                                source.x,
-                                source.y,
-                                source.width,
-                                source.height,
-                            ),
-                            valid_source_hw=(valid_height, valid_width),
-                        )
-                    )
+                    self.records.append({
+                        "task_name": task_name,
+                        "task_type": task_type,
+                        "image_path": path,
+                        "image_size": image_size,
+                        "model_input_size": (source.width, source.height),
+                        "source_xywh": (source.x, source.y, source.width, source.height),
+                        "valid_source_hw": (valid_height, valid_width),
+                    })
             return
 
         model_input_size = self._thumbnail_model_input_size(task["thumbnail_size"])
@@ -123,33 +110,34 @@ class StreamingTaskDataset(Dataset):
             path = sample.image.image_path
             image_size = self._read_image_size(path)
             self._entries.append((sample_index, None))
-            self.records.append(
-                PreparedInputRecord(
-                    task_name=task_name,
-                    task_type=task_type,
-                    image_path=path,
-                    image_size=image_size,
-                    model_input_size=model_input_size,
-                )
-            )
+            self.records.append({
+                "task_name": task_name,
+                "task_type": task_type,
+                "image_path": path,
+                "image_size": image_size,
+                "model_input_size": model_input_size,
+            })
 
     def __len__(self) -> int:
         return len(self._entries)
 
-    def _processed_image(self, sample: HRSample) -> numpy.ndarray:
+    def source_sample_index(self, index: int) -> int:
+        return self._entries[index][0]
+
+    def _load_image(self, sample: HRSample) -> numpy.ndarray:
         path = sample.image.image_path
         if self._cached_path == path and self._cached_image is not None:
             return self._cached_image
-        preprocessor = self.preprocessor_registry.get(sample.clsname)
-        image_array = preprocessor.process_file(path, sample.clsname)
+        with Image.open(path) as image_file:
+            image_array = numpy.array(image_file.convert("RGB"), copy=True)
         if (
             not isinstance(image_array, numpy.ndarray)
-            or image_array.dtype != numpy.float32
+            or image_array.dtype != numpy.uint8
             or image_array.ndim != 3
             or image_array.shape[2] != 3
             or not numpy.isfinite(image_array).all()
         ):
-            raise ValueError("process_file must return finite HWC float32 RGB")
+            raise ValueError("Source image must be a finite HWC uint8 RGB image")
         self._cached_path = path
         self._cached_image = image_array
         return image_array
@@ -157,11 +145,9 @@ class StreamingTaskDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         sample_index, region = self._entries[index]
         sample = self.samples[sample_index]
-        image_array = self._processed_image(sample)
+        image_array = self._load_image(sample)
 
         sample.image.image = image_array
-        sample.image._is_processed = True
-        sample.image._shared_tensor = None
         try:
             if sample.mask is not None:
                 sample.mask.open()
@@ -175,9 +161,6 @@ class StreamingTaskDataset(Dataset):
                 task_name=self.task["name"],
             )[0]
         finally:
-            # Detach without freeing the one-image cache; clear sample handle only.
             sample.image.image = None
-            sample.image._is_processed = False
-            sample.image._shared_tensor = None
             if sample.mask is not None:
                 sample.mask.close()

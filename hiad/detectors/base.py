@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
-from typing import Callable, List, Optional
+from typing import List
 from torch.utils.data import DataLoader
 import torch
 import torch.nn.functional as F
 
 from hiad.data import HRImageIndex, LRPatch
-from hiad.scoring.contracts import DetectorEvidence
 from hiad.datasets.patch_dataset import PatchDataset
 
 class BaseDetector(ABC):
@@ -50,7 +49,6 @@ class BaseDetector(ABC):
     def train_step(self,
                    train_dataloader: DataLoader,
                    task_name: str,
-                   validation_callback: Optional[Callable[[], bool]] = None,
                    ) -> None:
         r"""
            This method defines the training procedure of the model.
@@ -58,31 +56,27 @@ class BaseDetector(ABC):
            Args
                train_dataloader (torch.utils.data.DataLoader): DataLoader used for training; the format of the returned data is defined by `create_dataset`.
                task_name (str): Task Name.
-               validation_callback: Optional trainer-owned callback invoked at the
-                    detector's validation interval. Returning True stops training.
-
            return:
-                None. Checkpoint selection and persistence are trainer responsibilities.
+                None. The trainer saves the final task checkpoint after training.
         """
         raise NotImplementedError
 
 
     @abstractmethod
-    def predict_evidence(
+    def inference_step(
         self,
         test_dataloader: DataLoader,
         task_name: str,
-    ) -> list[DetectorEvidence]:
+    ) -> list:
         r"""
-           Produce raw token and pixel evidence for each detector input.
+           Produce one pixel anomaly map for each detector input.
 
            Args
                test_dataloader (torch.utils.data.DataLoader): DataLoader used for testing; the format of the returned data is defined by `create_dataset`.
                task_name (str): Task Name.
 
            return:
-                One DetectorEvidence record per input sample, preserving both
-                native token scores and raw interpolated pixel scores.
+                One two-dimensional numpy anomaly map per input sample.
         """
         raise NotImplementedError
 
