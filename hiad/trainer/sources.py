@@ -79,6 +79,7 @@ def load_unified_training_samples(data_root) -> tuple[list[HRSample], tuple[str,
                 )
             label = record.get("label")
             category = record.get("clsname")
+            foreground_name = record.get("foreground")
             if (
                 isinstance(label, bool)
                 or label != 0
@@ -93,6 +94,11 @@ def load_unified_training_samples(data_root) -> tuple[list[HRSample], tuple[str,
             samples.append(
                 HRSample(
                     image=os.fspath(_resolve_training_path(root, record.get("filename"))),
+                    foreground=(
+                        os.fspath(root / foreground_name)
+                        if isinstance(foreground_name, str) and foreground_name
+                        else None
+                    ),
                     clsname=category,
                     label=0,
                     label_name=record.get("label_name"),

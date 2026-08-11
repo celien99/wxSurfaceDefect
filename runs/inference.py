@@ -67,6 +67,11 @@ if __name__ == "__main__":
     test_samples = [
         HRSample(
             image=os.path.join(args.data_root, record["filename"]),
+            foreground=(
+                os.path.join(args.data_root, record["foreground"])
+                if isinstance(record.get("foreground"), str) and record["foreground"]
+                else None
+            ),
             mask=os.path.join(args.data_root, record["mask"]) if record.get("mask") else None,
             clsname=record["clsname"],
             label=record["label"],

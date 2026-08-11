@@ -1,4 +1,8 @@
+import hashlib
+import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Union
 
 import cv2
@@ -115,12 +119,81 @@ class HRSample:
         label: int = None,
         label_name: str = None,
         clsname: str = None,
+        foreground: Union[str, HRImage] = None,
     ):
         self.image = HRImage(image, is_mask=False) if isinstance(image, str) else image
+        self.image = self._apply_foreground(self.image, foreground)
         self.mask = HRImage(mask, is_mask=True) if isinstance(mask, str) else mask
         self.label = label
         self.label_name = label_name
         self.clsname = clsname
+
+    @staticmethod
+    def _apply_foreground(image: HRImage, foreground: Union[str, HRImage]) -> HRImage:
+        """Return a cached RGB foreground composite when an optional mask is usable."""
+        if not isinstance(image, HRImage) or foreground is None:
+            return image
+        foreground_path = (
+            foreground.image_path if isinstance(foreground, HRImage) else foreground
+        )
+        if not isinstance(image.image_path, str) or not isinstance(foreground_path, str):
+            return image
+
+        try:
+            source_path = Path(image.image_path).expanduser().resolve()
+            mask_path = Path(foreground_path).expanduser().resolve()
+            source_stat = source_path.stat()
+            mask_stat = mask_path.stat()
+            cache_key = "|".join(
+                (
+                    os.fspath(source_path),
+                    str(source_stat.st_mtime_ns),
+                    str(source_stat.st_size),
+                    os.fspath(mask_path),
+                    str(mask_stat.st_mtime_ns),
+                    str(mask_stat.st_size),
+                )
+            )
+            cache_path = (
+                Path(tempfile.gettempdir())
+                / "hiad_foreground_cache"
+                / f"{hashlib.sha256(cache_key.encode()).hexdigest()}.png"
+            )
+            if cache_path.is_file():
+                return HRImage(os.fspath(cache_path), is_mask=False)
+
+            source_image = cv2.imread(os.fspath(source_path), cv2.IMREAD_COLOR)
+            foreground_image = cv2.imread(os.fspath(mask_path), cv2.IMREAD_GRAYSCALE)
+            if source_image is None or foreground_image is None:
+                return image
+
+            source_height, source_width = source_image.shape[:2]
+            if foreground_image.shape != (source_height, source_width):
+                foreground_image = cv2.resize(
+                    foreground_image,
+                    (source_width, source_height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            clean_image = cv2.bitwise_and(
+                source_image,
+                source_image,
+                mask=foreground_image,
+            )
+            temporary_path = cache_path.with_name(
+                f".{cache_path.stem}.{os.getpid()}.tmp.png"
+            )
+            try:
+                if not cv2.imwrite(os.fspath(temporary_path), clean_image):
+                    return image
+                os.replace(temporary_path, cache_path)
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+            return HRImage(os.fspath(cache_path), is_mask=False)
+        except (OSError, cv2.error):
+            return image
 
     def __getitem__(self, item: HRImageIndex) -> LRPatch:
         if self.image.image is None:
