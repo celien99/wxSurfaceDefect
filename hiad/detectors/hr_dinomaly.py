@@ -27,7 +27,6 @@ class HRDinomaly(BaseDetector):
     def __init__(self,
                  backbone_name,
                  total_iters,
-                 eval_per_steps,
                  log_per_steps,
                  patch_size: int,  # base
                  logger: logging.Logger,  # base
@@ -46,7 +45,6 @@ class HRDinomaly(BaseDetector):
                  **kwargs):
 
         total_iters = _positive_int(total_iters, "total_iters")
-        eval_per_steps = _positive_int(eval_per_steps, "eval_per_steps")
         log_per_steps = _positive_int(log_per_steps, "log_per_steps")
         super().__init__(patch_size, device, fusion_weights, logger, seed)
 
@@ -126,7 +124,6 @@ class HRDinomaly(BaseDetector):
                             fuse_layer_encoder=self.fuse_layer_encoder,
                             fuse_layer_decoder=self.fuse_layer_decoder)
         self.to_device(device)
-        self.eval_per_steps = eval_per_steps
         self.log_per_steps = log_per_steps
         self.max_anomaly_score = None
         self.min_anomaly_score = None

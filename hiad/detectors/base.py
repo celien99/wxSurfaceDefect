@@ -4,8 +4,8 @@ from torch.utils.data import DataLoader
 import torch
 import torch.nn.functional as F
 
-from hiad.data import HRImageIndex, LRPatch
-from hiad.datasets.patch_dataset import PatchDataset
+from hiad.data import HRImageIndex
+
 
 class BaseDetector(ABC):
 
@@ -54,7 +54,7 @@ class BaseDetector(ABC):
            This method defines the training procedure of the model.
 
            Args
-               train_dataloader (torch.utils.data.DataLoader): DataLoader used for training; the format of the returned data is defined by `create_dataset`.
+               train_dataloader (torch.utils.data.DataLoader): DataLoader used for training.
                task_name (str): Task Name.
            return:
                 None. The trainer saves the final task checkpoint after training.
@@ -72,7 +72,7 @@ class BaseDetector(ABC):
            Produce one pixel anomaly map for each detector input.
 
            Args
-               test_dataloader (torch.utils.data.DataLoader): DataLoader used for testing; the format of the returned data is defined by `create_dataset`.
+               test_dataloader (torch.utils.data.DataLoader): DataLoader used for testing.
                task_name (str): Task Name.
 
            return:
@@ -100,27 +100,12 @@ class BaseDetector(ABC):
         """
         raise NotImplementedError
 
-    def create_dataset(self, patches: List[LRPatch], training: bool, task_name: str):
-
-        r"""
-                This method defines how data is loaded for the model by constructing a `Dataset` to create a `DataLoader` object.
-                Args
-                    patches (List[LRPatch]): A set of low-resolution Patch objects.
-                    training (boolean): True if training, else False.
-                    task_name (str): Task Name
-                return:
-                    return a torch.utils.data.Dataset object
-        """
-        dataset = PatchDataset(patches = patches, training = training, task_name = task_name)
-        return dataset
-
     @torch.no_grad()
     def get_multi_resolution_fusion_embeddings(self, data) -> List[torch.Tensor]:
         r"""
             This method can obtain multi-resolution fusion features for patches. It is only available when `embedding` method is defined.
             Args:
-                data: The data produced by iterating over the `DataLoader`;
-                    its specific format is defined by the `Dataset` created via `create_dataset` method.
+                data: The data produced by iterating over the `DataLoader`.
             return:
                 Returns a list of fusion features (multi-scale features). Shape: ([B,C1,H1,W1], [B,C2,H2,W2], ..., [B,Cn,Hn,Wn]) same as 'embedding' method
 

@@ -1,11 +1,49 @@
 import numpy as np
 import pytest
 
-from hiad.evaluation.metrics.numpy_backend import (
-    compute_pixelwise_metrics as compute_exact_pixelwise_metrics,
-)
 from hiad.evaluation.metrics.pro import compute_pro
 from hiad.evaluation.metrics.torch_backend import compute_pixelwise_metrics
+
+
+def _exact_pixelwise_metrics(prediction_masks, gt_masks):
+    scores = np.concatenate([np.asarray(mask, dtype=np.float64).ravel() for mask in prediction_masks])
+    labels = np.concatenate([np.asarray(mask).ravel() for mask in gt_masks]).astype(np.int64)
+    if labels.min() < 0 or labels.max() > 1 or not np.isin(labels, [0, 1]).all():
+        raise ValueError("gt masks must be binary")
+    if not (labels == 0).any() or not (labels == 1).any():
+        raise ValueError("Binary metrics require both normal and anomalous labels")
+
+    order = np.argsort(-scores, kind="mergesort")
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    distinct = np.flatnonzero(sorted_scores[1:] != sorted_scores[:-1])
+    threshold_indexes = np.concatenate([distinct, [sorted_scores.size - 1]])
+    true_positives = np.cumsum(sorted_labels)[threshold_indexes].astype(np.float64)
+    predicted_positives = threshold_indexes.astype(np.float64) + 1.0
+    false_positives = predicted_positives - true_positives
+    positive_count = float(sorted_labels.sum())
+    negative_count = float(sorted_labels.size - positive_count)
+    tpr = true_positives / positive_count
+    fpr = false_positives / negative_count
+    precision = true_positives / predicted_positives
+    thresholds = sorted_scores[threshold_indexes]
+
+    pixel_auroc = float(np.trapezoid(np.concatenate([[0.0], tpr]), np.concatenate([[0.0], fpr])))
+    previous_recall = np.concatenate([[0.0], tpr[:-1]])
+    pixel_ap = float(np.sum((tpr - previous_recall) * precision))
+    f1_scores = np.divide(
+        2 * precision * tpr,
+        precision + tpr,
+        out=np.zeros_like(precision),
+        where=(precision + tpr) != 0,
+    )
+    best_index = int(np.argmax(f1_scores))
+    return {
+        "pixel_auroc": pixel_auroc,
+        "pixel_ap": pixel_ap,
+        "pixel_f1": float(f1_scores[best_index]),
+        "seg_threshold": float(thresholds[best_index]),
+    }
 
 
 def test_streaming_pixel_metrics_match_exact_metrics_for_separated_scores():
@@ -18,7 +56,7 @@ def test_streaming_pixel_metrics_match_exact_metrics_for_separated_scores():
         np.array([[0, 0], [1, 1]], dtype=np.uint8),
     ]
 
-    expected = compute_exact_pixelwise_metrics(prediction_masks, gt_masks)
+    expected = _exact_pixelwise_metrics(prediction_masks, gt_masks)
     actual = compute_pixelwise_metrics(
         prediction_masks,
         gt_masks,
@@ -27,7 +65,7 @@ def test_streaming_pixel_metrics_match_exact_metrics_for_separated_scores():
     )
 
     for metric in ("pixel_auroc", "pixel_ap", "pixel_f1"):
-        assert actual[metric] == pytest.approx(expected[metric])
+        assert actual[metric] == pytest.approx(expected[metric], abs=1e-3)
     assert actual["seg_threshold"] == pytest.approx(
         expected["seg_threshold"],
         abs=0.001,

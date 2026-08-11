@@ -2,7 +2,6 @@
 backbone_name: vit_base_patch16_dinov3.lvd1689m
 total_iters: 300
 thumbnail_total_iters: 100
-eval_per_steps: 500
 log_per_steps: 10
 
 bottleneck_dropout: 0.1
