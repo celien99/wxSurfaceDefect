@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--checkpoint-root", default="results/dinomaly_checkpoints")
     parser.add_argument("--log-root", default="results/dinomaly_logs")
-    parser.add_argument("--gpus", default="0,1")
+    parser.add_argument("--gpus", default="0")
     args = parser.parse_args()
 
     if args.patch_size <= 0 or args.patch_size % DINO_PATCH_SIZE:

@@ -1,4 +1,5 @@
 import logging
+import time
 from functools import partial
 
 import numpy as np
@@ -22,12 +23,6 @@ def _positive_int(value, name: str) -> int:
     return value
 
 
-def effective_training_iters(configured_iters: int, dataloader_length: int) -> int:
-    configured_iters = _positive_int(configured_iters, "configured_iters")
-    dataloader_length = _positive_int(dataloader_length, "dataloader_length")
-    return max(configured_iters, dataloader_length)
-
-
 class HRDinomaly(BaseDetector):
     def __init__(self,
                  backbone_name,
@@ -45,6 +40,9 @@ class HRDinomaly(BaseDetector):
                  hard_mining_warmup_iters: int = 1000,
                  easy_grad_factor: float = 0.1,
                  score_top_k: int = 4,
+                 encoder_amp: bool = True,
+                 decoder_amp: bool = True,
+                 allow_tf32: bool = True,
                  **kwargs):
 
         total_iters = _positive_int(total_iters, "total_iters")
@@ -72,6 +70,12 @@ class HRDinomaly(BaseDetector):
             )
         if not 0 <= easy_grad_factor <= 1:
             raise ValueError(f"easy_grad_factor must be in [0, 1], got {easy_grad_factor}")
+        if not isinstance(encoder_amp, bool):
+            raise TypeError("encoder_amp must be a boolean")
+        if not isinstance(decoder_amp, bool):
+            raise TypeError("decoder_amp must be a boolean")
+        if not isinstance(allow_tf32, bool):
+            raise TypeError("allow_tf32 must be a boolean")
         score_top_k = _positive_int(score_top_k, "score_top_k")
         self.total_iters = total_iters
         self.grad_clip_norm = grad_clip_norm
@@ -79,12 +83,20 @@ class HRDinomaly(BaseDetector):
         self.hard_mining_warmup_iters = hard_mining_warmup_iters
         self.easy_grad_factor = easy_grad_factor
         self.score_top_k = score_top_k
+        self.encoder_amp = encoder_amp
+        self.decoder_amp = decoder_amp
+        self.allow_tf32 = allow_tf32
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            torch.backends.cudnn.allow_tf32 = allow_tf32
+            torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
         self.target_layers = [2, 3, 4, 5, 6, 7, 8, 9]
         self.fuse_layer_encoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
         self.fuse_layer_decoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
         self.encoder = TimmDinoV3Encoder(
             model_name=backbone_name,
             intermediate_layers=self.target_layers,
+            use_fp16=self.encoder_amp,
         )
         embed_dim = self.encoder.embed_dim
         if embed_dim == 384:
@@ -144,7 +156,11 @@ class HRDinomaly(BaseDetector):
 
         optimizer = StableAdamW([{'params': trainable.parameters()}], lr=2e-3,
                                 betas=(0.9, 0.999), weight_decay=1e-4, amsgrad=False, eps=1e-10)
-        training_iters = effective_training_iters(self.total_iters, len(train_dataloader))
+        # Keep the configured budget, but never skip the first sampled epoch:
+        # with one or more sampled patches per source that epoch contains every
+        # normal training image.
+        batches_per_epoch = len(train_dataloader)
+        training_iters = max(self.total_iters, batches_per_epoch)
         warmup_iters = min(100, max(training_iters - 1, 0))
         lr_scheduler = WarmCosineScheduler(
             optimizer,
@@ -156,48 +172,83 @@ class HRDinomaly(BaseDetector):
         if self.logger is not None:
             self.logger.info(
                 "Task %s effective training iterations: %d "
-                "(configured=%d, full_epoch=%d)",
+                "(configured=%d, sampled_epoch_batches=%d)",
                 task_name,
                 training_iters,
                 self.total_iters,
                 len(train_dataloader),
             )
 
+        decoder_amp_enabled = self.decoder_amp and self.device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=decoder_amp_enabled)
+        self.model.train()
+        self.model.encoder.eval()
         it = 0
-        for epoch in range(int(np.ceil(training_iters / len(train_dataloader)))):
-            torch.cuda.empty_cache()
-
+        step_started = time.perf_counter()
+        for epoch in range(int(np.ceil(training_iters / batches_per_epoch))):
             for data in train_dataloader:
+                if it >= training_iters:
+                    break
 
-                self.model.train()
-                self.model.encoder.eval()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=decoder_amp_enabled,
+                ):
+                    en = self.get_multi_resolution_fusion_embeddings(data)
+                    en, de = self.model.distillation(en)
 
-                en = self.get_multi_resolution_fusion_embeddings(data)
-                en, de = self.model.distillation(en)
-
-                if self.hard_mining_warmup_iters == 0:
-                    p = self.hard_mining_final
-                else:
-                    p = min(
-                        self.hard_mining_final * it / self.hard_mining_warmup_iters,
-                        self.hard_mining_final,
+                    if self.hard_mining_warmup_iters == 0:
+                        p = self.hard_mining_final
+                    else:
+                        p = min(
+                            self.hard_mining_final * it / self.hard_mining_warmup_iters,
+                            self.hard_mining_final,
+                        )
+                    loss = global_cosine_hm_percent(
+                        en,
+                        de,
+                        p=p,
+                        factor=self.easy_grad_factor,
                     )
-                loss = global_cosine_hm_percent(en, de, p=p, factor=self.easy_grad_factor)
 
-                optimizer.zero_grad()
-                loss.backward()
+                if not torch.isfinite(loss).all():
+                    raise FloatingPointError(
+                        f"Task {task_name} produced a non-finite loss at iteration {it + 1}"
+                    )
+                if decoder_amp_enabled:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
                 grad_norm = None
                 if self.grad_clip_norm > 0:
-                    grad_norm = nn.utils.clip_grad_norm_(
-                        trainable.parameters(), max_norm=self.grad_clip_norm
-                    )
+                    try:
+                        grad_norm = nn.utils.clip_grad_norm_(
+                            trainable.parameters(),
+                            max_norm=self.grad_clip_norm,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as error:
+                        raise FloatingPointError(
+                            f"Task {task_name} produced non-finite gradients at iteration {it + 1}"
+                        ) from error
 
-                optimizer.step()
+                if decoder_amp_enabled:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
                 lr_scheduler.step()
                 it += 1
 
-                if it % self.log_per_steps == 0:
-                    log_message = 'iter [{}/{}], loss:{:.4f}'.format(it, training_iters, loss.item())
+                if it == 1 or it % self.log_per_steps == 0 or it == training_iters:
+                    elapsed = time.perf_counter() - step_started
+                    step_time = elapsed / it
+                    log_message = 'iter [{}/{}], loss:{:.4f}, avg_step_sec:{:.2f}'.format(
+                        it, training_iters, loss.item(), step_time
+                    )
                     if grad_norm is not None:
                         log_message += ', grad_norm:{:.4f}'.format(grad_norm.item())
                     if self.logger is not None:
@@ -213,44 +264,68 @@ class HRDinomaly(BaseDetector):
         self,
         test_dataloader: DataLoader,
         task_name: str,
+        *,
+        include_anomaly_maps: bool = True,
     ) -> list[dict]:
         self.model.eval()
         predictions = []
         for data in test_dataloader:
             en = self.get_multi_resolution_fusion_embeddings(data)
             en, de = self.model.distillation(en)
-            anomaly_map, token_map = self.cal_anomaly_maps(en, de, self.patch_size)
-            pixel_batch = anomaly_map[:, 0].cpu().numpy()
-            score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
-            predictions.extend(
-                {
-                    "anomaly_map": self.patch_post_processing(pixel_map),
-                    "score": float(score),
-                }
-                for pixel_map, score in zip(pixel_batch, score_batch)
-            )
+            if include_anomaly_maps:
+                # Preserve the recall-first map path: each layer is upsampled
+                # before taking the strongest local anomaly evidence.
+                anomaly_map, token_map = self.cal_anomaly_maps(en, de, self.patch_size)
+                pixel_batch = anomaly_map[:, 0].cpu().numpy()
+                score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
+                predictions.extend(
+                    {
+                        "anomaly_map": self.patch_post_processing(pixel_map),
+                        "score": float(score),
+                    }
+                    for pixel_map, score in zip(pixel_batch, score_batch)
+                )
+            else:
+                token_map = self.cal_anomaly_token_map(en, de)
+                score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
+                predictions.extend({"score": float(score)} for score in score_batch)
         return predictions
 
-    def cal_anomaly_maps(self, encoder_features, decoder_features, output_size):
+    @staticmethod
+    def _layer_anomaly_token_maps(encoder_features, decoder_features):
         if not encoder_features or len(encoder_features) != len(decoder_features):
             raise ValueError("Encoder and decoder feature lists must be non-empty and aligned")
-        token_layer_maps = []
-        pixel_layer_maps = []
-        for encoder_feature, decoder_feature in zip(encoder_features, decoder_features):
-            distance = torch.clamp(
+        return [
+            torch.clamp(
                 1 - F.cosine_similarity(encoder_feature.float(), decoder_feature.float()),
                 min=0.0,
                 max=2.0,
-            )
-            distance = distance.unsqueeze(1)
-            token_layer_maps.append(distance)
-            pixel_layer_maps.append(F.interpolate(
-                distance,
+            ).unsqueeze(1)
+            for encoder_feature, decoder_feature in zip(encoder_features, decoder_features)
+        ]
+
+    def cal_anomaly_token_map(self, encoder_features, decoder_features):
+        token_layer_maps = self._layer_anomaly_token_maps(
+            encoder_features,
+            decoder_features,
+        )
+        return torch.cat(token_layer_maps, dim=1).amax(dim=1, keepdim=True)
+
+    def cal_anomaly_maps(self, encoder_features, decoder_features, output_size):
+        token_layer_maps = self._layer_anomaly_token_maps(
+            encoder_features,
+            decoder_features,
+        )
+        token_map = torch.cat(token_layer_maps, dim=1).amax(dim=1, keepdim=True)
+        pixel_layer_maps = [
+            F.interpolate(
+                token_layer_map,
                 size=(output_size[1], output_size[0]),
                 mode="bilinear",
                 align_corners=True,
-            ))
-        token_map = torch.cat(token_layer_maps, dim=1).amax(dim=1, keepdim=True)
+            )
+            for token_layer_map in token_layer_maps
+        ]
         anomaly_map = torch.cat(pixel_layer_maps, dim=1).amax(dim=1, keepdim=True)
         return anomaly_map, token_map
 
@@ -273,6 +348,15 @@ class HRDinomaly(BaseDetector):
 
 
     def save_checkpoint(self, checkpoint_path: str):
+        for module_name, module in (
+            ("bottleneck", self.bottleneck),
+            ("decoder", self.decoder),
+        ):
+            for parameter_name, parameter in module.named_parameters():
+                if not torch.isfinite(parameter).all():
+                    raise FloatingPointError(
+                        f"Refusing to save a non-finite {module_name} parameter: {parameter_name}"
+                    )
         torch.save({
             "bottleneck": self.bottleneck.state_dict(),
             "decoder": self.decoder.state_dict(),
@@ -281,6 +365,9 @@ class HRDinomaly(BaseDetector):
             "fusion_weights": self.fusion_weights,
             "score_top_k": self.score_top_k,
             "layer_aggregation": "max",
+            "encoder_amp": self.encoder_amp,
+            "decoder_amp": self.decoder_amp,
+            "allow_tf32": self.allow_tf32,
         }, checkpoint_path)
 
 
@@ -294,6 +381,8 @@ class HRDinomaly(BaseDetector):
         aggregation = state_dict.get("layer_aggregation", "max")
         if aggregation != "max":
             raise ValueError(f"Unsupported checkpoint layer aggregation: {aggregation}")
+        if state_dict.get("encoder_amp", self.encoder_amp) != self.encoder_amp:
+            raise ValueError("Checkpoint encoder_amp does not match runtime configuration")
         self.score_top_k = _positive_int(
             state_dict.get("score_top_k", self.score_top_k),
             "checkpoint score_top_k",

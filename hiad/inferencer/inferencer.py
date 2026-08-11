@@ -46,7 +46,14 @@ def _gather_patch_predictions(patches, image_size):
     return (accumulated / weight_map).astype(np.float32)
 
 
-def inference_in_device(test_samples, task_group, model_manager, batch_size):
+def inference_in_device(
+    test_samples,
+    task_group,
+    model_manager,
+    batch_size,
+    *,
+    include_anomaly_maps: bool = True,
+):
     paths = [sample.image.image_path for sample in test_samples]
     results = {
         path: {"image_size": None, "patches": [], "thumbnail": None, "scores": []}
@@ -68,7 +75,11 @@ def inference_in_device(test_samples, task_group, model_manager, batch_size):
             num_workers=0,
             pin_memory=True,
         )
-        predictions = detector.inference_step(dataloader, task_name)
+        predictions = detector.inference_step(
+            dataloader,
+            task_name,
+            include_anomaly_maps=include_anomaly_maps,
+        )
         if len(predictions) != len(dataset.records):
             raise RuntimeError(
                 f"Task {task_name} returned {len(predictions)} predictions for "
@@ -79,13 +90,15 @@ def inference_in_device(test_samples, task_group, model_manager, batch_size):
             for record, prediction in zip(dataset.records, predictions):
                 path = record["image_path"]
                 results[path]["image_size"] = record["image_size"]
-                results[path]["patches"].append((record, prediction["anomaly_map"]))
+                if include_anomaly_maps:
+                    results[path]["patches"].append((record, prediction["anomaly_map"]))
                 results[path]["scores"].append(prediction["score"])
         elif task["type"] == TASK_TYPE_THUMBNAIL:
             for record, prediction in zip(dataset.records, predictions):
                 path = record["image_path"]
                 results[path]["image_size"] = record["image_size"]
-                results[path]["thumbnail"] = prediction["anomaly_map"]
+                if include_anomaly_maps:
+                    results[path]["thumbnail"] = prediction["anomaly_map"]
                 results[path]["scores"].append(prediction["score"])
         else:
             raise ValueError(f"Unsupported task type: {task}")
@@ -188,6 +201,7 @@ class HRInferencer:
                     task_group,
                     manager,
                     batch_size,
+                    include_anomaly_maps=True,
                 )
                 for task_group, manager in zip(self.tasks_in_devices, self.model_managers)
             ]
@@ -253,6 +267,37 @@ class HRInferencer:
                 output["image_thresholds"] = thresholds
                 output["is_defect"] = (image_scores > thresholds).tolist()
             return output
+
+    def score_samples(self, test_samples) -> np.ndarray:
+        """Compute image scores without reconstructing full-resolution maps."""
+        with self._inference_lock:
+            if self._closed:
+                raise RuntimeError("HRInferencer is closed")
+            self._validate_samples(test_samples)
+
+            batch_size = self.batch_size or len(test_samples)
+            pending = [
+                self._executor.submit(
+                    inference_in_device,
+                    test_samples,
+                    task_group,
+                    manager,
+                    batch_size,
+                    include_anomaly_maps=False,
+                )
+                for task_group, manager in zip(self.tasks_in_devices, self.model_managers)
+            ]
+            worker_results = [future.result() for future in pending]
+            scores_by_path = {
+                sample.image.image_path: []
+                for sample in test_samples
+            }
+            for worker_result in worker_results:
+                for path, result in worker_result.items():
+                    scores_by_path[path].extend(result["scores"])
+            return self.detector_class.get_image_score(
+                [scores_by_path[sample.image.image_path] for sample in test_samples]
+            )
 
     @staticmethod
     def _validate_samples(test_samples) -> None:

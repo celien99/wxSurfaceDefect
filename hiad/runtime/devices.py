@@ -1,3 +1,6 @@
+import torch
+
+
 def validate_gpu_ids(gpu_ids) -> list[int]:
     if not isinstance(gpu_ids, list) or not gpu_ids:
         raise ValueError("gpu_ids must be a non-empty list")
@@ -10,4 +13,11 @@ def validate_gpu_ids(gpu_ids) -> list[int]:
         raise ValueError("gpu_ids must contain non-negative integers")
     if len(set(gpu_ids)) != len(gpu_ids):
         raise ValueError("gpu_ids must not contain duplicates")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Dinomaly training and inference")
+    device_count = torch.cuda.device_count()
+    if any(gpu_id >= device_count for gpu_id in gpu_ids):
+        raise ValueError(
+            f"Requested GPU ids {gpu_ids} exceed the {device_count} available CUDA device(s)"
+        )
     return list(gpu_ids)

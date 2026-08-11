@@ -23,12 +23,13 @@ def global_cosine_hm_percent(a, b, p=0.9, factor=0.):
     for item in range(len(a)):
         a_ = a[item].detach()
         b_ = b[item]
-        with torch.no_grad():
-            point_dist = 1 - cos_loss(a_, b_).unsqueeze(1)
-
         loss += torch.mean(1 - cos_loss(a_.reshape(a_.shape[0], -1),
                                         b_.reshape(b_.shape[0], -1)))
 
+        if p == 0:
+            continue
+        with torch.no_grad():
+            point_dist = 1 - cos_loss(a_, b_).unsqueeze(1)
         easy_count = int(point_dist.numel() * p)
         if easy_count > 0:
             flat_mask = torch.zeros(point_dist.numel(), dtype=torch.bool, device=point_dist.device)

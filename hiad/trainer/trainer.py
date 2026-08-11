@@ -144,8 +144,7 @@ class HRTrainer:
         ) as inferencer:
             for start in range(0, len(sources.samples), self.batch_size):
                 batch_samples = list(sources.samples[start:start + self.batch_size])
-                result = inferencer.inference(batch_samples)
-                calibration_scores.extend(result["image_scores"].tolist())
+                calibration_scores.extend(inferencer.score_samples(batch_samples).tolist())
 
         percentile = float(getattr(self.config.patch, "normal_score_percentile", 0.99))
         score_top_k = int(getattr(self.config.patch, "score_top_k", 4))

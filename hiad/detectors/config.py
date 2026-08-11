@@ -13,5 +13,8 @@ def detector_config_for_task(config, task):
         detector_config = copy.deepcopy(config.thumbnail)
         detector_config.pop("thumbnail_size", None)
         detector_config.patch_size = task["thumbnail_size"]
+        thumbnail_total_iters = detector_config.get("thumbnail_total_iters")
+        if thumbnail_total_iters is not None:
+            detector_config.total_iters = thumbnail_total_iters
         return detector_config
     raise ValueError(f"Unsupported task type: {task}")

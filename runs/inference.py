@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--log-root", default="results/dinomaly_logs")
     parser.add_argument("--vis-root", default="results/dinomaly_vis")
     parser.add_argument("--vis-size", default=1024, type=int)
-    parser.add_argument("--gpus", default="0,1")
+    parser.add_argument("--gpus", default="0")
     args = parser.parse_args()
     if args.batch_size <= 0 or args.vis_size <= 0:
         parser.error("--batch-size and --vis-size must be positive")

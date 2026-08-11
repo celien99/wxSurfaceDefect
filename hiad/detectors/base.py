@@ -125,7 +125,7 @@ class BaseDetector(ABC):
                 Returns a list of fusion features (multi-scale features). Shape: ([B,C1,H1,W1], [B,C2,H2,W2], ..., [B,Cn,Hn,Wn]) same as 'embedding' method
 
         """
-        image = data['image'].to(self.device)
+        image = data['image'].to(self.device, non_blocking=True)
         low_resolution_image_keys = [key for key in data if key.startswith('low_resolution_image')]
 
         if len(low_resolution_image_keys) == 0:
@@ -146,7 +146,7 @@ class BaseDetector(ABC):
         # Collect all images into a single batch for one encoder forward pass
         all_images = [image]
         for key in low_resolution_image_keys:
-            all_images.append(data[key].to(self.device))
+            all_images.append(data[key].to(self.device, non_blocking=True))
         all_images = torch.cat(all_images, dim=0)
         all_embeddings = self.embedding(all_images)
 

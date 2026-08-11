@@ -1,7 +1,10 @@
+# The first complete sampled epoch always runs, so every normal source image
+# participates even when this fixed optimization budget is small.
 backbone_name: vit_base_patch16_dinov3.lvd1689m
-total_iters: 5000
+total_iters: 100
+thumbnail_total_iters: 30
 eval_per_steps: 500
-log_per_steps: 50
+log_per_steps: 10
 
 # Recall-first Dinomaly training parameters.
 bottleneck_dropout: 0.1
@@ -9,6 +12,10 @@ grad_clip_norm: 1.0
 hard_mining_final: 0.0
 hard_mining_warmup_iters: 1000
 easy_grad_factor: 0.1
+encoder_amp: true
+decoder_amp: true
+allow_tf32: true
+patches_per_source: 4
 
 # Preserve local anomaly evidence for low missed-detection operation.
 score_top_k: 4

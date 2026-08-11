@@ -43,6 +43,14 @@ def train_tasks_in_device(
             raise ValueError(f"Task {task_name} has no training samples")
 
         detector_config = detector_config_for_task(config, task)
+        patches_per_source = int(detector_config.get("patches_per_source", 4))
+        logger.info(
+            "Task %s index ready: source_images=%d, candidate_patches=%d; "
+            "initializing DINOv3 detector",
+            task_name,
+            len(train_samples),
+            len(dataset),
+        )
         detector = detector_class(
             **detector_config,
             logger=logger,
@@ -50,6 +58,7 @@ def train_tasks_in_device(
             seed=seed,
             fusion_weights=fusion_weights,
         )
+        logger.info("Task %s detector is resident on %s", task_name, device)
         sampler_generator = torch.Generator()
         sampler_generator.manual_seed(seed)
         train_dataloader = torch.utils.data.DataLoader(
@@ -57,6 +66,7 @@ def train_tasks_in_device(
             batch_size=batch_size,
             sampler=SourceGroupedRandomSampler(
                 dataset,
+                patches_per_source=patches_per_source,
                 generator=sampler_generator,
             ),
             num_workers=0,
@@ -64,14 +74,21 @@ def train_tasks_in_device(
             drop_last=False,
         )
 
-        logger.info("Task %s train dataset len is: %d", task_name, len(dataset))
+        logger.info(
+            "Task %s training patches: total=%d, sampled_per_epoch=%d, batches_per_epoch=%d",
+            task_name,
+            len(dataset),
+            len(train_dataloader.sampler),
+            len(train_dataloader),
+        )
         checkpoint_path = os.path.join(checkpoint_root, f"{task_name}_weight.pkl")
         detector.train_step(train_dataloader, task_name)
         detector.save_checkpoint(checkpoint_path)
         logger.info("Task %s checkpoint saved as %s", task_name, checkpoint_path)
 
-        detector.to_device(torch.device("cpu"))
         del detector
+        # Release the task model in-place. Moving a full DINOv3 model to CPU
+        # between tasks is slow and can hide an accidental CPU inference path.
         torch.cuda.empty_cache()
 
     logger.info("All tasks are done.")

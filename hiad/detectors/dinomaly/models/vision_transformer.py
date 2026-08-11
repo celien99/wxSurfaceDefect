@@ -261,12 +261,18 @@ class LinearAttention2(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = nn.functional.elu(q) + 1.
-        k = nn.functional.elu(k) + 1.
-
-        kv = torch.einsum('...sd,...se->...de', k, v)
-        z = 1.0 / torch.einsum('...sd,...d->...s', q, k.sum(dim=-2))
-        x = torch.einsum('...de,...sd,...s->...se', kv, q, z)
+        # The token reductions below overflow in FP16 at a 32x32 token grid.
+        # Keep the projection on Tensor Cores, but accumulate and normalize in
+        # FP32 before returning to the surrounding autocast region.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            q = nn.functional.elu(q.float()) + 1.0
+            k = nn.functional.elu(k.float()) + 1.0
+            v = v.float()
+            kv = torch.einsum('...sd,...se->...de', k, v)
+            denominator = torch.einsum('...sd,...d->...s', q, k.sum(dim=-2))
+            z = denominator.clamp_min(torch.finfo(q.dtype).eps).reciprocal()
+            x = torch.einsum('...de,...sd,...s->...se', kv, q, z)
+        x = x.to(qkv.dtype)
         x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
