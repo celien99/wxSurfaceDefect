@@ -1,8 +1,7 @@
-import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 
 from hiad.runtime.partition import round_robin_partition
 
@@ -17,8 +16,7 @@ def _compute_metrics_in_device(
     prediction_scores,
     sample_class_names,
 ):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    device = torch.device("cuda")
+    device = torch.device(f"cuda:{gpu_id}")
     scores = []
     for class_name in class_names:
         selected = [
@@ -61,35 +59,27 @@ def evaluate_category_metrics(batch, gpu_ids, evaluators):
         for group in round_robin_partition(all_class_names, len(gpu_ids))
         if group
     ]
-    pending_results = []
-    process_pool = mp.get_context("spawn").Pool(processes=len(class_groups))
-    try:
+    # Native-resolution masks can exceed Windows process-pipe limits; threads
+    # share the arrays while each worker targets its assigned CUDA device.
+    with ThreadPoolExecutor(max_workers=len(class_groups)) as executor:
+        pending_results = []
         for gpu_id, class_names in zip(gpu_ids, class_groups):
             pending_results.append(
-                process_pool.apply_async(
+                executor.submit(
                     _compute_metrics_in_device,
-                    (
-                        gpu_id,
-                        class_names,
-                        evaluators,
-                        batch.prediction_masks,
-                        batch.gt_masks,
-                        batch.gt_labels,
-                        batch.prediction_scores,
-                        batch.class_names,
-                    ),
+                    gpu_id,
+                    class_names,
+                    evaluators,
+                    batch.prediction_masks,
+                    batch.gt_masks,
+                    batch.gt_labels,
+                    batch.prediction_scores,
+                    batch.class_names,
                 )
             )
-        process_pool.close()
-        process_pool.join()
-    except Exception:
-        process_pool.terminate()
-        process_pool.join()
-        raise
-
-    scores = []
-    for pending_result in pending_results:
-        scores.extend(pending_result.get())
+        scores = []
+        for pending_result in pending_results:
+            scores.extend(pending_result.result())
     scores.sort(key=lambda score: score["clsname"])
     if not scores:
         raise RuntimeError("Evaluation produced no category scores")

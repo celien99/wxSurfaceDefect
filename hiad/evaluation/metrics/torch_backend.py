@@ -70,13 +70,75 @@ def compute_pixelwise_metrics(
     prediction_masks,
     gt_masks,
     device=None,
+    num_thresholds: int = 65536,
     **kwargs,
 ):
+    """Compute bounded-memory pixel metrics from a streaming score histogram."""
     pairs = validate_mask_pairs(prediction_masks, gt_masks)
-    scores = np.concatenate([prediction.reshape(-1) for prediction, _ in pairs])
-    labels = np.concatenate([target.reshape(-1) for _, target in pairs])
+    if isinstance(num_thresholds, bool) or not isinstance(num_thresholds, int):
+        raise TypeError("num_thresholds must be an integer")
+    if num_thresholds < 2:
+        raise ValueError("num_thresholds must be at least 2")
+
     device = _resolve_device(device)
-    fpr, recall, precision, thresholds = _binary_curve(scores, labels, device)
+    minimum = min(float(prediction.min()) for prediction, _ in pairs)
+    maximum = max(float(prediction.max()) for prediction, _ in pairs)
+    positive_counts = torch.zeros(num_thresholds, dtype=torch.int64, device=device)
+    negative_counts = torch.zeros_like(positive_counts)
+
+    for prediction, target in pairs:
+        scores = torch.as_tensor(
+            np.ascontiguousarray(prediction),
+            dtype=torch.float32,
+            device=device,
+        )
+        labels = torch.as_tensor(
+            np.ascontiguousarray(target),
+            dtype=torch.bool,
+            device=device,
+        )
+        if maximum == minimum:
+            bin_indexes = torch.full_like(
+                scores,
+                num_thresholds - 1,
+                dtype=torch.int64,
+            )
+        else:
+            bin_indexes = ((scores - minimum) * (
+                num_thresholds / (maximum - minimum)
+            )).to(torch.int64)
+            bin_indexes.clamp_(0, num_thresholds - 1)
+        positive_counts += torch.bincount(
+            bin_indexes[labels],
+            minlength=num_thresholds,
+        )
+        negative_counts += torch.bincount(
+            bin_indexes[~labels],
+            minlength=num_thresholds,
+        )
+
+    positive_total = positive_counts.sum()
+    negative_total = negative_counts.sum()
+    if positive_total.item() == 0 or negative_total.item() == 0:
+        raise ValueError("Binary metrics require both normal and anomalous labels")
+
+    true_positives = torch.cumsum(positive_counts.flip(0), dim=0).double()
+    false_positives = torch.cumsum(negative_counts.flip(0), dim=0).double()
+    recall = true_positives / positive_total.double()
+    fpr = false_positives / negative_total.double()
+    predicted_positives = true_positives + false_positives
+    precision = torch.where(
+        predicted_positives > 0,
+        true_positives / predicted_positives,
+        torch.zeros_like(predicted_positives),
+    )
+    thresholds = torch.linspace(
+        minimum,
+        maximum,
+        num_thresholds + 1,
+        dtype=torch.float64,
+        device=device,
+    )[:-1].flip(0)
     denominator = precision + recall
     f1_scores = torch.where(
         denominator > 0,

@@ -5,6 +5,19 @@ import numpy as np
 from tqdm import tqdm
 
 
+def scale_anomaly_map_for_display(prediction_mask, threshold=None):
+    prediction_mask = np.asarray(prediction_mask)
+    if threshold is not None:
+        threshold = float(threshold)
+        if np.isfinite(threshold) and threshold > 0:
+            return np.clip(prediction_mask / (2 * threshold), 0, 1)
+    minimum = float(prediction_mask.min())
+    maximum = float(prediction_mask.max())
+    if maximum == minimum:
+        return np.zeros_like(prediction_mask, dtype=np.float32)
+    return (prediction_mask - minimum) / (maximum - minimum)
+
+
 def save_evaluation_visualizations(
     batch,
     scores,
@@ -61,12 +74,13 @@ def save_evaluation_visualizations(
             interpolation=cv2.INTER_NEAREST,
         )
 
-        normalized_mask = cv2.normalize(
-            prediction_mask,
-            None,
-            0,
-            255,
-            cv2.NORM_MINMAX,
+        threshold = (
+            segmentation_thresholds[class_name]
+            if segmentation_thresholds is not None
+            else None
+        )
+        normalized_mask = (
+            scale_anomaly_map_for_display(prediction_mask, threshold) * 255
         ).astype(np.uint8)
         heatmap = cv2.applyColorMap(normalized_mask, cv2.COLORMAP_JET)
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
@@ -81,9 +95,7 @@ def save_evaluation_visualizations(
         if segmentation_thresholds is None:
             panels = [image, heat, image_with_mask * 255]
         else:
-            binary_prediction = (
-                prediction_mask >= segmentation_thresholds[class_name]
-            )
+            binary_prediction = prediction_mask >= threshold
             image_with_prediction = mark_boundaries(
                 image / 255,
                 binary_prediction,

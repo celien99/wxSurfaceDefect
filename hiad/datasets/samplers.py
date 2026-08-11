@@ -5,7 +5,7 @@ from torch.utils.data import Sampler
 
 
 class SourceGroupedRandomSampler(Sampler[int]):
-    """Sample a bounded random patch set for every source image each epoch."""
+    """Sample each source fairly while covering unseen patches before repeats."""
 
     def __init__(
         self,
@@ -28,15 +28,33 @@ class SourceGroupedRandomSampler(Sampler[int]):
         self._groups: dict[int, list[int]] = {}
         for index in range(len(self.dataset)):
             self._groups.setdefault(self.dataset.source_sample_index(index), []).append(index)
+        self._remaining: dict[int, list[int]] = {
+            group_id: [] for group_id in self._groups
+        }
+
+    def _sample_group(self, group_id: int) -> list[int]:
+        indexes = self._groups[group_id]
+        target_count = min(len(indexes), self.patches_per_source)
+        selected = []
+        while len(selected) < target_count:
+            remaining = self._remaining[group_id]
+            if not remaining:
+                available = [index for index in indexes if index not in selected]
+                order = torch.randperm(
+                    len(available),
+                    generator=self.generator,
+                ).tolist()
+                remaining.extend(available[position] for position in order)
+            take_count = min(target_count - len(selected), len(remaining))
+            selected.extend(remaining[:take_count])
+            del remaining[:take_count]
+        return selected
 
     def __iter__(self):
         group_ids = list(self._groups)
         group_order = torch.randperm(len(group_ids), generator=self.generator).tolist()
         for group_position in group_order:
-            indexes = self._groups[group_ids[group_position]]
-            patch_order = torch.randperm(len(indexes), generator=self.generator).tolist()
-            for patch_position in patch_order[: self.patches_per_source]:
-                yield indexes[patch_position]
+            yield from self._sample_group(group_ids[group_position])
 
     def __len__(self) -> int:
         return sum(

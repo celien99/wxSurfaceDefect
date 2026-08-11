@@ -1,23 +1,22 @@
-# The first complete sampled epoch always runs, so every normal source image
-# participates even when this fixed optimization budget is small.
+# Full patch coverage and hard-normal mining for aligned high-resolution parts.
 backbone_name: vit_base_patch16_dinov3.lvd1689m
-total_iters: 100
-thumbnail_total_iters: 30
+total_iters: 300
+thumbnail_total_iters: 100
 eval_per_steps: 500
 log_per_steps: 10
 
-# Recall-first Dinomaly training parameters.
 bottleneck_dropout: 0.1
 grad_clip_norm: 1.0
-hard_mining_final: 0.0
-hard_mining_warmup_iters: 1000
+hard_mining_final: 0.8
+hard_mining_warmup_iters: 100
 easy_grad_factor: 0.1
 encoder_amp: true
 decoder_amp: true
 allow_tf32: true
-patches_per_source: 4
 
-# Preserve local anomaly evidence for low missed-detection operation.
+# MVTec-2K images produce sixteen 512x512 patches, so every patch is used.
+patches_per_source: 16
+
 score_top_k: 4
 normal_score_percentile: 0.99
 map_gaussian_sigma: 0.0

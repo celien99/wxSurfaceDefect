@@ -4,6 +4,20 @@ from scipy import ndimage
 from .common import validate_mask_pairs
 
 
+def _counts_at_thresholds(values, ascending_thresholds):
+    bucket_indexes = np.searchsorted(
+        ascending_thresholds,
+        np.asarray(values).reshape(-1),
+        side="right",
+    )
+    bucket_counts = np.bincount(
+        bucket_indexes,
+        minlength=len(ascending_thresholds) + 1,
+    )
+    counts_at_ascending_thresholds = np.cumsum(bucket_counts[::-1])[::-1][1:]
+    return counts_at_ascending_thresholds[::-1]
+
+
 def compute_pro(
     prediction_masks,
     gt_masks,
@@ -21,51 +35,52 @@ def compute_pro(
         raise ValueError("num_thresholds must be at least 2")
 
     pairs = validate_mask_pairs(prediction_masks, gt_masks)
-    boolean_pairs = [
-        (prediction, target.astype(bool, copy=False))
-        for prediction, target in pairs
-    ]
-    background_count = sum(int((~target).sum()) for _, target in boolean_pairs)
-    if background_count == 0:
-        raise ValueError("PRO requires at least one background pixel")
-
-    regions = []
-    for pair_index, (_, target) in enumerate(boolean_pairs):
-        components, component_count = ndimage.label(target)
-        for component_id in range(1, component_count + 1):
-            region = components == component_id
-            regions.append((pair_index, region, int(region.sum())))
-    if not regions:
-        raise ValueError("PRO requires at least one anomalous region")
-
-    all_values = np.concatenate(
-        [prediction.reshape(-1) for prediction, _ in boolean_pairs]
-    )
-    minimum = float(all_values.min())
-    maximum = float(all_values.max())
+    minimum = min(float(prediction.min()) for prediction, _ in pairs)
+    maximum = max(float(prediction.max()) for prediction, _ in pairs)
     margin = max(
         np.finfo(np.float64).eps,
         abs(maximum) * 1e-12,
         abs(minimum) * 1e-12,
     )
     thresholds = np.linspace(maximum + margin, minimum - margin, num_thresholds)
+    ascending_thresholds = thresholds[::-1]
+    false_positives = np.zeros(num_thresholds, dtype=np.int64)
+    overlap_sums = np.zeros(num_thresholds, dtype=np.float64)
+    background_count = 0
+    region_count = 0
 
-    fprs = []
-    pros = []
-    for threshold in thresholds:
-        binary_predictions = [
-            prediction >= threshold for prediction, _ in boolean_pairs
-        ]
-        false_positives = sum(
-            int(np.logical_and(binary, ~target).sum())
-            for binary, (_, target) in zip(binary_predictions, boolean_pairs)
+    for prediction, target in pairs:
+        boolean_target = target.astype(bool, copy=False)
+        background = ~boolean_target
+        background_count += int(background.sum())
+        false_positives += _counts_at_thresholds(
+            prediction[background],
+            ascending_thresholds,
         )
-        overlaps = [
-            float(binary_predictions[pair_index][region].sum()) / region_size
-            for pair_index, region, region_size in regions
-        ]
-        fprs.append(false_positives / background_count)
-        pros.append(float(np.mean(overlaps)))
+
+        components, _ = ndimage.label(boolean_target)
+        for component_id, region_slice in enumerate(
+            ndimage.find_objects(components),
+            start=1,
+        ):
+            if region_slice is None:
+                continue
+            local_components = components[region_slice]
+            region = local_components == component_id
+            region_size = int(region.sum())
+            overlap_sums += _counts_at_thresholds(
+                prediction[region_slice][region],
+                ascending_thresholds,
+            ) / region_size
+            region_count += 1
+
+    if background_count == 0:
+        raise ValueError("PRO requires at least one background pixel")
+    if region_count == 0:
+        raise ValueError("PRO requires at least one anomalous region")
+
+    fprs = false_positives / background_count
+    pros = overlap_sums / region_count
 
     order = np.argsort(fprs, kind="stable")
     sorted_fprs = np.asarray(fprs)[order]
@@ -83,5 +98,8 @@ def compute_pro(
     if curve_fprs[0] > 0:
         curve_fprs.insert(0, 0.0)
         curve_pros.insert(0, 0.0)
-    area = np.trapz(np.asarray(curve_pros), np.asarray(curve_fprs))
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is None:
+        trapezoid = np.trapz
+    area = trapezoid(np.asarray(curve_pros), np.asarray(curve_fprs))
     return {"pixel_pro": float(np.clip(area / fpr_limit, 0.0, 1.0))}

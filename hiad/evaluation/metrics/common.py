@@ -30,14 +30,9 @@ def validate_mask_pairs(prediction_masks, gt_masks):
             raise ValueError("Each prediction mask must match its ground-truth mask shape")
         if not np.isfinite(prediction).all():
             raise ValueError("Prediction masks must be finite")
-        if not set(np.unique(target).tolist()).issubset({0, 1, False, True}):
+        if not np.logical_or(target == 0, target == 1).all():
             raise ValueError("Ground-truth masks must be binary")
-        pairs.append(
-            (
-                prediction.astype(np.float64, copy=False),
-                target.astype(np.int64, copy=False),
-            )
-        )
+        pairs.append((prediction, target))
     return pairs
 
 
