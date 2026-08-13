@@ -39,15 +39,17 @@ class HREvaluator:
                 print_console=True,
             )
 
-        main_logger.info("Computing metrics")
-        scores = evaluate_category_metrics(batch, gpu_ids, evaluators)
-        mean_metrics, report = summarize_category_scores(scores)
-        main_logger.info(f"\n{report}")
+        scores = []
+        mean_metrics = {}
+        if evaluators:
+            main_logger.info("Computing metrics")
+            scores = evaluate_category_metrics(batch, gpu_ids, evaluators)
+            mean_metrics, report = summarize_category_scores(scores)
+            main_logger.info(f"\n{report}")
 
         if self.vis_root is not None:
             save_evaluation_visualizations(
                 batch,
-                scores,
                 self.vis_root,
                 vis_size,
                 main_logger,

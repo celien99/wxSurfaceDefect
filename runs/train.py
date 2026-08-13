@@ -22,7 +22,7 @@ from hiad.trainer.sources import load_unified_training_samples
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HiAD Dinomaly training")
-    parser.add_argument("--data-root", default="data/MVTec-2K")
+    parser.add_argument("--data-root", required=True)
     parser.add_argument("--config", default="configs/dinomaly.yaml")
     parser.add_argument("--patch-size", default=512, type=int)
     parser.add_argument("--stride", default=-1, type=int)

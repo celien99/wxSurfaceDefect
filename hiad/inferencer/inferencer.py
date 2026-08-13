@@ -16,8 +16,10 @@ from hiad.datasets import StreamingTaskDataset
 from hiad.inferencer.modelmanager import ModelManager
 from hiad.runtime.devices import validate_gpu_ids
 from hiad.runtime.partition import round_robin_partition
+from hiad.runtime.prediction import threshold_anomaly_maps
 from hiad.runtime.score_calibration import (
     load_score_calibration,
+    pixel_thresholds_for_samples,
     thresholds_for_samples,
 )
 from hiad.task import load_tasks
@@ -265,7 +267,16 @@ class HRInferencer:
             if self.score_calibration is not None:
                 thresholds = thresholds_for_samples(self.score_calibration, test_samples)
                 output["image_thresholds"] = thresholds
-                output["is_defect"] = (image_scores > thresholds).tolist()
+                is_defect = image_scores > thresholds
+                pixel_thresholds = pixel_thresholds_for_samples(
+                    self.score_calibration, test_samples
+                )
+                output["is_defect"] = is_defect.tolist()
+                if pixel_thresholds is not None:
+                    output["pixel_thresholds"] = pixel_thresholds
+                    output["binary_anomaly_maps"] = threshold_anomaly_maps(
+                        anomaly_maps, pixel_thresholds
+                    )
             return output
 
     def score_samples(self, test_samples) -> np.ndarray:

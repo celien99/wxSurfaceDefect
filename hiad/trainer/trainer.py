@@ -12,6 +12,7 @@ from hiad.runtime.devices import validate_gpu_ids
 from hiad.runtime.score_calibration import (
     build_score_calibration,
     save_score_calibration,
+    summarize_anomaly_map,
 )
 from hiad.task import save_tasks, validate_tasks
 from hiad.trainer.sources import validate_unified_training_samples
@@ -131,41 +132,70 @@ class HRTrainer:
 
         from hiad.inferencer import HRInferencer
 
-        main_logger.info("Calibrating low-miss image scores from all normal training images")
+        main_logger.info(
+            "Calibrating image and pixel thresholds from all normal training images"
+        )
         calibration_scores = []
+        calibration_pixel_statistics = []
+        calibration_batch_size = int(
+            getattr(self.config.patch, "calibration_batch_size", 1)
+        )
+        pixel_percentile = float(
+            getattr(self.config.patch, "normal_pixel_percentile", 0.9999)
+        )
         with HRInferencer(
             detector_class=self.detector_class,
             config=self.config,
             checkpoint_root=self.checkpoint_root,
             gpu_ids=gpu_ids,
             models_per_gpu=-1,
-            batch_size=self.batch_size,
+            batch_size=calibration_batch_size,
             require_score_calibration=False,
         ) as inferencer:
-            for start in range(0, len(sources.samples), self.batch_size):
-                batch_samples = list(sources.samples[start:start + self.batch_size])
-                calibration_scores.extend(inferencer.score_samples(batch_samples).tolist())
+            for start in range(0, len(sources.samples), calibration_batch_size):
+                batch_samples = list(
+                    sources.samples[start:start + calibration_batch_size]
+                )
+                calibration_result = inferencer.inference(batch_samples)
+                calibration_scores.extend(calibration_result["image_scores"].tolist())
+                calibration_pixel_statistics.extend(
+                    summarize_anomaly_map(anomaly_map, pixel_percentile)
+                    for anomaly_map in calibration_result["anomaly_maps"]
+                )
 
         percentile = float(getattr(self.config.patch, "normal_score_percentile", 0.99))
+        pixel_image_percentile = float(
+            getattr(self.config.patch, "normal_pixel_image_percentile", 0.99)
+        )
         score_top_k = int(getattr(self.config.patch, "score_top_k", 4))
         calibration = build_score_calibration(
             sources.samples,
             np.asarray(calibration_scores, dtype=np.float64),
+            calibration_pixel_statistics,
             percentile=percentile,
+            pixel_percentile=pixel_percentile,
+            pixel_image_percentile=pixel_image_percentile,
             score_top_k=score_top_k,
         )
         calibration_path = save_score_calibration(calibration, self.checkpoint_root)
         main_logger.info(
-            "Score calibration saved as %s: percentile=%.4f, global_threshold=%.6f",
+            "Score calibration saved as %s: image_percentile=%.4f, "
+            "global_image_threshold=%.6f, pixel_percentile=%.6f, "
+            "pixel_image_percentile=%.4f, global_pixel_threshold=%.6f",
             calibration_path,
             calibration["percentile"],
             calibration["global_threshold"],
+            calibration["pixel_percentile"],
+            calibration["pixel_image_percentile"],
+            calibration["global_pixel_threshold"],
         )
         for category, payload in calibration["categories"].items():
             main_logger.info(
-                "Category %s score threshold: %.6f (normal_images=%d)",
+                "Category %s thresholds: image=%.6f, pixel=%.6f "
+                "(normal_images=%d)",
                 category,
                 payload["threshold"],
+                payload["pixel_threshold"],
                 payload["normal_image_count"],
             )
 

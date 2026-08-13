@@ -7,8 +7,6 @@ import numpy as np
 
 
 SCORE_CALIBRATION_FILE = "score_calibration.json"
-SCORE_CALIBRATION_DOMAIN = "dinomaly_max_layer_topk_token"
-SCORE_CALIBRATION_SCHEMA_VERSION = 1
 
 
 def _validate_percentile(value) -> float:
@@ -25,33 +23,61 @@ def _score_threshold(scores, percentile: float) -> float:
     return float(np.quantile(values, percentile))
 
 
-def build_score_calibration(samples, scores, *, percentile, score_top_k: int) -> dict:
+def summarize_anomaly_map(anomaly_map, percentile: float) -> float:
+    """Reduce one full-resolution map to a scalar for bounded-memory calibration."""
+    values = np.asarray(anomaly_map)
+    return float(np.quantile(values, _validate_percentile(percentile)))
+
+
+def build_score_calibration(
+    samples,
+    scores,
+    pixel_statistics,
+    *,
+    percentile,
+    pixel_percentile,
+    pixel_image_percentile,
+    score_top_k: int,
+) -> dict:
     samples = tuple(samples)
     scores = np.asarray(scores, dtype=np.float64)
     if scores.shape != (len(samples),):
         raise ValueError("Calibration score count must match the normal sample count")
+    pixel_statistics = np.asarray(pixel_statistics, dtype=np.float64)
+    if pixel_statistics.shape != (len(samples),):
+        raise ValueError("Pixel statistic count must match the normal sample count")
     if isinstance(score_top_k, bool) or not isinstance(score_top_k, int) or score_top_k <= 0:
         raise ValueError("score_top_k must be a positive integer")
     percentile = _validate_percentile(percentile)
+    pixel_percentile = _validate_percentile(pixel_percentile)
+    pixel_image_percentile = _validate_percentile(pixel_image_percentile)
 
     grouped_scores: dict[str, list[float]] = {}
-    for sample, score in zip(samples, scores):
+    grouped_pixel_statistics: dict[str, list[float]] = {}
+    for sample, score, pixel_statistic in zip(samples, scores, pixel_statistics):
         category = sample.clsname
         if not isinstance(category, str) or not category.strip():
             raise ValueError("Every calibration sample must have a non-empty clsname")
         grouped_scores.setdefault(category, []).append(float(score))
+        grouped_pixel_statistics.setdefault(category, []).append(float(pixel_statistic))
 
     return {
-        "schema_version": SCORE_CALIBRATION_SCHEMA_VERSION,
-        "domain": SCORE_CALIBRATION_DOMAIN,
         "score_top_k": score_top_k,
         "percentile": percentile,
+        "pixel_percentile": pixel_percentile,
+        "pixel_image_percentile": pixel_image_percentile,
         "normal_image_count": len(samples),
         "global_threshold": _score_threshold(scores, percentile),
+        "global_pixel_threshold": _score_threshold(
+            pixel_statistics, pixel_image_percentile
+        ),
         "categories": {
             category: {
                 "normal_image_count": len(category_scores),
                 "threshold": _score_threshold(category_scores, percentile),
+                "pixel_threshold": _score_threshold(
+                    grouped_pixel_statistics[category], pixel_image_percentile
+                ),
             }
             for category, category_scores in sorted(grouped_scores.items())
         },
@@ -78,25 +104,6 @@ def load_score_calibration(checkpoint_root: str, *, required: bool = True) -> di
         return None
     with open(path, "r", encoding="utf-8") as stream:
         calibration = json.load(stream)
-    if not isinstance(calibration, dict):
-        raise ValueError("Score calibration must be a mapping")
-    if calibration.get("schema_version") != SCORE_CALIBRATION_SCHEMA_VERSION:
-        raise ValueError("Unsupported score calibration schema version")
-    if calibration.get("domain") != SCORE_CALIBRATION_DOMAIN:
-        raise ValueError("Score calibration domain does not match Dinomaly scoring")
-    _validate_percentile(calibration.get("percentile"))
-    global_threshold = float(calibration.get("global_threshold"))
-    if not np.isfinite(global_threshold):
-        raise ValueError("Score calibration global threshold must be finite")
-    categories = calibration.get("categories")
-    if not isinstance(categories, dict):
-        raise ValueError("Score calibration categories must be a mapping")
-    for category, payload in categories.items():
-        if not isinstance(category, str) or not category or not isinstance(payload, dict):
-            raise ValueError("Score calibration contains an invalid category entry")
-        threshold = float(payload.get("threshold"))
-        if not np.isfinite(threshold):
-            raise ValueError(f"Score threshold for category {category} must be finite")
     return calibration
 
 
@@ -106,6 +113,25 @@ def thresholds_for_samples(calibration: dict, samples) -> np.ndarray:
     return np.asarray(
         [
             float(categories.get(sample.clsname, {}).get("threshold", global_threshold))
+            for sample in samples
+        ],
+        dtype=np.float32,
+    )
+
+
+def pixel_thresholds_for_samples(calibration: dict, samples) -> np.ndarray | None:
+    global_value = calibration.get("global_pixel_threshold")
+    if global_value is None:
+        return None
+    global_threshold = float(global_value)
+    categories = calibration["categories"]
+    return np.asarray(
+        [
+            float(
+                categories.get(sample.clsname, {}).get(
+                    "pixel_threshold", global_threshold
+                )
+            )
             for sample in samples
         ],
         dtype=np.float32,

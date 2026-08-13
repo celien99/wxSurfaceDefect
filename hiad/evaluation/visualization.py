@@ -20,7 +20,6 @@ def scale_anomaly_map_for_display(prediction_mask, threshold=None):
 
 def save_evaluation_visualizations(
     batch,
-    scores,
     output_root,
     output_size,
     logger,
@@ -42,11 +41,6 @@ def save_evaluation_visualizations(
     if not isinstance(batch.display_images, dict):
         raise ValueError("Visualization requires inference(..., display_size=vis_size)")
 
-    segmentation_thresholds = (
-        {score["clsname"]: score["seg_threshold"] for score in scores}
-        if "seg_threshold" in scores[0]
-        else None
-    )
     logger.info("Saving visualizations")
     for index, (sample, prediction_mask, gt_mask, class_name) in enumerate(
         tqdm(
@@ -75,8 +69,8 @@ def save_evaluation_visualizations(
         )
 
         threshold = (
-            segmentation_thresholds[class_name]
-            if segmentation_thresholds is not None
+            float(batch.pixel_thresholds[index])
+            if batch.pixel_thresholds is not None
             else None
         )
         normalized_mask = (
@@ -86,23 +80,29 @@ def save_evaluation_visualizations(
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
         heat = cv2.addWeighted(image.astype(np.uint8), 0.5, heatmap, 0.5, 0)
 
-        image_with_mask = mark_boundaries(
-            image / 255,
-            gt_mask,
-            color=(1, 0, 0),
-            mode="inner",
-        )
-        if segmentation_thresholds is None:
-            panels = [image, heat, image_with_mask * 255]
+        if batch.binary_prediction_masks is None:
+            panels = [image, heat]
         else:
-            binary_prediction = prediction_mask >= threshold
+            binary_prediction = cv2.resize(
+                batch.binary_prediction_masks[index].astype(np.uint8),
+                output_size,
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
             image_with_prediction = mark_boundaries(
                 image / 255,
                 binary_prediction,
                 color=(1, 0, 0),
                 mode="inner",
             )
-            panels = [image_with_prediction * 255, heat, image_with_mask * 255]
+            panels = [image_with_prediction * 255, heat]
+        if sample.mask is not None:
+            image_with_mask = mark_boundaries(
+                image / 255,
+                gt_mask,
+                color=(1, 0, 0),
+                mode="inner",
+            )
+            panels.append(image_with_mask * 255)
 
         image_name = os.path.basename(sample.image.image_path)
         Image.fromarray(np.concatenate(panels, axis=1).astype(np.uint8)).save(

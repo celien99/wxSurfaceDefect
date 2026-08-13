@@ -13,6 +13,8 @@ class EvaluationBatch:
     class_names: tuple[str, ...]
     prediction_scores: np.ndarray
     prediction_masks: tuple[np.ndarray, ...]
+    binary_prediction_masks: tuple[np.ndarray, ...] | None
+    pixel_thresholds: np.ndarray | None
     gt_labels: np.ndarray
     gt_masks: tuple[np.ndarray, ...]
     display_images: dict | None
@@ -77,6 +79,25 @@ def build_evaluation_batch(test_samples, inference_result) -> EvaluationBatch:
             sample.label if sample.label is not None else np.max(gt_mask).item()
         )
 
+    binary_values = inference_result.get("binary_anomaly_maps")
+    binary_prediction_masks = None
+    if binary_values is not None:
+        if not isinstance(binary_values, list) or len(binary_values) != len(test_samples):
+            raise ValueError("Inference result binary_anomaly_maps have an invalid length")
+        binary_prediction_masks = tuple(np.asarray(mask, dtype=bool) for mask in binary_values)
+        if any(
+            mask.shape != prediction.shape
+            for mask, prediction in zip(binary_prediction_masks, prediction_masks)
+        ):
+            raise ValueError("Binary anomaly maps must match anomaly map shapes")
+
+    pixel_threshold_values = inference_result.get("pixel_thresholds")
+    pixel_thresholds = None
+    if pixel_threshold_values is not None:
+        pixel_thresholds = np.asarray(pixel_threshold_values, dtype=np.float32)
+        if pixel_thresholds.shape != (len(test_samples),):
+            raise ValueError("Inference result pixel_thresholds have an invalid shape")
+
     return EvaluationBatch(
         samples=tuple(test_samples),
         image_paths=image_paths,
@@ -86,6 +107,8 @@ def build_evaluation_batch(test_samples, inference_result) -> EvaluationBatch:
         ),
         prediction_scores=prediction_scores,
         prediction_masks=tuple(prediction_masks),
+        binary_prediction_masks=binary_prediction_masks,
+        pixel_thresholds=pixel_thresholds,
         gt_labels=np.asarray(gt_labels),
         gt_masks=tuple(gt_masks),
         display_images=inference_result.get("display_images"),

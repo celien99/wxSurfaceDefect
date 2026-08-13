@@ -20,11 +20,17 @@ from hiad.evaluation.metrics.torch_backend import (
 )
 from hiad.inferencer import HRInferencer
 from hiad.runtime.logging import create_logger
+from hiad.runtime.prediction import (
+    has_complete_image_annotations,
+    has_complete_pixel_annotations,
+    save_predictions,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HiAD Dinomaly inference")
-    parser.add_argument("--data-root", default="data/MVTec-2K")
+    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--manifest", default="test_uni.jsonl")
     parser.add_argument("--config", default="configs/dinomaly.yaml")
     parser.add_argument("--batch-size", default=16, type=int)
     parser.add_argument("--checkpoint-root", default="results/dinomaly_checkpoints")
@@ -63,7 +69,7 @@ if __name__ == "__main__":
     main_logger.info(args)
     main_logger.info("Loading checkpoints from %s", args.checkpoint_root)
 
-    test_meta = read_jsonl_records(os.path.join(args.data_root, "test_uni.jsonl"))
+    test_meta = read_jsonl_records(os.path.join(args.data_root, args.manifest))
     test_samples = [
         HRSample(
             image=os.path.join(args.data_root, record["filename"]),
@@ -73,8 +79,8 @@ if __name__ == "__main__":
                 else None
             ),
             mask=os.path.join(args.data_root, record["mask"]) if record.get("mask") else None,
-            clsname=record["clsname"],
-            label=record["label"],
+            clsname=record.get("clsname", "default"),
+            label=record.get("label"),
             label_name=record.get("label_name"),
         )
         for record in test_meta
@@ -96,12 +102,28 @@ if __name__ == "__main__":
             display_size=args.vis_size,
         )
 
+    predictions_path = os.path.join(args.log_root, "predictions.jsonl")
+    save_predictions(predictions_path, test_samples, inference_result)
+    main_logger.info("Per-image predictions saved to %s", predictions_path)
+
+    evaluators = []
+    if has_complete_image_annotations(test_meta):
+        evaluators.append(compute_imagewise_metrics)
+    else:
+        main_logger.info("Image labels are incomplete; skipping image metrics")
+    if has_complete_pixel_annotations(test_meta):
+        evaluators.extend([compute_pixelwise_metrics, compute_pro])
+    elif evaluators:
+        main_logger.info(
+            "Pixel masks are incomplete; skipping pixel AUROC/AP/F1 and PRO metrics"
+        )
+
     evaluator = HREvaluator(log_root=args.log_root, vis_root=args.vis_root)
     evaluator.evaluate(
         test_samples=test_samples,
         inference_result=inference_result,
         gpu_ids=gpu_ids,
-        evaluators=[compute_imagewise_metrics, compute_pixelwise_metrics, compute_pro],
+        evaluators=evaluators,
         main_logger=main_logger,
         vis_size=args.vis_size,
     )
