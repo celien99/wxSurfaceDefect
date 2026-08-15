@@ -82,10 +82,25 @@ def test_select_refinement_regions_adds_deterministic_safety_coverage():
     )
 
     assert first == second
-    assert first == [
-        HRImageIndex(x=0, y=0, width=4, height=4),
-        HRImageIndex(x=6, y=2, width=4, height=4),
-    ]
+    assert len(first) == 2
+    assert len({region.x for region in first}) == 2
+    assert len({region.y for region in first}) == 2
+
+
+def test_select_refinement_regions_does_not_fill_sparse_component_bbox():
+    anomaly_map = np.zeros((16, 16), dtype=np.float32)
+    np.fill_diagonal(anomaly_map, 1.0)
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=4,
+        safety_fraction=0.01,
+    )
+
+    assert len(regions) <= 5
+    assert sum(region.x == region.y for region in regions) >= 4
 
 
 def test_select_refinement_regions_keeps_a_top_quantile_plateau():
@@ -116,20 +131,35 @@ def test_select_refinement_regions_rejects_zero_safety_coverage():
         )
 
 
-def test_merge_refinement_maps_uses_native_coordinates_and_valid_edge_extent():
-    base_map = np.full((4, 6), 0.2, dtype=np.float32)
-    refinement_map = np.full((4, 4), 0.8, dtype=np.float32)
+def test_merge_refinement_maps_blends_native_edge_extent():
+    base_map = np.full((6, 8), 0.2, dtype=np.float32)
+    refinement_map = np.full((5, 5), 0.8, dtype=np.float32)
 
     merged = merge_refinement_maps(
         base_map,
-        [(HRImageIndex(x=4, y=2, width=4, height=4), refinement_map)],
-        image_size=(6, 4),
+        [(HRImageIndex(x=4, y=2, width=5, height=5), refinement_map)],
+        image_size=(8, 6),
     )
 
-    assert merged.shape == (4, 6)
+    assert merged.shape == (6, 8)
     assert np.all(merged[:2, :] == 0.2)
     assert np.all(merged[2:, :4] == 0.2)
-    assert np.all(merged[2:, 4:] == 0.8)
+    assert np.all(merged[2:, 4:] > 0.2)
+    assert merged[4, 6] == 0.8
+
+
+def test_merge_refinement_maps_can_suppress_coarse_false_positive():
+    base_map = np.full((7, 7), 0.8, dtype=np.float32)
+    refinement_map = np.full((5, 5), 0.2, dtype=np.float32)
+
+    merged = merge_refinement_maps(
+        base_map,
+        [(HRImageIndex(x=1, y=1, width=5, height=5), refinement_map)],
+        image_size=(7, 7),
+    )
+
+    assert merged[3, 3] == 0.2
+    assert merged[0, 0] == 0.8
 
 
 def test_refinement_region_keeps_nested_multiscale_context_at_image_edge():

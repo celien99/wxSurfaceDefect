@@ -30,6 +30,7 @@ from hiad.runtime.decision import (
     classify_score,
     component_statistics,
     image_score_from_statistics,
+    top_k_map_score,
 )
 from hiad.runtime.partition import round_robin_partition
 from hiad.runtime.prediction import threshold_anomaly_maps
@@ -101,6 +102,7 @@ def inference_in_device(
             "max_patches": [],
             "thumbnail": None,
             "max_thumbnail": None,
+            "thumbnail_score": None,
             "scores": [],
         }
         for path in paths
@@ -144,6 +146,7 @@ def inference_in_device(
                 results[path]["image_size"] = record["image_size"]
                 results[path]["thumbnail"] = prediction["anomaly_map"]
                 results[path]["max_thumbnail"] = prediction["max_evidence_map"]
+                results[path]["thumbnail_score"] = prediction["score"]
                 results[path]["scores"].append(prediction["score"])
         else:
             raise ValueError(f"Unsupported task type: {task}")
@@ -250,6 +253,7 @@ class HRInferencer:
         )
         if not np.isfinite(self.global_routing_weight) or not 0 <= self.global_routing_weight <= 1:
             raise ValueError("global_routing_weight must be finite and in [0, 1]")
+        self.score_top_k = int(self.config.patch.score_top_k)
         self._executor = ThreadPoolExecutor(max_workers=len(task_groups))
         self._inference_lock = Lock()
         self._closed = False
@@ -275,6 +279,7 @@ class HRInferencer:
                     "max_patches": [],
                     "thumbnail": None,
                     "max_thumbnail": None,
+                    "thumbnail_score": None,
                     "scores": [],
                 }
                 for sample in test_samples
@@ -294,12 +299,13 @@ class HRInferencer:
                             raise ValueError(f"Duplicate thumbnail prediction for {path}")
                         merged[path]["thumbnail"] = result["thumbnail"]
                         merged[path]["max_thumbnail"] = result["max_thumbnail"]
+                        merged[path]["thumbnail_score"] = result["thumbnail_score"]
 
             anomaly_maps = []
             max_evidence_maps = []
             global_context_maps = []
             global_max_evidence_maps = []
-            task_score_groups = []
+            global_scores = []
             for sample in test_samples:
                 path = sample.image.image_path
                 result = merged[path]
@@ -312,7 +318,11 @@ class HRInferencer:
                 )
                 final_map = patch_map
                 final_max_map = max_patch_map
-                if result["thumbnail"] is None or result["max_thumbnail"] is None:
+                if (
+                    result["thumbnail"] is None
+                    or result["max_thumbnail"] is None
+                    or result["thumbnail_score"] is None
+                ):
                     raise ValueError(f"Incomplete global context prediction for {path}")
                 image_width, image_height = result["image_size"]
                 global_context_maps.append(cv2.resize(
@@ -332,7 +342,7 @@ class HRInferencer:
                     )
                 anomaly_maps.append(np.asarray(final_map, dtype=np.float32))
                 max_evidence_maps.append(np.asarray(final_max_map, dtype=np.float32))
-                task_score_groups.append(result["scores"])
+                global_scores.append(float(result["thumbnail_score"]))
 
             routing_maps = [
                 build_routing_map(
@@ -345,17 +355,20 @@ class HRInferencer:
                     global_context_maps,
                 )
             ]
-            anomaly_maps, max_evidence_maps, refinement_scores = self._apply_refinement(
+            anomaly_maps, max_evidence_maps = self._apply_refinement(
                 test_samples,
                 anomaly_maps,
                 max_evidence_maps,
                 routing_maps,
                 batch_size,
             )
-            for score_group, sample in zip(task_score_groups, test_samples):
-                score_group.extend(refinement_scores[sample.image.image_path])
-
-            image_scores = self.detector_class.get_image_score(task_score_groups)
+            image_scores = np.asarray(
+                [
+                    max(top_k_map_score(anomaly_map, self.score_top_k), global_score)
+                    for anomaly_map, global_score in zip(anomaly_maps, global_scores)
+                ],
+                dtype=np.float32,
+            )
             output = {
                 "image_paths": [sample.image.image_path for sample in test_samples],
                 "image_scores": image_scores,
@@ -488,15 +501,10 @@ class HRInferencer:
             sample.image.image_path: []
             for sample in test_samples
         }
-        scores_by_path = {
-            sample.image.image_path: []
-            for sample in test_samples
-        }
         for worker_result in worker_results:
             for path, result in worker_result.items():
                 refinements_by_path[path].extend(result["patches"])
                 max_refinements_by_path[path].extend(result["max_patches"])
-                scores_by_path[path].extend(result["scores"])
 
         refined_maps = []
         refined_max_maps = []
@@ -539,7 +547,7 @@ class HRInferencer:
                     image_size=(base_max_map.shape[1], base_max_map.shape[0]),
                 )
             )
-        return refined_maps, refined_max_maps, scores_by_path
+        return refined_maps, refined_max_maps
 
     @staticmethod
     def _validate_samples(test_samples) -> None:

@@ -59,18 +59,43 @@ def _validate_selection_arguments(
     return values
 
 
-def _tile_for_center(center_x, center_y, tile_size, image_width, image_height):
-    x = min(max(math.floor(center_x - tile_size / 2), 0), max(image_width - tile_size, 0))
-    y = min(max(math.floor(center_y - tile_size / 2), 0), max(image_height - tile_size, 0))
-    return HRImageIndex(x=x, y=y, width=tile_size, height=tile_size)
-
-
 def _tile_axis_starts(length: int, tile_size: int) -> list[int]:
     if length <= tile_size:
         return [0]
     starts = list(range(0, length, tile_size))
     starts[-1] = length - tile_size
     return list(dict.fromkeys(starts))
+
+
+def _radical_inverse(index: int, base: int) -> float:
+    result = 0.0
+    fraction = 1.0 / base
+    while index:
+        result += (index % base) * fraction
+        index //= base
+        fraction /= base
+    return result
+
+
+def _spatial_safety_indexes(row_count: int, column_count: int, count: int) -> list[int]:
+    total = row_count * column_count
+    if count >= total:
+        return list(range(total))
+    selected = []
+    seen = set()
+    sequence_index = 1
+    while len(selected) < count:
+        row = min(int(_radical_inverse(sequence_index, 2) * row_count), row_count - 1)
+        column = min(
+            int(_radical_inverse(sequence_index, 3) * column_count),
+            column_count - 1,
+        )
+        flattened = row * column_count + column
+        if flattened not in seen:
+            seen.add(flattened)
+            selected.append(flattened)
+        sequence_index += 1
+    return selected
 
 
 def select_refinement_regions(
@@ -81,41 +106,41 @@ def select_refinement_regions(
         anomaly_map, threshold, tile_size, min_area, safety_fraction
     )
     image_height, image_width = values.shape
-    selected = []
+    x_starts = _tile_axis_starts(image_width, tile_size)
+    y_starts = _tile_axis_starts(image_height, tile_size)
     binary = np.zeros(values.shape, dtype=np.uint8)
     if float(values.max()) > float(values.min()):
         binary = np.asarray(values >= threshold, dtype=np.uint8)
-    component_count, _, statistics, _ = cv2.connectedComponentsWithStats(
+    component_count, labels, statistics, _ = cv2.connectedComponentsWithStats(
         binary, connectivity=8
     )
-    for component_index in range(1, component_count):
-        if int(statistics[component_index, cv2.CC_STAT_AREA]) < min_area:
-            continue
-        left = int(statistics[component_index, cv2.CC_STAT_LEFT])
-        top = int(statistics[component_index, cv2.CC_STAT_TOP])
-        width = int(statistics[component_index, cv2.CC_STAT_WIDTH])
-        height = int(statistics[component_index, cv2.CC_STAT_HEIGHT])
-        for y in range(top, top + height, tile_size):
-            for x in range(left, left + width, tile_size):
-                selected.append(
-                    _tile_for_center(
-                        min(x + tile_size / 2, left + width - 0.5),
-                        min(y + tile_size / 2, top + height - 0.5),
-                        tile_size,
-                        image_width,
-                        image_height,
-                    )
-                )
-
-    selected = list(dict.fromkeys(selected))
+    valid_components = np.zeros(component_count, dtype=bool)
+    valid_components[1:] = statistics[1:, cv2.CC_STAT_AREA] >= min_area
+    candidate_y, candidate_x = np.nonzero(valid_components[labels])
+    occupied_tiles = set()
+    if candidate_x.size:
+        x_indexes = np.searchsorted(x_starts, candidate_x, side="right") - 1
+        y_indexes = np.searchsorted(y_starts, candidate_y, side="right") - 1
+        occupied_tiles.update(zip(y_indexes.tolist(), x_indexes.tolist()))
+    selected = [
+        HRImageIndex(
+            x=x_starts[x_index],
+            y=y_starts[y_index],
+            width=tile_size,
+            height=tile_size,
+        )
+        for y_index, x_index in sorted(occupied_tiles)
+    ]
     safety_tiles = [
         HRImageIndex(x=x, y=y, width=tile_size, height=tile_size)
-        for y in _tile_axis_starts(image_height, tile_size)
-        for x in _tile_axis_starts(image_width, tile_size)
+        for y in y_starts
+        for x in x_starts
     ]
     safety_count = max(1, math.ceil(len(safety_tiles) * float(safety_fraction)))
-    safety_indexes = np.linspace(
-        0, len(safety_tiles) - 1, num=safety_count, dtype=np.intp
+    safety_indexes = _spatial_safety_indexes(
+        len(y_starts),
+        len(x_starts),
+        safety_count,
     )
     for safety_index in safety_indexes:
         tile = safety_tiles[int(safety_index)]
@@ -139,7 +164,8 @@ def merge_refinement_maps(base_map, refinements, image_size) -> np.ndarray:
     if base.shape != (image_height, image_width):
         raise ValueError("base_map shape must match image_size")
 
-    merged = np.array(base, copy=True)
+    accumulated = np.zeros_like(base, dtype=np.float64)
+    weight_map = np.zeros_like(base, dtype=np.float64)
     for refinement in refinements:
         if not isinstance(refinement, tuple) or len(refinement) != 2:
             raise TypeError("Each refinement must be an (HRImageIndex, anomaly_map) tuple")
@@ -161,9 +187,27 @@ def merge_refinement_maps(base_map, refinements, image_size) -> np.ndarray:
             )
         valid_width = min(index.width, image_width - index.x)
         valid_height = min(index.height, image_height - index.y)
-        target = merged[index.y:index.y + valid_height, index.x:index.x + valid_width]
-        merged[index.y:index.y + valid_height, index.x:index.x + valid_width] = np.maximum(
-            target,
-            prediction[:valid_height, :valid_width],
+        row_hann = np.hanning(index.height) if index.height > 1 else np.ones(1)
+        column_hann = np.hanning(index.width) if index.width > 1 else np.ones(1)
+        if row_hann.max() > 0:
+            row_hann /= row_hann.max()
+        if column_hann.max() > 0:
+            column_hann /= column_hann.max()
+        weights = 0.05 + 0.95 * np.outer(row_hann, column_hann)
+        target_slice = (
+            slice(index.y, index.y + valid_height),
+            slice(index.x, index.x + valid_width),
         )
-    return merged
+        valid_weights = weights[:valid_height, :valid_width]
+        accumulated[target_slice] += (
+            prediction[:valid_height, :valid_width] * valid_weights
+        )
+        weight_map[target_slice] += valid_weights
+
+    covered = weight_map > 0
+    if not np.any(covered):
+        return np.array(base, copy=True)
+    refinement_map = np.zeros_like(base, dtype=np.float64)
+    refinement_map[covered] = accumulated[covered] / weight_map[covered]
+    alpha = np.clip(weight_map, 0.0, 1.0)
+    return ((1.0 - alpha) * base + alpha * refinement_map).astype(np.float32)

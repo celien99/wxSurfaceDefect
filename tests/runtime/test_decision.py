@@ -6,6 +6,7 @@ from hiad.runtime.decision import (
     component_statistics,
     image_score_from_components,
     image_score_from_statistics,
+    top_k_map_score,
 )
 
 
@@ -55,6 +56,12 @@ def test_component_score_is_invariant_to_uniform_resolution_scaling():
     high_score = image_score_from_components(high_resolution, 0.5, 0.0)
 
     assert np.isclose(low_score, high_score)
+
+
+def test_top_k_map_score_uses_final_refined_map_values():
+    anomaly_map = np.asarray([[0.1, 0.2], [0.8, 0.9]], dtype=np.float32)
+
+    assert np.isclose(top_k_map_score(anomaly_map, 2), 0.85)
 
 
 def test_image_score_preserves_a_stronger_global_task_prior():

@@ -95,6 +95,17 @@ def image_score_from_components(anomaly_map, pixel_threshold, fallback_score) ->
     )
 
 
+def top_k_map_score(anomaly_map, top_k: int) -> float:
+    """Return a resolution-stable local score from the final fused map."""
+    values = np.asarray(anomaly_map, dtype=np.float32).reshape(-1)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("anomaly_map must contain finite values")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    count = min(top_k, values.size)
+    return float(np.partition(values, values.size - count)[-count:].mean())
+
+
 def classify_score(score, threshold, recheck_margin) -> str:
     """Return the conservative three-state image decision for a calibrated score."""
     score = float(score)
