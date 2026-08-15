@@ -26,6 +26,7 @@ from hiad.inferencer.refinement import (
 )
 from hiad.runtime.devices import validate_gpu_ids
 from hiad.runtime.decision import (
+    apply_quality_gate,
     classify_score,
     component_statistics,
     image_score_from_statistics,
@@ -367,7 +368,6 @@ class HRInferencer:
             }
             if self.score_calibration is not None:
                 thresholds = thresholds_for_samples(self.score_calibration, test_samples)
-                output["image_thresholds"] = thresholds
                 pixel_thresholds = pixel_thresholds_for_samples(
                     self.score_calibration, test_samples
                 )
@@ -397,6 +397,9 @@ class HRInferencer:
                 ]
                 output["decision_thresholds"] = decision_thresholds
                 output["component_scores"] = component_scores
+                output["raw_image_scores"] = image_scores
+                output["image_scores"] = np.asarray(component_scores, dtype=np.float32)
+                output["image_thresholds"] = decision_thresholds
                 output["decisions"] = decisions
                 output["decision_reasons"] = [
                     "score_at_or_below_threshold"
@@ -408,11 +411,12 @@ class HRInferencer:
                 ]
                 output["component_summaries"] = component_summaries
                 for index, quality in enumerate(quality_results):
-                    if quality["status"] == "RECHECK":
-                        decisions[index] = "RECHECK"
-                        output["decision_reasons"][index] = (
-                            "quality_gate:" + ",".join(quality["reasons"])
-                        )
+                    decisions[index], quality_reason = apply_quality_gate(
+                        decisions[index],
+                        quality["reasons"],
+                    )
+                    if quality_reason is not None:
+                        output["decision_reasons"][index] = quality_reason
                 output["is_defect"] = [decision == "NG" for decision in decisions]
                 output["pixel_thresholds"] = pixel_thresholds
                 output["binary_anomaly_maps"] = threshold_anomaly_maps(

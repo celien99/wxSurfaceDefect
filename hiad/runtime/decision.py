@@ -109,3 +109,10 @@ def classify_score(score, threshold, recheck_margin) -> str:
     if score <= threshold + recheck_margin:
         return "RECHECK"
     return "NG"
+
+
+def apply_quality_gate(decision: str, reasons) -> tuple[str, str | None]:
+    """Promote an otherwise acceptable image without hiding an NG decision."""
+    if decision == "OK" and reasons:
+        return "RECHECK", "quality_gate:" + ",".join(str(reason) for reason in reasons)
+    return decision, None

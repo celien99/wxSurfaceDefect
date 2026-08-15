@@ -1,6 +1,7 @@
 import numpy as np
 
 from hiad.runtime.decision import (
+    apply_quality_gate,
     classify_score,
     component_statistics,
     image_score_from_components,
@@ -73,3 +74,14 @@ def test_classify_score_has_three_states():
     assert classify_score(0.3, 0.5, 0.1) == "OK"
     assert classify_score(0.55, 0.5, 0.1) == "RECHECK"
     assert classify_score(0.7, 0.5, 0.1) == "NG"
+
+
+def test_quality_gate_promotes_ok_without_downgrading_ng():
+    reasons = ["focus_variance_below_minimum"]
+
+    assert apply_quality_gate("OK", reasons) == (
+        "RECHECK",
+        "quality_gate:focus_variance_below_minimum",
+    )
+    assert apply_quality_gate("NG", reasons) == ("NG", None)
+    assert apply_quality_gate("RECHECK", reasons) == ("RECHECK", None)
