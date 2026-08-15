@@ -4,6 +4,8 @@
 
 SurfaceMind 将预训练 DINOv3 表征、Dinomaly 特征重建、原图坐标级多尺度切片和正常样本阈值校准组合为一条可训练、可推理、可评估的工程链路。它适合缺陷样本稀少、缺陷形态开放、且需要保留微小缺陷空间证据的场景。
 
+该架构面向通用表面、结构件与装配件异常检测，不绑定汽车座椅或任何单一产品类别；类别差异通过正常样本、`clsname` 分组校准和可选前景掩码表达。
+
 ## 核心价值
 
 - **只用 OK 样本训练**：训练集明确限制为无掩码、`label=0` 的正常图像；未知或罕见缺陷可作为偏离正常分布的异常被定位。
@@ -36,11 +38,14 @@ flowchart LR
         D --> X[Sobel + Laplacian 高频证据]
         E --> X
         R --> X
-        G --> H[多尺度上下文条件门控]
+        G --> H[多尺度任务的上下文条件门控]
+        G --> P[单尺度与缩略图任务的主特征]
         H --> I[可训练瓶颈 +\n线性注意力解码器]
+        P --> I
         I --> S[Dinomaly 语义重建残差]
         H --> V[正常特征对角高斯距离]
-        S --> J[三路证据融合 + 最大安全通道]
+        P --> V
+        S --> J[三路标定证据融合 +\n启用分支最大值校正]
         V --> J
         X --> J
     end
@@ -48,10 +53,10 @@ flowchart LR
     subgraph OUTPUT[原图级输出]
         J --> K[补丁图 Hann 加权回填]
         J --> L[缩略图全局异常先验]
-        K --> M[逐像素最大证据融合]
+        K --> M[微补丁 Hann 加权校正]
         L --> Q[候选区域路由 + 图像级先验]
         Q --> R
-        M --> N[原图尺寸异常图]
+        M --> N[最终原图尺寸异常图]
         J --> O[Top-K token 分数]
     end
 ```
@@ -80,7 +85,7 @@ flowchart LR
 | `hiad/task/` | 任务契约 | 强制且仅允许一个 `dynamic_patch`、一个 `refinement_patch` 和一个 `thumbnail` 任务，任务定义写入 `tasks.json` |
 | `hiad/datasets/` | 流式采样 | 原图尺寸建索引；逐样本、逐补丁读取；仅保留一个已解码图像缓存 |
 | `hiad/models/dinov3.py` | 表征底座 | 通过 `timm` 加载预训练 DINOv3，固定全部编码器参数并提取中间层特征 |
-| `hiad/detectors/hr_dinomaly.py` | 异常检测器 | 训练瓶颈与 8 层线性注意力解码器，以多层编码/解码余弦差异生成异常证据 |
+| `hiad/detectors/hr_dinomaly.py` | 异常检测器 | 组合语义重建、正常特征记忆和高频响应，生成经过正常数据标定的融合异常证据 |
 | `hiad/inferencer/` | 多任务推理 | 管理任务检查点、多 GPU 任务分配、补丁回填、全局先验路由和阈值判定 |
 | `hiad/runtime/score_calibration.py` | 阈值校准 | 两阶段计算全局与分类别的图像、像素和组件阈值 |
 | `hiad/evaluation/` | 指标与图像化 | 按类别计算指标，输出热力图、预测边界和可选 GT 对比图 |
@@ -89,12 +94,12 @@ flowchart LR
 
 1. **数据约束**：训练样本必须是无缺陷、无像素掩码的正常图，并携带非空 `clsname`。可选 `foreground` 掩码用于在训练和推理阶段抑制背景干扰，并限定图像质量统计区域。
 2. **动态多尺度采样**：`DynamicTaskGenerator` 将原图划为边界对齐的主补丁；`--ds-factors` 为每个主补丁提供包含它的更大感受野。`stride` 可设置重叠，以提高边界区域的冗余观测。
-3. **特征重建**：冻结的 DINOv3 输出中间层表征；可训练瓶颈和解码器学习复现正常表征。训练仅更新重建部分，降低小规模现场数据直接微调整个视觉骨干的风险。
+3. **特征重建**：冻结的 DINOv3 输出中间层表征；多尺度任务先用可训练上下文调节器融合主补丁与更大感受野，单尺度和缩略图任务直接使用主特征。训练仅更新上下文调节器（启用时）、瓶颈和解码器，避免用小规模现场数据直接微调整个视觉骨干。
 4. **困难正常样本关注**：余弦蒸馏损失支持从 warmup 逐步提高 hard-mining 比例，并以较低系数保留易样本梯度；同时提供梯度裁剪、AMP 与 TF32 开关。
 5. **异常图生成**：各层的编码/重建特征余弦距离先在 token 级取最大，再上采样到补丁尺寸；不同补丁以 Hann 权重回填，减轻拼接边缘不连续。
-6. **互补证据融合**：语义重建误差、正常特征记忆距离和高频纹理响应按 `semantic_weight`、`memory_weight`、`high_frequency_weight` 融合，并保留逐像素最大证据作为低漏检安全通道。
-7. **粗到细复核与全局路由**：局部粗粒度异常图与稳健归一化后的缩略图全局先验共同选择候选区域，并补充确定性安全区域；微补丁结果回填到原图坐标。最终像素图只融合局部及复核窗口，避免低分辨率全局图覆盖或稀释微小缺陷边界。
-8. **校准与决策**：使用全部正常训练图像的分位数建立图像、像素和连通组件阈值。推理优先选择 `clsname` 对应阈值，缺失时回退到全局阈值；组件分数在阈值上方的 `decision_recheck_margin_ratio` 范围内输出 `RECHECK`，更高时输出 `NG`。质量门禁不通过同样输出 `RECHECK`。
+6. **互补证据融合**：语义重建误差、正常特征记忆距离和高频纹理响应先使用正常训练数据拟合的中心与尺度标定，再按 `semantic_weight`、`memory_weight`、`high_frequency_weight` 融合。最终证据由 75% 加权均值与 25% 启用分支逐像素最大值组成；权重为零的分支不参与最大值校正，也不额外输出诊断通道。
+7. **粗到细复核与全局路由**：局部粗粒度异常图与稳健归一化后的缩略图全局先验共同选择候选区域，并以二维低差异序列补充确定性安全区域；候选切片只覆盖真实占用网格，不填满稀疏组件的外接矩形。微补丁结果通过 Hann 权重校正原图异常图，既可增强细小缺陷，也可压低粗扫误报；缩略图不写入最终像素图。
+8. **校准与决策**：最终细化图的 Top-K 像素分数与缩略图 token 分数形成原始图像分数；连通组件以平均异常强度和相对图像面积形成分辨率无关分数。全部阈值只从正常训练图像校准，推理优先使用 `clsname` 对应阈值，缺失时回退到全局阈值；超过组件阈值但处于 `decision_recheck_margin_ratio` 内时输出 `RECHECK`，更高时输出 `NG`。质量门禁仅将原本的 `OK` 提升为 `RECHECK`，不会把已有 `NG` 降级。
 
 ## 环境要求
 
@@ -190,7 +195,7 @@ python runs/train.py \
 | `--refinement-safety-fraction` | 额外均匀采样的复核覆盖比例，范围为 `(0, 1]` |
 | `--gpus` | 逗号分隔的 CUDA 设备编号。任务以 round-robin 方式分配给设备 |
 
-默认配置在 [`configs/dinomaly.yaml`](configs/dinomaly.yaml)，所有字段均为必填项。它包含训练迭代、困难样本比例、混合精度、每源图像采样补丁数、Top-K 图像评分、三路证据权重、`global_routing_weight`、图像/像素/组件校准分位数、`decision_recheck_margin_ratio` 和质量门禁阈值。启动训练或推理时会拒绝缺失、非有限或范围不合法的配置。
+默认配置在 [`configs/dinomaly.yaml`](configs/dinomaly.yaml)，所有字段均为必填项。训练与推理共享这一份配置映射；补丁尺寸、上下文尺度、细化参数和缩略图尺寸来自任务定义，不再复制三份同内容配置。配置包含训练迭代、困难样本比例、混合精度、每源图像采样补丁数、Top-K 图像评分、三路证据权重、`global_routing_weight`、图像/像素/组件校准分位数、`decision_recheck_margin_ratio` 和质量门禁阈值。
 
 ### 训练产物
 
@@ -205,7 +210,7 @@ results/dinomaly_checkpoints/
 └── score_calibration.json        # 正常样本校准的全局与分类别阈值
 ```
 
-每个 `*_weight.pkl` 只保存上下文调节器、正常特征记忆、Dinomaly 解码网络和高频标定等推理状态。`score_calibration.json` 保存图像、像素和组件阈值。架构或配置改变后直接重新训练并校准，不复用旧训练产物。
+每个 `*_weight.pkl` 只保存当前任务推理所需的正常特征记忆、Dinomaly 重建网络和三路证据标定状态；仅多尺度补丁任务保存上下文调节器，单尺度与缩略图任务不构造该模块。`score_calibration.json` 保存图像、像素和组件阈值。加载入口只要求当前任务文件存在，并按当前格式直接读取，不提供旧格式兼容或额外架构校验；架构或配置改变后直接重新训练并校准，不复用旧训练产物。
 
 ## 推理、判定与评估
 
@@ -244,7 +249,7 @@ results/dinomaly_vis/
 
 评估指标用于对比模型能力；线上 OK/NG 与像素掩码使用的是训练后保存的正常样本校准阈值，而非测试集上的最优阈值。
 
-`predictions.jsonl` 的每条记录至少包含 `filename`、`clsname`、`score`、`is_defect`；完成校准后还包含 `threshold`、`decision`、`decision_threshold`、`decision_reason`、`component_score`、`component_summary`、`pixel_threshold`、`prediction_mask` 和 `anomaly_pixel_count`。运行时还保留三路分支的平均融合图、最大证据图和仅用于路由/图像先验的全局上下文图，供调用方做诊断与可视化。`decision` 的取值为 `OK`、`RECHECK`、`NG`，其中 `is_defect` 仅在 `decision == "NG"` 时为真；若质量门禁触发，质量指标和原因写入 `quality` 字段，判定为 `RECHECK`。
+`predictions.jsonl` 的每条记录至少包含 `filename`、`clsname`、`score`、`is_defect`；完成校准后还包含 `threshold`、`decision`、`decision_threshold`、`decision_reason`、`component_score`、`component_summary`、`pixel_threshold`、`prediction_mask` 和 `anomaly_pixel_count`。运行时对外保留最终异常图及判定所需结果；缩略图上采样结果和路由图只在单张图选择细化区域时短暂存在，不作为诊断大图返回。`decision` 的取值为 `OK`、`RECHECK`、`NG`，其中 `is_defect` 仅在 `decision == "NG"` 时为真；质量指标和原因写入 `quality` 字段，质量门禁只会把原本的 `OK` 提升为 `RECHECK`。
 
 ## 真实数据评估切分
 
