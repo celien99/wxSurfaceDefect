@@ -146,15 +146,18 @@ def detector_config_for_task(config, task):
     if task_type == TASK_TYPE_DYNAMIC_PATCH:
         detector_config = copy.deepcopy(config.patch)
         detector_config.patch_size = task["patch_size"]
+        detector_config.use_context_conditioning = len(task["ds_factors"]) > 1
         return detector_config
     if task_type == TASK_TYPE_REFINEMENT_PATCH:
         detector_config = copy.deepcopy(config.refinement)
         detector_config.patch_size = task["patch_size"]
+        detector_config.use_context_conditioning = len(task["ds_factors"]) > 1
         return detector_config
     if task_type == TASK_TYPE_THUMBNAIL:
         detector_config = copy.deepcopy(config.thumbnail)
         detector_config.pop("thumbnail_size", None)
         detector_config.patch_size = task["thumbnail_size"]
         detector_config.total_iters = detector_config.thumbnail_total_iters
+        detector_config.use_context_conditioning = False
         return detector_config
     raise ValueError(f"Unsupported task type: {task}")

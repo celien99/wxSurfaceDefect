@@ -4,7 +4,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hiad.detectors.config import REQUIRED_CONFIG_KEYS, validate_required_config
+from easydict import EasyDict
+
+from hiad.constants import TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_THUMBNAIL
+from hiad.detectors.config import (
+    REQUIRED_CONFIG_KEYS,
+    detector_config_for_task,
+    validate_required_config,
+)
 from hiad.detectors.hr_dinomaly import HRDinomaly
 
 
@@ -57,6 +64,31 @@ def test_required_config_rejects_missing_new_architecture_setting():
         validate_required_config(config)
 
 
+def test_detector_config_only_enables_context_when_task_has_context_scales():
+    config = EasyDict(_config())
+    patch_config = detector_config_for_task(
+        EasyDict(patch=config, refinement=config, thumbnail=config),
+        {
+            "name": TASK_TYPE_DYNAMIC_PATCH,
+            "type": TASK_TYPE_DYNAMIC_PATCH,
+            "patch_size": 512,
+            "stride": 512,
+            "ds_factors": [0, 1],
+        },
+    )
+    thumbnail_config = detector_config_for_task(
+        EasyDict(patch=config, refinement=config, thumbnail=config),
+        {
+            "name": TASK_TYPE_THUMBNAIL,
+            "type": TASK_TYPE_THUMBNAIL,
+            "thumbnail_size": 512,
+        },
+    )
+
+    assert patch_config.use_context_conditioning is True
+    assert thumbnail_config.use_context_conditioning is False
+
+
 def test_checkpoint_save_persists_inference_state(monkeypatch):
     class Module:
         def state_dict(self):
@@ -93,6 +125,33 @@ def test_checkpoint_save_persists_inference_state(monkeypatch):
         "memory_center": 0.3,
         "memory_scale": 0.8,
     }
+
+
+def test_checkpoint_omits_context_state_for_single_resolution_task(monkeypatch):
+    class Module:
+        def state_dict(self):
+            return {"state": "present"}
+
+    detector = object.__new__(HRDinomaly)
+    detector.context_conditioner = None
+    detector.feature_memory = Module()
+    detector.bottleneck = Module()
+    detector.decoder = Module()
+    detector.high_frequency_center = 0.2
+    detector.high_frequency_scale = 0.7
+    detector.semantic_center = 0.1
+    detector.semantic_scale = 0.4
+    detector.memory_center = 0.3
+    detector.memory_scale = 0.8
+    captured = {}
+
+    monkeypatch.setattr(
+        "hiad.detectors.hr_dinomaly.torch.save",
+        lambda payload, _: captured.update(payload),
+    )
+    detector.save_checkpoint("unused.pkl")
+
+    assert "context_conditioner" not in captured
 
 
 def test_checkpoint_load_restores_inference_state(monkeypatch):

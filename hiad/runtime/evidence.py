@@ -66,36 +66,11 @@ def _validate_weights(weights: Sequence[float], branch_count: int) -> np.ndarray
     return numeric_weights
 
 
-def fuse_evidence_maps(
-    branch_maps: Sequence[np.ndarray], weights: Sequence[float], max_evidence: bool = True
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fuse same-shaped branch maps and optionally apply a safety maximum."""
-    if len(branch_maps) == 0:
-        raise ValueError("at least one evidence branch is required")
-    numeric_weights = _validate_weights(weights, len(branch_maps))
-    converted = [np.asarray(branch, dtype=np.float64) for branch in branch_maps]
-    shape = converted[0].shape
-    if len(shape) == 0:
-        raise ValueError("evidence branches must have at least one dimension")
-    if any(branch.shape != shape for branch in converted[1:]):
-        raise ValueError("all evidence branches must have the same shape")
-    if any(not np.isfinite(branch).all() for branch in converted):
-        raise ValueError("all evidence branches must be finite")
-
-    enabled = numeric_weights > 0
-    stack = np.stack(converted, axis=0)[enabled]
-    active_weights = numeric_weights[enabled]
-    weighted = np.average(stack, axis=0, weights=active_weights)
-    maximum = np.max(stack, axis=0)
-    fused = 0.75 * weighted + 0.25 * maximum if max_evidence else weighted
-    return fused, maximum
-
-
 def fuse_evidence_tensors(
     branch_maps: Sequence[torch.Tensor],
     weights: Sequence[float],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse aligned accelerator tensors while retaining a max safety channel."""
+) -> torch.Tensor:
+    """Fuse aligned accelerator tensors with an internal max safety contribution."""
     if not branch_maps:
         raise ValueError("at least one evidence branch is required")
     numeric_weights = _validate_weights(weights, len(branch_maps))
@@ -125,4 +100,4 @@ def fuse_evidence_tensors(
     ).view(-1, 1, 1, 1, 1)
     weighted = (stack * tensor_weights).sum(dim=0) / tensor_weights.sum()
     maximum = stack.amax(dim=0)
-    return 0.75 * weighted + 0.25 * maximum, maximum
+    return 0.75 * weighted + 0.25 * maximum

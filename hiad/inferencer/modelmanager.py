@@ -61,8 +61,5 @@ class ModelManager:
             return detector
         raise KeyError(f"Unknown task: {task_name}")
 
-    def get_device_task_names(self, gpu: bool):
-        return [model["name"] for model in self.models if model["gpu"] == gpu]
-
     def close(self) -> None:
         self.models.clear()

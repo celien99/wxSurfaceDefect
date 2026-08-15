@@ -5,15 +5,6 @@ from hiad.detectors.hr_dinomaly import HRDinomaly
 from hiad.models.memory import NormalFeatureMemory
 
 
-def test_image_score_keeps_the_strongest_local_evidence():
-    scores = HRDinomaly.get_image_score([
-        [0.02, 0.03, 0.91, 0.04],
-        [0.12, 0.08],
-    ])
-
-    np.testing.assert_allclose(scores, np.asarray([0.91, 0.12], dtype=np.float32))
-
-
 def test_top_k_token_score_does_not_average_the_full_map():
     token_maps = torch.tensor([[[[0.01, 0.02], [0.03, 0.95]]]])
 
@@ -59,7 +50,7 @@ def test_memory_evidence_uses_conditioned_layers_before_dinomaly_aggregation():
     semantic_encoder = [torch.ones((1, 2, 1, 2)) for _ in range(2)]
     semantic_decoder = [torch.ones((1, 2, 1, 2)) for _ in range(2)]
 
-    pixel_map, token_map, max_map = detector._fused_evidence(
+    pixel_map, token_map = detector._fused_evidence(
         {"image": torch.zeros((1, 3, 2, 2))},
         conditioned,
         semantic_encoder,
@@ -68,4 +59,3 @@ def test_memory_evidence_uses_conditioned_layers_before_dinomaly_aggregation():
 
     assert pixel_map.shape == (1, 1, 2, 2)
     assert token_map.shape == (1, 1, 1, 2)
-    assert max_map.shape == (1, 1, 2, 2)

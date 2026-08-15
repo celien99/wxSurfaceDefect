@@ -67,25 +67,6 @@ def _gather_patch_predictions(patches, image_size):
     return (accumulated / weight_map).astype(np.float32)
 
 
-def _gather_patch_max_predictions(patches, image_size):
-    image_width, image_height = image_size
-    maximum = np.full((image_height, image_width), -np.inf, dtype=np.float32)
-    coverage = np.zeros((image_height, image_width), dtype=np.uint8)
-    for record, prediction in patches:
-        x, y, _, _ = record["source_xywh"]
-        valid_height, valid_width = record["valid_source_hw"]
-        values = np.asarray(prediction, dtype=np.float32)
-        target = maximum[y:y + valid_height, x:x + valid_width]
-        maximum[y:y + valid_height, x:x + valid_width] = np.maximum(
-            target,
-            values[:valid_height, :valid_width],
-        )
-        coverage[y:y + valid_height, x:x + valid_width] = 1
-    if not np.all(coverage):
-        raise ValueError("Patch predictions do not cover the complete source image")
-    return maximum
-
-
 def inference_in_device(
     test_samples,
     task_group,
@@ -99,11 +80,8 @@ def inference_in_device(
         path: {
             "image_size": None,
             "patches": [],
-            "max_patches": [],
             "thumbnail": None,
-            "max_thumbnail": None,
             "thumbnail_score": None,
-            "scores": [],
         }
         for path in paths
     }
@@ -136,18 +114,12 @@ def inference_in_device(
                 path = record["image_path"]
                 results[path]["image_size"] = record["image_size"]
                 results[path]["patches"].append((record, prediction["anomaly_map"]))
-                results[path]["max_patches"].append(
-                    (record, prediction["max_evidence_map"])
-                )
-                results[path]["scores"].append(prediction["score"])
         elif task["type"] == TASK_TYPE_THUMBNAIL:
             for record, prediction in zip(dataset.records, predictions):
                 path = record["image_path"]
                 results[path]["image_size"] = record["image_size"]
                 results[path]["thumbnail"] = prediction["anomaly_map"]
-                results[path]["max_thumbnail"] = prediction["max_evidence_map"]
                 results[path]["thumbnail_score"] = prediction["score"]
-                results[path]["scores"].append(prediction["score"])
         else:
             raise ValueError(f"Unsupported task type: {task}")
 
@@ -276,11 +248,8 @@ class HRInferencer:
                 sample.image.image_path: {
                     "image_size": None,
                     "patches": [],
-                    "max_patches": [],
                     "thumbnail": None,
-                    "max_thumbnail": None,
                     "thumbnail_score": None,
-                    "scores": [],
                 }
                 for sample in test_samples
             }
@@ -292,74 +261,64 @@ class HRInferencer:
                             raise ValueError(f"Task image sizes disagree for {path}")
                         merged[path]["image_size"] = result["image_size"]
                     merged[path]["patches"].extend(result["patches"])
-                    merged[path]["max_patches"].extend(result["max_patches"])
-                    merged[path]["scores"].extend(result["scores"])
                     if result["thumbnail"] is not None:
                         if merged[path]["thumbnail"] is not None:
                             raise ValueError(f"Duplicate thumbnail prediction for {path}")
                         merged[path]["thumbnail"] = result["thumbnail"]
-                        merged[path]["max_thumbnail"] = result["max_thumbnail"]
                         merged[path]["thumbnail_score"] = result["thumbnail_score"]
 
             anomaly_maps = []
-            max_evidence_maps = []
-            global_context_maps = []
-            global_max_evidence_maps = []
             global_scores = []
+            refinement_task = self.refinement_task
+            regions_by_path = {}
             for sample in test_samples:
                 path = sample.image.image_path
                 result = merged[path]
                 if result["image_size"] is None or not result["patches"]:
                     raise ValueError(f"Incomplete dynamic patch prediction for {path}")
                 patch_map = _gather_patch_predictions(result["patches"], result["image_size"])
-                max_patch_map = _gather_patch_max_predictions(
-                    result["max_patches"],
-                    result["image_size"],
-                )
                 final_map = patch_map
-                final_max_map = max_patch_map
                 if (
                     result["thumbnail"] is None
-                    or result["max_thumbnail"] is None
                     or result["thumbnail_score"] is None
                 ):
                     raise ValueError(f"Incomplete global context prediction for {path}")
                 image_width, image_height = result["image_size"]
-                global_context_maps.append(cv2.resize(
+                global_context_map = cv2.resize(
                     np.asarray(result["thumbnail"], dtype=np.float32),
                     (image_width, image_height),
                     interpolation=cv2.INTER_LINEAR,
-                ))
-                global_max_evidence_maps.append(cv2.resize(
-                    np.asarray(result["max_thumbnail"], dtype=np.float32),
-                    (image_width, image_height),
-                    interpolation=cv2.INTER_LINEAR,
-                ))
+                )
                 if self.map_gaussian_sigma > 0:
                     final_map = gaussian_filter(
                         final_map,
                         sigma=self.map_gaussian_sigma,
                     )
-                anomaly_maps.append(np.asarray(final_map, dtype=np.float32))
-                max_evidence_maps.append(np.asarray(final_max_map, dtype=np.float32))
-                global_scores.append(float(result["thumbnail_score"]))
-
-            routing_maps = [
-                build_routing_map(
-                    local_map,
-                    global_map,
+                final_map = np.asarray(final_map, dtype=np.float32)
+                routing_map = build_routing_map(
+                    final_map,
+                    global_context_map,
                     self.global_routing_weight,
                 )
-                for local_map, global_map in zip(
-                    anomaly_maps,
-                    global_context_maps,
+                regions_by_path[path] = select_refinement_regions(
+                    routing_map,
+                    threshold=float(
+                        np.quantile(
+                            routing_map,
+                            refinement_task["refinement_quantile"],
+                        )
+                    ),
+                    tile_size=refinement_task["patch_size"],
+                    min_area=refinement_task["refinement_min_area"],
+                    safety_fraction=refinement_task["refinement_safety_fraction"],
                 )
-            ]
-            anomaly_maps, max_evidence_maps = self._apply_refinement(
+                anomaly_maps.append(final_map)
+                global_scores.append(float(result["thumbnail_score"]))
+
+            anomaly_maps = self._apply_refinement(
                 test_samples,
                 anomaly_maps,
-                max_evidence_maps,
-                routing_maps,
+                regions_by_path,
                 batch_size,
             )
             image_scores = np.asarray(
@@ -373,9 +332,6 @@ class HRInferencer:
                 "image_paths": [sample.image.image_path for sample in test_samples],
                 "image_scores": image_scores,
                 "anomaly_maps": anomaly_maps,
-                "max_evidence_maps": max_evidence_maps,
-                "global_context_maps": global_context_maps,
-                "global_max_evidence_maps": global_max_evidence_maps,
                 "display_images": self._build_display_images(test_samples, display_size),
                 "quality_results": quality_results,
             }
@@ -467,26 +423,9 @@ class HRInferencer:
         self,
         test_samples,
         base_maps,
-        base_max_maps,
-        routing_maps,
+        regions_by_path,
         batch_size,
     ):
-        refinement_task = self.refinement_task
-        regions_by_path = {
-            sample.image.image_path: select_refinement_regions(
-                anomaly_map,
-                threshold=float(
-                    np.quantile(
-                        anomaly_map,
-                        refinement_task["refinement_quantile"],
-                    )
-                ),
-                tile_size=refinement_task["patch_size"],
-                min_area=refinement_task["refinement_min_area"],
-                safety_fraction=refinement_task["refinement_safety_fraction"],
-            )
-            for sample, anomaly_map in zip(test_samples, routing_maps)
-        }
         worker_results = self._run_inference_groups(
             test_samples,
             self.refinement_tasks_in_devices,
@@ -497,22 +436,12 @@ class HRInferencer:
             sample.image.image_path: []
             for sample in test_samples
         }
-        max_refinements_by_path = {
-            sample.image.image_path: []
-            for sample in test_samples
-        }
         for worker_result in worker_results:
             for path, result in worker_result.items():
                 refinements_by_path[path].extend(result["patches"])
-                max_refinements_by_path[path].extend(result["max_patches"])
 
         refined_maps = []
-        refined_max_maps = []
-        for sample, base_map, base_max_map in zip(
-            test_samples,
-            base_maps,
-            base_max_maps,
-        ):
+        for sample, base_map in zip(test_samples, base_maps):
             path = sample.image.image_path
             refinements = []
             for record, anomaly_map in refinements_by_path[path]:
@@ -533,21 +462,7 @@ class HRInferencer:
                     image_size=(base_map.shape[1], base_map.shape[0]),
                 )
             )
-            max_refinements = []
-            for record, anomaly_map in max_refinements_by_path[path]:
-                x, y, width, height = record["source_xywh"]
-                max_refinements.append((
-                    HRImageIndex(x=x, y=y, width=width, height=height),
-                    anomaly_map,
-                ))
-            refined_max_maps.append(
-                merge_refinement_maps(
-                    base_max_map,
-                    max_refinements,
-                    image_size=(base_max_map.shape[1], base_max_map.shape[0]),
-                )
-            )
-        return refined_maps, refined_max_maps
+        return refined_maps
 
     @staticmethod
     def _validate_samples(test_samples) -> None:

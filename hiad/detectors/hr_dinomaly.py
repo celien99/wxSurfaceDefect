@@ -81,6 +81,7 @@ class HRDinomaly(BaseDetector):
                  semantic_weight: float = 0.6,
                  memory_weight: float = 0.3,
                  high_frequency_weight: float = 0.1,
+                 use_context_conditioning: bool = True,
                  **kwargs):
 
         total_iters = _positive_int(total_iters, "total_iters")
@@ -113,6 +114,8 @@ class HRDinomaly(BaseDetector):
             raise TypeError("decoder_amp must be a boolean")
         if not isinstance(allow_tf32, bool):
             raise TypeError("allow_tf32 must be a boolean")
+        if not isinstance(use_context_conditioning, bool):
+            raise TypeError("use_context_conditioning must be a boolean")
         evidence_weights = (
             float(semantic_weight),
             float(memory_weight),
@@ -133,7 +136,6 @@ class HRDinomaly(BaseDetector):
         self.decoder_amp = decoder_amp
         self.allow_tf32 = allow_tf32
         self.evidence_weights = evidence_weights
-        self.backbone_name = backbone_name
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
             torch.backends.cudnn.allow_tf32 = allow_tf32
@@ -156,9 +158,13 @@ class HRDinomaly(BaseDetector):
         else:
             raise ValueError(f"Unsupported DINOv3 embedding dimension: {embed_dim}")
 
-        self.context_conditioner = ConditionalFeatureFusion(
-            embed_dim=embed_dim,
-            layers=len(self.target_layers),
+        self.context_conditioner = (
+            ConditionalFeatureFusion(
+                embed_dim=embed_dim,
+                layers=len(self.target_layers),
+            )
+            if use_context_conditioning
+            else None
         )
         self.feature_memory = NormalFeatureMemory(
             embed_dim=embed_dim,
@@ -197,7 +203,8 @@ class HRDinomaly(BaseDetector):
 
     def to_device(self, device):
         self.model = self.model.to(device)
-        self.context_conditioner = self.context_conditioner.to(device)
+        if self.context_conditioner is not None:
+            self.context_conditioner = self.context_conditioner.to(device)
         self.feature_memory = self.feature_memory.to(device)
         self.device = device
 
@@ -205,13 +212,14 @@ class HRDinomaly(BaseDetector):
     def fit_normal_evidence(self, train_dataloader: DataLoader) -> None:
         """Fit normal token statistics and high-frequency normalization."""
         self.model.eval()
-        self.context_conditioner.eval()
+        if self.context_conditioner is not None:
+            self.context_conditioner.eval()
         self.feature_memory.reset()
         semantic_moments = _empty_moments(self.device)
         frequency_moments = _empty_moments(self.device)
         for data in train_dataloader:
             main_features, context_features = self.get_multi_resolution_embeddings(data)
-            conditioned = self.context_conditioner(main_features, context_features)
+            conditioned = self._condition_features(main_features, context_features)
             self.feature_memory.update(conditioned)
 
             semantic_encoder, semantic_decoder = self.model.distillation(
@@ -232,7 +240,7 @@ class HRDinomaly(BaseDetector):
         memory_moments = _empty_moments(self.device)
         for data in train_dataloader:
             main_features, context_features = self.get_multi_resolution_embeddings(data)
-            conditioned = self.context_conditioner(main_features, context_features)
+            conditioned = self._condition_features(main_features, context_features)
             semantic_encoder, semantic_decoder = self.model.distillation(
                 list(conditioned)
             )
@@ -274,6 +282,11 @@ class HRDinomaly(BaseDetector):
     @staticmethod
     def _positive_normalize(values, center, scale):
         return ((values - center) / scale).clamp_min(0.0)
+
+    def _condition_features(self, main_features, context_features):
+        if self.context_conditioner is None:
+            return list(main_features)
+        return self.context_conditioner(main_features, context_features)
 
     def _fused_evidence(
         self,
@@ -326,25 +339,24 @@ class HRDinomaly(BaseDetector):
             frequency_pixel,
             output_size=semantic_token.shape[-2:],
         )
-        fused_pixel, max_pixel = fuse_evidence_tensors(
+        fused_pixel = fuse_evidence_tensors(
             [semantic_pixel, memory_pixel, frequency_pixel],
             self.evidence_weights,
         )
-        fused_token, _ = fuse_evidence_tensors(
+        fused_token = fuse_evidence_tensors(
             [semantic_token, memory_token, frequency_token],
             self.evidence_weights,
         )
-        return fused_pixel, fused_token, max_pixel
+        return fused_pixel, fused_token
 
     def train_step(self,
                    train_dataloader: DataLoader,
                    task_name: str) -> None:
 
-        trainable = nn.ModuleList([
-            self.context_conditioner,
-            self.bottleneck,
-            self.decoder,
-        ])
+        trainable_modules = [self.bottleneck, self.decoder]
+        if self.context_conditioner is not None:
+            trainable_modules.insert(0, self.context_conditioner)
+        trainable = nn.ModuleList(trainable_modules)
 
         for m in trainable.modules():
             if isinstance(m, nn.Linear):
@@ -384,7 +396,8 @@ class HRDinomaly(BaseDetector):
         scaler = torch.amp.GradScaler("cuda", enabled=decoder_amp_enabled)
         self.model.train()
         self.model.encoder.eval()
-        self.context_conditioner.train()
+        if self.context_conditioner is not None:
+            self.context_conditioner.train()
         it = 0
         step_started = time.perf_counter()
         for epoch in range(int(np.ceil(training_iters / batches_per_epoch))):
@@ -399,7 +412,7 @@ class HRDinomaly(BaseDetector):
                     enabled=decoder_amp_enabled,
                 ):
                     main_features, context_features = self.get_multi_resolution_embeddings(data)
-                    en = self.context_conditioner(main_features, context_features)
+                    en = self._condition_features(main_features, context_features)
                     en, de = self.model.distillation(en)
 
                     if self.hard_mining_warmup_iters == 0:
@@ -468,32 +481,33 @@ class HRDinomaly(BaseDetector):
         test_dataloader: DataLoader,
     ) -> list[dict]:
         self.model.eval()
-        self.context_conditioner.eval()
+        if self.context_conditioner is not None:
+            self.context_conditioner.eval()
         predictions = []
         for data in test_dataloader:
             main_features, context_features = self.get_multi_resolution_embeddings(data)
-            conditioned_features = self.context_conditioner(main_features, context_features)
+            conditioned_features = self._condition_features(
+                main_features,
+                context_features,
+            )
             semantic_encoder, semantic_decoder = self.model.distillation(
                 list(conditioned_features)
             )
-            anomaly_map, token_map, max_evidence_map = self._fused_evidence(
+            anomaly_map, token_map = self._fused_evidence(
                 data,
                 conditioned_features,
                 semantic_encoder,
                 semantic_decoder,
             )
             pixel_batch = anomaly_map[:, 0].cpu().numpy()
-            max_batch = max_evidence_map[:, 0].cpu().numpy()
             score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
             predictions.extend(
                 {
                     "anomaly_map": pixel_map,
-                    "max_evidence_map": max_map,
                     "score": float(score),
                 }
-                for pixel_map, max_map, score in zip(
+                for pixel_map, score in zip(
                     pixel_batch,
-                    max_batch,
                     score_batch,
                 )
             )
@@ -540,8 +554,7 @@ class HRDinomaly(BaseDetector):
         return torch.topk(values, k=count, dim=1).values.mean(dim=1)
 
     def save_checkpoint(self, checkpoint_path: str):
-        torch.save({
-            "context_conditioner": self.context_conditioner.state_dict(),
+        state = {
             "feature_memory": self.feature_memory.state_dict(),
             "bottleneck": self.bottleneck.state_dict(),
             "decoder": self.decoder.state_dict(),
@@ -551,11 +564,15 @@ class HRDinomaly(BaseDetector):
             "semantic_scale": self.semantic_scale,
             "memory_center": self.memory_center,
             "memory_scale": self.memory_scale,
-        }, checkpoint_path)
+        }
+        if self.context_conditioner is not None:
+            state["context_conditioner"] = self.context_conditioner.state_dict()
+        torch.save(state, checkpoint_path)
 
     def load_checkpoint(self, checkpoint_path: str):
         state_dict = torch.load(checkpoint_path, map_location=self.device)
-        self.context_conditioner.load_state_dict(state_dict['context_conditioner'])
+        if self.context_conditioner is not None:
+            self.context_conditioner.load_state_dict(state_dict['context_conditioner'])
         self.feature_memory.load_state_dict(state_dict['feature_memory'])
         self.bottleneck.load_state_dict(state_dict['bottleneck'])
         self.decoder.load_state_dict(state_dict['decoder'])
@@ -565,13 +582,3 @@ class HRDinomaly(BaseDetector):
         self.semantic_scale = state_dict['semantic_scale']
         self.memory_center = state_dict['memory_center']
         self.memory_scale = state_dict['memory_scale']
-
-    @staticmethod
-    def get_image_score(task_score_groups):
-        scores = []
-        for task_scores in task_score_groups:
-            values = np.asarray(task_scores, dtype=np.float32).reshape(-1)
-            if values.size == 0 or not np.isfinite(values).all():
-                raise ValueError("Every image requires finite task anomaly scores")
-            scores.append(float(values.max()))
-        return np.asarray(scores, dtype=np.float32)
