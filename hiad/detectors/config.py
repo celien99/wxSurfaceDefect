@@ -70,7 +70,7 @@ def _finite_number(value, key):
 
 
 def validate_required_config(config) -> None:
-    """Reject incomplete or incompatible production detector configuration."""
+    """Validate the current production detector configuration."""
     values = {key: _config_value(config, key) for key in REQUIRED_CONFIG_KEYS}
     if not isinstance(values["backbone_name"], str) or not values["backbone_name"].strip():
         raise ValueError("backbone_name must be a non-empty string")
@@ -143,19 +143,13 @@ def validate_required_config(config) -> None:
 
 def detector_config_for_task(config, task):
     task_type = task.get("type")
-    if task_type == TASK_TYPE_DYNAMIC_PATCH:
-        detector_config = copy.deepcopy(config.patch)
-        detector_config.patch_size = task["patch_size"]
-        detector_config.use_context_conditioning = len(task["ds_factors"]) > 1
-        return detector_config
-    if task_type == TASK_TYPE_REFINEMENT_PATCH:
-        detector_config = copy.deepcopy(config.refinement)
+    if task_type in {TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_REFINEMENT_PATCH}:
+        detector_config = copy.deepcopy(config)
         detector_config.patch_size = task["patch_size"]
         detector_config.use_context_conditioning = len(task["ds_factors"]) > 1
         return detector_config
     if task_type == TASK_TYPE_THUMBNAIL:
-        detector_config = copy.deepcopy(config.thumbnail)
-        detector_config.pop("thumbnail_size", None)
+        detector_config = copy.deepcopy(config)
         detector_config.patch_size = task["thumbnail_size"]
         detector_config.total_iters = detector_config.thumbnail_total_iters
         detector_config.use_context_conditioning = False

@@ -51,9 +51,7 @@ class HRTrainer:
         self.checkpoint_root = checkpoint_root
         self.log_root = log_root
         self.tasks = validate_tasks(tasks)
-        validate_required_config(self.config.patch)
-        validate_required_config(self.config.refinement)
-        validate_required_config(self.config.thumbnail)
+        validate_required_config(self.config)
         self.seed = seed
         os.makedirs(self.checkpoint_root, exist_ok=True)
         os.makedirs(self.log_root, exist_ok=True)
@@ -64,7 +62,7 @@ class HRTrainer:
         gpu_ids = validate_gpu_ids(gpu_ids)
 
         quality_thresholds = {
-            key: float(self.config.patch[key])
+            key: float(self.config[key])
             for key in (
                 "min_mean_luminance",
                 "max_mean_luminance",
@@ -166,12 +164,8 @@ class HRTrainer:
         )
         calibration_scores = []
         calibration_pixel_statistics = []
-        calibration_batch_size = int(
-            getattr(self.config.patch, "calibration_batch_size", 1)
-        )
-        pixel_percentile = float(
-            getattr(self.config.patch, "normal_pixel_percentile", 0.9999)
-        )
+        calibration_batch_size = int(self.config.calibration_batch_size)
+        pixel_percentile = float(self.config.normal_pixel_percentile)
         with HRInferencer(
             detector_class=self.detector_class,
             config=self.config,
@@ -192,10 +186,8 @@ class HRTrainer:
                     for anomaly_map in calibration_result["anomaly_maps"]
                 )
 
-        percentile = float(getattr(self.config.patch, "normal_score_percentile", 0.99))
-        pixel_image_percentile = float(
-            getattr(self.config.patch, "normal_pixel_image_percentile", 0.99)
-        )
+        percentile = float(self.config.normal_score_percentile)
+        pixel_image_percentile = float(self.config.normal_pixel_image_percentile)
         calibration = build_score_calibration(
             sources.samples,
             np.asarray(calibration_scores, dtype=np.float64),
@@ -224,7 +216,7 @@ class HRTrainer:
                 component_scores.extend(result["component_scores"])
 
         component_percentile = float(
-            self.config.patch.normal_component_percentile
+            self.config.normal_component_percentile
         )
         calibration = build_component_calibration(
             calibration,

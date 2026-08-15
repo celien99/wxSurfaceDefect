@@ -48,7 +48,7 @@ def test_default_config_declares_every_required_production_setting():
         ("min_focus_variance", float("nan"), "min_focus_variance"),
     ],
 )
-def test_required_config_rejects_malformed_new_architecture_settings(key, value, match):
+def test_required_config_rejects_malformed_architecture_settings(key, value, match):
     config = deepcopy(_config())
     config[key] = value
 
@@ -56,7 +56,7 @@ def test_required_config_rejects_malformed_new_architecture_settings(key, value,
         validate_required_config(config)
 
 
-def test_required_config_rejects_missing_new_architecture_setting():
+def test_required_config_rejects_missing_architecture_setting():
     config = _config()
     del config["memory_weight"]
 
@@ -64,10 +64,10 @@ def test_required_config_rejects_missing_new_architecture_setting():
         validate_required_config(config)
 
 
-def test_detector_config_only_enables_context_when_task_has_context_scales():
+def test_detector_config_derives_task_fields_from_single_config():
     config = EasyDict(_config())
     patch_config = detector_config_for_task(
-        EasyDict(patch=config, refinement=config, thumbnail=config),
+        config,
         {
             "name": TASK_TYPE_DYNAMIC_PATCH,
             "type": TASK_TYPE_DYNAMIC_PATCH,
@@ -77,7 +77,7 @@ def test_detector_config_only_enables_context_when_task_has_context_scales():
         },
     )
     thumbnail_config = detector_config_for_task(
-        EasyDict(patch=config, refinement=config, thumbnail=config),
+        config,
         {
             "name": TASK_TYPE_THUMBNAIL,
             "type": TASK_TYPE_THUMBNAIL,
@@ -87,6 +87,8 @@ def test_detector_config_only_enables_context_when_task_has_context_scales():
 
     assert patch_config.use_context_conditioning is True
     assert thumbnail_config.use_context_conditioning is False
+    assert thumbnail_config.total_iters == config.thumbnail_total_iters
+    assert "patch_size" not in config
 
 
 def test_checkpoint_save_persists_inference_state(monkeypatch):

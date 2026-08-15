@@ -1,5 +1,4 @@
 import argparse
-import copy
 import json
 import math
 import os
@@ -7,7 +6,6 @@ import shutil
 import sys
 
 import yaml
-from easydict import EasyDict
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if parent_dir not in sys.path:
@@ -15,7 +13,6 @@ if parent_dir not in sys.path:
 
 from hiad.constants import DINO_PATCH_SIZE
 from hiad.detectors import HRDinomaly
-from hiad.detectors.config import validate_required_config
 from hiad.runtime.logging import create_logger
 from hiad.task import DynamicTaskGenerator, print_task_summary
 from hiad.trainer import HRTrainer
@@ -80,16 +77,6 @@ if __name__ == "__main__":
         loaded_config = yaml.safe_load(stream)
     if not isinstance(loaded_config, dict):
         raise TypeError("Training config must be a mapping")
-    validate_required_config(loaded_config)
-
-    patch_config = EasyDict(copy.deepcopy(loaded_config))
-    refinement_config = EasyDict(copy.deepcopy(loaded_config))
-    thumbnail_config = EasyDict(copy.deepcopy(loaded_config))
-    config = EasyDict(
-        patch=patch_config,
-        refinement=refinement_config,
-        thumbnail=thumbnail_config,
-    )
 
     main_logger = create_logger(
         "main",
@@ -116,7 +103,7 @@ if __name__ == "__main__":
 
     trainer = HRTrainer(
         detector_class=HRDinomaly,
-        config=config,
+        config=loaded_config,
         batch_size=args.batch_size,
         checkpoint_root=args.checkpoint_root,
         log_root=args.log_root,

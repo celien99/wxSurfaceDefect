@@ -158,9 +158,7 @@ class HRInferencer:
         if not os.path.isfile(tasks_path):
             raise FileNotFoundError(f"Task configuration not found: {tasks_path}")
         self.tasks = load_tasks(tasks_path)
-        validate_required_config(self.config.patch)
-        validate_required_config(self.config.refinement)
-        validate_required_config(self.config.thumbnail)
+        validate_required_config(self.config)
 
         task_groups = [group for group in round_robin_partition(self.tasks, len(self.gpu_ids)) if group]
         if models_per_gpu == -1:
@@ -196,23 +194,12 @@ class HRInferencer:
             if require_score_calibration
             else None
         )
-        self.map_gaussian_sigma = float(
-            getattr(self.config.patch, "map_gaussian_sigma", 0.0)
-        )
-        if not np.isfinite(self.map_gaussian_sigma) or self.map_gaussian_sigma < 0:
-            raise ValueError("map_gaussian_sigma must be a finite non-negative number")
+        self.map_gaussian_sigma = float(self.config.map_gaussian_sigma)
         self.decision_recheck_margin_ratio = float(
-            self.config.patch.decision_recheck_margin_ratio
+            self.config.decision_recheck_margin_ratio
         )
-        if (
-            not np.isfinite(self.decision_recheck_margin_ratio)
-            or not 0 <= self.decision_recheck_margin_ratio <= 1
-        ):
-            raise ValueError(
-                "decision_recheck_margin_ratio must be finite and in [0, 1]"
-            )
         self.quality_thresholds = {
-            key: float(self.config.patch[key])
+            key: float(self.config[key])
             for key in (
                 "min_mean_luminance",
                 "max_mean_luminance",
@@ -221,11 +208,9 @@ class HRInferencer:
             )
         }
         self.global_routing_weight = float(
-            self.config.patch.global_routing_weight
+            self.config.global_routing_weight
         )
-        if not np.isfinite(self.global_routing_weight) or not 0 <= self.global_routing_weight <= 1:
-            raise ValueError("global_routing_weight must be finite and in [0, 1]")
-        self.score_top_k = int(self.config.patch.score_top_k)
+        self.score_top_k = int(self.config.score_top_k)
         self._executor = ThreadPoolExecutor(max_workers=len(task_groups))
         self._inference_lock = Lock()
         self._closed = False

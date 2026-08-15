@@ -42,7 +42,7 @@ def train_tasks_in_device(
             raise ValueError(f"Task {task_name} has no training samples")
 
         detector_config = detector_config_for_task(config, task)
-        patches_per_source = int(detector_config.get("patches_per_source", 4))
+        patches_per_source = int(detector_config.patches_per_source)
         logger.info(
             "Task %s index ready: source_images=%d, candidate_patches=%d; "
             "initializing DINOv3 detector",
