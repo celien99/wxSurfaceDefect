@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 
 from hiad.detectors.hr_dinomaly import HRDinomaly
