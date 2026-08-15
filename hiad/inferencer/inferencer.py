@@ -148,18 +148,16 @@ class HRInferencer:
         if not isinstance(require_score_calibration, bool):
             raise TypeError("require_score_calibration must be a boolean")
 
-        self.detector_class = detector_class
-        self.checkpoint_root = os.path.abspath(checkpoint_root)
-        self.config = EasyDict(config) if isinstance(config, dict) else config
-        self.gpu_ids = gpu_ids
+        checkpoint_root = os.path.abspath(checkpoint_root)
+        config = EasyDict(config) if isinstance(config, dict) else config
         self.batch_size = batch_size
-        tasks_path = os.path.join(self.checkpoint_root, "tasks.json")
+        tasks_path = os.path.join(checkpoint_root, "tasks.json")
         if not os.path.isfile(tasks_path):
             raise FileNotFoundError(f"Task configuration not found: {tasks_path}")
-        self.tasks = load_tasks(tasks_path)
-        validate_required_config(self.config)
+        tasks = load_tasks(tasks_path)
+        validate_required_config(config)
 
-        task_groups = [group for group in round_robin_partition(self.tasks, len(self.gpu_ids)) if group]
+        task_groups = [group for group in round_robin_partition(tasks, len(gpu_ids)) if group]
 
         self.coarse_tasks_in_devices = [
             [task for task in task_group if task["type"] != TASK_TYPE_REFINEMENT_PATCH]
@@ -170,30 +168,30 @@ class HRInferencer:
             for task_group in task_groups
         ]
         refinement_tasks = [
-            task for task in self.tasks if task["type"] == TASK_TYPE_REFINEMENT_PATCH
+            task for task in tasks if task["type"] == TASK_TYPE_REFINEMENT_PATCH
         ]
         self.refinement_task = refinement_tasks[0]
         self.model_managers = [
             ModelManager(
                 tasks,
                 detector_class,
-                self.config,
-                self.checkpoint_root,
-                self.gpu_ids[index],
+                config,
+                checkpoint_root,
+                gpu_ids[index],
             )
             for index, tasks in enumerate(tqdm(task_groups, desc="Loading checkpoints..."))
         ]
         self.score_calibration = (
-            load_score_calibration(self.checkpoint_root)
+            load_score_calibration(checkpoint_root)
             if require_score_calibration
             else None
         )
-        self.map_gaussian_sigma = float(self.config.map_gaussian_sigma)
+        self.map_gaussian_sigma = float(config.map_gaussian_sigma)
         self.decision_recheck_margin_ratio = float(
-            self.config.decision_recheck_margin_ratio
+            config.decision_recheck_margin_ratio
         )
         self.quality_thresholds = {
-            key: float(self.config[key])
+            key: float(config[key])
             for key in (
                 "min_mean_luminance",
                 "max_mean_luminance",
@@ -202,9 +200,9 @@ class HRInferencer:
             )
         }
         self.global_routing_weight = float(
-            self.config.global_routing_weight
+            config.global_routing_weight
         )
-        self.score_top_k = int(self.config.score_top_k)
+        self.score_top_k = int(config.score_top_k)
         self._executor = ThreadPoolExecutor(max_workers=len(task_groups))
         self._inference_lock = Lock()
         self._closed = False
