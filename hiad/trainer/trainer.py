@@ -171,7 +171,6 @@ class HRTrainer:
             config=self.config,
             checkpoint_root=self.checkpoint_root,
             gpu_ids=gpu_ids,
-            models_per_gpu=-1,
             batch_size=calibration_batch_size,
             require_score_calibration=False,
         ) as inferencer:
@@ -204,7 +203,6 @@ class HRTrainer:
             config=self.config,
             checkpoint_root=self.checkpoint_root,
             gpu_ids=gpu_ids,
-            models_per_gpu=-1,
             batch_size=calibration_batch_size,
             require_score_calibration=True,
         ) as inferencer:

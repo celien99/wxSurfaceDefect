@@ -135,7 +135,6 @@ class HRInferencer:
         config,
         checkpoint_root: str,
         gpu_ids,
-        models_per_gpu: int = -1,
         batch_size: int | None = None,
         require_score_calibration: bool = True,
     ):
@@ -161,10 +160,6 @@ class HRInferencer:
         validate_required_config(self.config)
 
         task_groups = [group for group in round_robin_partition(self.tasks, len(self.gpu_ids)) if group]
-        if models_per_gpu == -1:
-            models_per_gpu = max(len(group) for group in task_groups)
-        if models_per_gpu <= 0:
-            raise ValueError("models_per_gpu must be positive or -1")
 
         self.coarse_tasks_in_devices = [
             [task for task in task_group if task["type"] != TASK_TYPE_REFINEMENT_PATCH]
@@ -185,7 +180,6 @@ class HRInferencer:
                 self.config,
                 self.checkpoint_root,
                 self.gpu_ids[index],
-                models_per_gpu,
             )
             for index, tasks in enumerate(tqdm(task_groups, desc="Loading checkpoints..."))
         ]
