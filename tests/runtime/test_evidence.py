@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from hiad.runtime.evidence import (
+    denormalize_imagenet_batch,
     fuse_evidence_maps,
     fuse_evidence_tensors,
     high_frequency_map,
@@ -26,6 +27,19 @@ def test_step_edge_has_high_frequency_response():
 
     assert float(evidence.max()) > 0
     assert float(evidence[:, :, :, 4:6].max()) > float(evidence[:, :, :, :3].max())
+
+
+def test_high_frequency_uses_denormalized_production_input():
+    raw = torch.zeros((1, 3, 9, 9), dtype=torch.float32)
+    raw[:, :, :, 5:] = 1.0
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    normalized = (raw - mean) / std
+
+    restored = denormalize_imagenet_batch(normalized)
+
+    torch.testing.assert_close(restored, raw)
+    torch.testing.assert_close(high_frequency_map(restored), high_frequency_map(raw))
 
 
 @pytest.mark.parametrize(
@@ -64,6 +78,16 @@ def test_tensor_fusion_preserves_device_shape_and_safety_channel():
     assert fused.shape == first.shape
     torch.testing.assert_close(maximum, torch.maximum(first, second))
     assert torch.all(fused >= (first + second) / 2.0)
+
+
+def test_zero_weight_branch_is_excluded_from_safety_maximum():
+    enabled = torch.tensor([[[[0.2]]]])
+    disabled = torch.tensor([[[[100.0]]]])
+
+    fused, maximum = fuse_evidence_tensors([enabled, disabled], [1.0, 0.0])
+
+    torch.testing.assert_close(fused, enabled)
+    torch.testing.assert_close(maximum, enabled)
 
 
 def test_tensor_fusion_rejects_nonfinite_evidence():

@@ -19,13 +19,45 @@ from hiad.models import (
     NormalFeatureMemory,
     TimmDinoV3Encoder,
 )
-from hiad.runtime.evidence import fuse_evidence_tensors, high_frequency_map
+from hiad.runtime.evidence import (
+    denormalize_imagenet_batch,
+    fuse_evidence_tensors,
+    high_frequency_map,
+)
 
 
 def _positive_int(value, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _empty_moments(device):
+    zero = torch.zeros((), dtype=torch.float32, device=device)
+    return zero.clone(), zero.clone(), zero.clone()
+
+
+def _update_moments(moments, values):
+    count, mean, m2 = moments
+    values = values.reshape(-1).to(dtype=torch.float32)
+    batch_count = torch.as_tensor(values.numel(), dtype=torch.float32, device=values.device)
+    batch_mean = values.mean()
+    batch_m2 = (values - batch_mean).square().sum()
+    total = count + batch_count
+    delta = batch_mean - mean
+    return (
+        total,
+        mean + delta * batch_count / total,
+        m2 + batch_m2 + delta.square() * count * batch_count / total,
+    )
+
+
+def _finalize_moments(moments, name):
+    count, mean, m2 = moments
+    if count < 2:
+        raise ValueError(f"{name} fitting requires at least two values")
+    scale = torch.sqrt(m2 / (count - 1)).clamp_min(1e-6)
+    return float(mean.item()), float(scale.item())
 
 
 class HRDinomaly(BaseDetector):
@@ -134,6 +166,10 @@ class HRDinomaly(BaseDetector):
         )
         self.high_frequency_center = 0.0
         self.high_frequency_scale = 1.0
+        self.semantic_center = 0.0
+        self.semantic_scale = 1.0
+        self.memory_center = 0.0
+        self.memory_scale = 1.0
 
         self.bottleneck = []
         self.bottleneck.append(bMlp(embed_dim, embed_dim * 4, embed_dim, drop=bottleneck_dropout))
@@ -171,28 +207,73 @@ class HRDinomaly(BaseDetector):
         self.model.eval()
         self.context_conditioner.eval()
         self.feature_memory.reset()
-        count = torch.zeros((), dtype=torch.float32, device=self.device)
-        mean = torch.zeros((), dtype=torch.float32, device=self.device)
-        m2 = torch.zeros((), dtype=torch.float32, device=self.device)
+        semantic_moments = _empty_moments(self.device)
+        frequency_moments = _empty_moments(self.device)
         for data in train_dataloader:
             main_features, context_features = self.get_multi_resolution_embeddings(data)
             conditioned = self.context_conditioner(main_features, context_features)
             self.feature_memory.update(conditioned)
 
+            semantic_encoder, semantic_decoder = self.model.distillation(
+                list(conditioned)
+            )
+            semantic_token = torch.cat(
+                self._layer_anomaly_token_maps(semantic_encoder, semantic_decoder),
+                dim=1,
+            ).amax(dim=1, keepdim=True)
+            semantic_moments = _update_moments(semantic_moments, semantic_token)
+
             image = data["image"].to(self.device, non_blocking=True)
-            values = high_frequency_map(image).reshape(-1).to(dtype=torch.float32)
-            batch_count = torch.as_tensor(values.numel(), dtype=torch.float32, device=self.device)
-            batch_mean = values.mean()
-            batch_m2 = (values - batch_mean).square().sum()
-            total = count + batch_count
-            delta = batch_mean - mean
-            mean = mean + delta * batch_count / total
-            m2 = m2 + batch_m2 + delta.square() * count * batch_count / total
-            count = total
-        if count < 2:
-            raise ValueError("normal evidence fitting requires at least two pixels")
-        self.high_frequency_center = float(mean.item())
-        self.high_frequency_scale = float(torch.sqrt(m2 / (count - 1)).clamp_min(1e-6).item())
+            frequency_moments = _update_moments(
+                frequency_moments,
+                high_frequency_map(denormalize_imagenet_batch(image)),
+            )
+
+        memory_moments = _empty_moments(self.device)
+        for data in train_dataloader:
+            main_features, context_features = self.get_multi_resolution_embeddings(data)
+            conditioned = self.context_conditioner(main_features, context_features)
+            semantic_encoder, semantic_decoder = self.model.distillation(
+                list(conditioned)
+            )
+            semantic_token = torch.cat(
+                self._layer_anomaly_token_maps(semantic_encoder, semantic_decoder),
+                dim=1,
+            ).amax(dim=1, keepdim=True)
+            memory_token = self._memory_token_map(conditioned, semantic_token.shape[-2:])
+            memory_moments = _update_moments(memory_moments, memory_token)
+
+        self.semantic_center, self.semantic_scale = _finalize_moments(
+            semantic_moments,
+            "semantic evidence",
+        )
+        self.memory_center, self.memory_scale = _finalize_moments(
+            memory_moments,
+            "memory evidence",
+        )
+        self.high_frequency_center, self.high_frequency_scale = _finalize_moments(
+            frequency_moments,
+            "high-frequency evidence",
+        )
+
+    def _memory_token_map(self, features, output_size):
+        memory_layers = self.feature_memory.score(features)
+        return torch.cat(
+            [
+                F.interpolate(
+                    layer,
+                    size=output_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                for layer in memory_layers
+            ],
+            dim=1,
+        ).amax(dim=1, keepdim=True)
+
+    @staticmethod
+    def _positive_normalize(values, center, scale):
+        return ((values - center) / scale).clamp_min(0.0)
 
     def _fused_evidence(
         self,
@@ -206,19 +287,19 @@ class HRDinomaly(BaseDetector):
             semantic_decoder_features,
             self.patch_size,
         )
-        memory_layers = self.feature_memory.score(memory_features)
-        memory_token = torch.cat(
-            [
-                F.interpolate(
-                    layer,
-                    size=semantic_token.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                for layer in memory_layers
-            ],
-            dim=1,
-        ).amax(dim=1, keepdim=True)
+        semantic_pixel = self._positive_normalize(
+            semantic_pixel, self.semantic_center, self.semantic_scale
+        )
+        semantic_token = self._positive_normalize(
+            semantic_token, self.semantic_center, self.semantic_scale
+        )
+        memory_token = self._memory_token_map(
+            memory_features,
+            semantic_token.shape[-2:],
+        )
+        memory_token = self._positive_normalize(
+            memory_token, self.memory_center, self.memory_scale
+        )
         memory_pixel = F.interpolate(
             memory_token,
             size=semantic_pixel.shape[-2:],
@@ -228,7 +309,10 @@ class HRDinomaly(BaseDetector):
 
         image = data["image"].to(self.device, non_blocking=True)
         frequency_pixel = (
-            (high_frequency_map(image) - self.high_frequency_center)
+            (
+                high_frequency_map(denormalize_imagenet_batch(image))
+                - self.high_frequency_center
+            )
             / self.high_frequency_scale
         ).clamp_min(0.0)
         if frequency_pixel.shape[-2:] != semantic_pixel.shape[-2:]:
@@ -463,6 +547,10 @@ class HRDinomaly(BaseDetector):
             "decoder": self.decoder.state_dict(),
             "high_frequency_center": self.high_frequency_center,
             "high_frequency_scale": self.high_frequency_scale,
+            "semantic_center": self.semantic_center,
+            "semantic_scale": self.semantic_scale,
+            "memory_center": self.memory_center,
+            "memory_scale": self.memory_scale,
         }, checkpoint_path)
 
     def load_checkpoint(self, checkpoint_path: str):
@@ -473,6 +561,10 @@ class HRDinomaly(BaseDetector):
         self.decoder.load_state_dict(state_dict['decoder'])
         self.high_frequency_center = state_dict['high_frequency_center']
         self.high_frequency_scale = state_dict['high_frequency_scale']
+        self.semantic_center = state_dict['semantic_center']
+        self.semantic_scale = state_dict['semantic_scale']
+        self.memory_center = state_dict['memory_center']
+        self.memory_scale = state_dict['memory_scale']
 
     @staticmethod
     def get_image_score(task_score_groups):

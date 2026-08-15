@@ -69,6 +69,10 @@ def test_checkpoint_save_persists_inference_state(monkeypatch):
     detector.decoder = Module()
     detector.high_frequency_center = 0.2
     detector.high_frequency_scale = 0.7
+    detector.semantic_center = 0.1
+    detector.semantic_scale = 0.4
+    detector.memory_center = 0.3
+    detector.memory_scale = 0.8
     captured = {}
 
     monkeypatch.setattr(
@@ -84,6 +88,10 @@ def test_checkpoint_save_persists_inference_state(monkeypatch):
         "decoder": {"state": "present"},
         "high_frequency_center": 0.2,
         "high_frequency_scale": 0.7,
+        "semantic_center": 0.1,
+        "semantic_scale": 0.4,
+        "memory_center": 0.3,
+        "memory_scale": 0.8,
     }
 
 
@@ -101,6 +109,10 @@ def test_checkpoint_load_restores_inference_state(monkeypatch):
         "decoder": {"decoder": 4},
         "high_frequency_center": 0.2,
         "high_frequency_scale": 0.7,
+        "semantic_center": 0.1,
+        "semantic_scale": 0.4,
+        "memory_center": 0.3,
+        "memory_scale": 0.8,
     }
     monkeypatch.setattr(
         "hiad.detectors.hr_dinomaly.torch.load",
@@ -115,3 +127,7 @@ def test_checkpoint_load_restores_inference_state(monkeypatch):
     assert detector.decoder.loaded_state == {"decoder": 4}
     assert detector.high_frequency_center == 0.2
     assert detector.high_frequency_scale == 0.7
+    assert detector.semantic_center == 0.1
+    assert detector.semantic_scale == 0.4
+    assert detector.memory_center == 0.3
+    assert detector.memory_scale == 0.8

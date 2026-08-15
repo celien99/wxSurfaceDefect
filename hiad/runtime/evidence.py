@@ -8,6 +8,20 @@ import torch
 from torch.nn import functional as F
 
 
+def denormalize_imagenet_batch(image_batch: torch.Tensor) -> torch.Tensor:
+    """Restore ImageNet-normalized BCHW RGB tensors to their source value range."""
+    if (
+        not isinstance(image_batch, torch.Tensor)
+        or image_batch.ndim != 4
+        or image_batch.shape[1] != 3
+        or not image_batch.is_floating_point()
+    ):
+        raise ValueError("image_batch must be a floating-point BCHW RGB tensor")
+    mean = image_batch.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = image_batch.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    return image_batch * std + mean
+
+
 def high_frequency_map(image_batch: torch.Tensor) -> torch.Tensor:
     """Return a single-channel Sobel/Laplacian high-frequency map.
 
@@ -68,8 +82,10 @@ def fuse_evidence_maps(
     if any(not np.isfinite(branch).all() for branch in converted):
         raise ValueError("all evidence branches must be finite")
 
-    stack = np.stack(converted, axis=0)
-    weighted = np.average(stack, axis=0, weights=numeric_weights)
+    enabled = numeric_weights > 0
+    stack = np.stack(converted, axis=0)[enabled]
+    active_weights = numeric_weights[enabled]
+    weighted = np.average(stack, axis=0, weights=active_weights)
     maximum = np.max(stack, axis=0)
     fused = 0.75 * weighted + 0.25 * maximum if max_evidence else weighted
     return fused, maximum
@@ -97,9 +113,13 @@ def fuse_evidence_tensors(
         raise ValueError("all evidence tensors must use a floating-point dtype")
     if any(not torch.isfinite(branch).all() for branch in branch_maps):
         raise ValueError("all evidence tensors must be finite")
-    stack = torch.stack(tuple(branch_maps), dim=0)
+    enabled = numeric_weights > 0
+    stack = torch.stack(
+        tuple(branch for branch, active in zip(branch_maps, enabled) if active),
+        dim=0,
+    )
     tensor_weights = torch.as_tensor(
-        numeric_weights,
+        numeric_weights[enabled],
         device=reference.device,
         dtype=reference.dtype,
     ).view(-1, 1, 1, 1, 1)

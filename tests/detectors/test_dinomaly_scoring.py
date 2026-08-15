@@ -48,6 +48,10 @@ def test_memory_evidence_uses_conditioned_layers_before_dinomaly_aggregation():
     detector.feature_memory = NormalFeatureMemory(embed_dim=2, layers=8)
     detector.high_frequency_center = 0.0
     detector.high_frequency_scale = 1.0
+    detector.semantic_center = 0.0
+    detector.semantic_scale = 1.0
+    detector.memory_center = 0.0
+    detector.memory_scale = 1.0
     detector.evidence_weights = (0.6, 0.3, 0.1)
     conditioned = [torch.zeros((1, 2, 1, 2)) for _ in range(8)]
     detector.feature_memory.update(conditioned)
