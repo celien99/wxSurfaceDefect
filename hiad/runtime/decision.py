@@ -87,14 +87,6 @@ def image_score_from_statistics(statistics, fallback_score) -> float:
     return float(max(fallback, strongest["score"]))
 
 
-def image_score_from_components(anomaly_map, pixel_threshold, fallback_score) -> float:
-    """Compute a resolution-independent score from connected anomaly regions."""
-    return image_score_from_statistics(
-        component_statistics(anomaly_map, pixel_threshold),
-        fallback_score,
-    )
-
-
 def top_k_map_score(anomaly_map, top_k: int) -> float:
     """Return a resolution-stable local score from the final fused map."""
     values = np.asarray(anomaly_map, dtype=np.float32).reshape(-1)

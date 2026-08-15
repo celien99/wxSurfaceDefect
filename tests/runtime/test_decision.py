@@ -4,7 +4,6 @@ from hiad.runtime.decision import (
     apply_quality_gate,
     classify_score,
     component_statistics,
-    image_score_from_components,
     image_score_from_statistics,
     top_k_map_score,
 )
@@ -42,9 +41,14 @@ def test_image_score_rewards_coherent_component_over_isolated_noise():
     coherent = np.zeros((5, 5), dtype=np.float32)
     coherent[1:4, 1:4] = 0.7
 
-    assert image_score_from_components(coherent, 0.5, 0.0) > image_score_from_components(
-        isolated, 0.5, 0.0
+    coherent_score = image_score_from_statistics(
+        component_statistics(coherent, 0.5), 0.0
     )
+    isolated_score = image_score_from_statistics(
+        component_statistics(isolated, 0.5), 0.0
+    )
+
+    assert coherent_score > isolated_score
 
 
 def test_component_score_is_invariant_to_uniform_resolution_scaling():
@@ -52,8 +56,12 @@ def test_component_score_is_invariant_to_uniform_resolution_scaling():
     low_resolution[2:4, 2:4] = 0.8
     high_resolution = np.repeat(np.repeat(low_resolution, 2, axis=0), 2, axis=1)
 
-    low_score = image_score_from_components(low_resolution, 0.5, 0.0)
-    high_score = image_score_from_components(high_resolution, 0.5, 0.0)
+    low_score = image_score_from_statistics(
+        component_statistics(low_resolution, 0.5), 0.0
+    )
+    high_score = image_score_from_statistics(
+        component_statistics(high_resolution, 0.5), 0.0
+    )
 
     assert np.isclose(low_score, high_score)
 
@@ -68,9 +76,8 @@ def test_image_score_preserves_a_stronger_global_task_prior():
     anomaly_map = np.zeros((5, 5), dtype=np.float32)
     anomaly_map[2, 2] = 0.6
 
-    score = image_score_from_components(
-        anomaly_map,
-        pixel_threshold=0.5,
+    score = image_score_from_statistics(
+        component_statistics(anomaly_map, 0.5),
         fallback_score=0.9,
     )
 
