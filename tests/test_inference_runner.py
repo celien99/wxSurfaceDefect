@@ -100,32 +100,38 @@ def test_save_predictions_serializes_three_state_decision_and_components(tmp_pat
         )
     ]
     output = tmp_path / "predictions.jsonl"
+    component_summary = {
+        "component_count": 1,
+        "anomalous_pixel_count": 4,
+        "largest_component_area": 4,
+        "strongest_component": {
+            "area": 4,
+            "area_fraction": 0.25,
+            "mean_score": 0.4,
+            "max_score": 0.72,
+            "score": 0.6,
+            "bbox_xywh": [1, 2, 2, 2],
+        },
+    }
 
     save_predictions(
         output,
         samples,
         {
-            "image_scores": [0.55],
+            "image_scores": [0.6],
             "is_defect": [False],
             "decisions": ["RECHECK"],
-            "decision_thresholds": [0.6],
+            "decision_thresholds": [0.55],
             "decision_reasons": ["score_within_recheck_margin"],
-            "component_scores": [0.58],
-            "component_summaries": [
-                {
-                    "component_count": 1,
-                    "anomalous_pixel_count": 4,
-                    "largest_component_area": 4,
-                    "components": [{"area": 4}],
-                }
-            ],
+            "component_scores": [0.6],
+            "component_summaries": [component_summary],
         },
     )
 
     record = json.loads(output.read_text())
     assert record["is_defect"] is False
     assert record["decision"] == "RECHECK"
-    assert record["decision_threshold"] == 0.6
+    assert record["decision_threshold"] == 0.55
     assert record["decision_reason"] == "score_within_recheck_margin"
-    assert record["component_score"] == 0.58
-    assert record["component_summary"]["largest_component_area"] == 4
+    assert record["component_score"] == 0.6
+    assert record["component_summary"] == component_summary
