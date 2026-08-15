@@ -121,6 +121,36 @@ def split_multiresolution_regions(
     return indexes
 
 
+def build_multiresolution_region(
+    image_size: Union[int, List],
+    main_index: HRImageIndex,
+    ds_factors: List[int],
+) -> MultiResolutionIndex:
+    """Build centered, boundary-aligned context regions around one native tile."""
+    if not isinstance(main_index, HRImageIndex):
+        raise TypeError("main_index must be an HRImageIndex")
+    if not ds_factors or ds_factors[0] != 0 or ds_factors != sorted(set(ds_factors)):
+        raise ValueError("ds_factors must be unique, sorted, and start with 0")
+    if isinstance(image_size, int):
+        image_width = image_height = image_size
+    else:
+        image_width, image_height = image_size
+    contexts = []
+    center_x = main_index.x + main_index.width / 2
+    center_y = main_index.y + main_index.height / 2
+    for factor in ds_factors[1:]:
+        scale = 2 ** factor
+        width = main_index.width * scale
+        height = main_index.height * scale
+        x = min(max(int(center_x - width / 2), 0), max(image_width - width, 0))
+        y = min(max(int(center_y - height / 2), 0), max(image_height - height, 0))
+        contexts.append(HRImageIndex(x=x, y=y, width=width, height=height))
+    return MultiResolutionIndex(
+        main_index=main_index,
+        low_resolution_indexes=contexts or None,
+    )
+
+
 def split_image_regions(
     image_size: Union[int, List],
     patch_size: Union[int, List],

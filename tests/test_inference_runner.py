@@ -88,3 +88,44 @@ def test_pixel_masks_are_not_gated_by_image_decisions():
     )
 
     assert masks[0].tolist() == [[0, 1]]
+
+
+def test_save_predictions_serializes_three_state_decision_and_components(tmp_path):
+    samples = [
+        SimpleNamespace(
+            image=SimpleNamespace(image_path="a.bmp"),
+            clsname="part",
+            label=0,
+            label_name="good",
+        )
+    ]
+    output = tmp_path / "predictions.jsonl"
+
+    save_predictions(
+        output,
+        samples,
+        {
+            "image_scores": [0.55],
+            "is_defect": [False],
+            "decisions": ["RECHECK"],
+            "decision_thresholds": [0.6],
+            "decision_reasons": ["score_within_recheck_margin"],
+            "component_scores": [0.58],
+            "component_summaries": [
+                {
+                    "component_count": 1,
+                    "anomalous_pixel_count": 4,
+                    "largest_component_area": 4,
+                    "components": [{"area": 4}],
+                }
+            ],
+        },
+    )
+
+    record = json.loads(output.read_text())
+    assert record["is_defect"] is False
+    assert record["decision"] == "RECHECK"
+    assert record["decision_threshold"] == 0.6
+    assert record["decision_reason"] == "score_within_recheck_margin"
+    assert record["component_score"] == 0.58
+    assert record["component_summary"]["largest_component_area"] == 4

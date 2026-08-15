@@ -18,7 +18,6 @@ def train_tasks_in_device(
     checkpoint_root,
     log_root,
     seed,
-    fusion_weights=None,
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = torch.device("cuda")
@@ -56,7 +55,6 @@ def train_tasks_in_device(
             logger=logger,
             device=device,
             seed=seed,
-            fusion_weights=fusion_weights,
         )
         logger.info("Task %s detector is resident on %s", task_name, device)
         sampler_generator = torch.Generator()
@@ -83,6 +81,7 @@ def train_tasks_in_device(
         )
         checkpoint_path = os.path.join(checkpoint_root, f"{task_name}_weight.pkl")
         detector.train_step(train_dataloader, task_name)
+        detector.fit_normal_evidence(train_dataloader)
         detector.save_checkpoint(checkpoint_path)
         logger.info("Task %s checkpoint saved as %s", task_name, checkpoint_path)
 

@@ -12,6 +12,7 @@ if parent_dir not in sys.path:
 
 from hiad.data import HRSample, read_jsonl_records
 from hiad.detectors import HRDinomaly
+from hiad.detectors.config import validate_required_config
 from hiad.evaluation import HREvaluator
 from hiad.evaluation.metrics import compute_pro
 from hiad.evaluation.metrics.torch_backend import (
@@ -56,8 +57,10 @@ if __name__ == "__main__":
         loaded_config = yaml.safe_load(stream)
     if not isinstance(loaded_config, dict):
         raise TypeError("Inference config must be a mapping")
+    validate_required_config(loaded_config)
     config = EasyDict(
         patch=EasyDict(copy.deepcopy(loaded_config)),
+        refinement=EasyDict(copy.deepcopy(loaded_config)),
         thumbnail=EasyDict(copy.deepcopy(loaded_config)),
     )
 
@@ -86,8 +89,16 @@ if __name__ == "__main__":
         for record in test_meta
     ]
     inference_samples = [
-        HRSample(image=sample.image.image_path, clsname=sample.clsname)
-        for sample in test_samples
+        HRSample(
+            image=os.path.join(args.data_root, record["filename"]),
+            foreground=(
+                os.path.join(args.data_root, record["foreground"])
+                if isinstance(record.get("foreground"), str) and record["foreground"]
+                else None
+            ),
+            clsname=record.get("clsname", "default"),
+        )
+        for record in test_meta
     ]
 
     with HRInferencer(

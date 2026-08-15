@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import math
 import os
 import shutil
 import sys
@@ -14,6 +15,7 @@ if parent_dir not in sys.path:
 
 from hiad.constants import DINO_PATCH_SIZE
 from hiad.detectors import HRDinomaly
+from hiad.detectors.config import validate_required_config
 from hiad.runtime.logging import create_logger
 from hiad.task import DynamicTaskGenerator, print_task_summary
 from hiad.trainer import HRTrainer
@@ -27,9 +29,12 @@ def parse_args():
     parser.add_argument("--patch-size", default=512, type=int)
     parser.add_argument("--stride", default=-1, type=int)
     parser.add_argument("--ds-factors", default=[0, 1], nargs="+", type=int)
-    parser.add_argument("--fusion-weights", default=None, nargs="+", type=float)
     parser.add_argument("--batch-size", default=16, type=int)
     parser.add_argument("--thumbnail-size", default=512, type=int)
+    parser.add_argument("--micro-patch-size", default=256, type=int)
+    parser.add_argument("--refinement-quantile", default=0.995, type=float)
+    parser.add_argument("--refinement-min-area", default=4, type=int)
+    parser.add_argument("--refinement-safety-fraction", default=0.02, type=float)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--checkpoint-root", default="results/dinomaly_checkpoints")
     parser.add_argument("--log-root", default="results/dinomaly_logs")
@@ -42,16 +47,20 @@ def parse_args():
         parser.error("--stride must be -1 or in [1, patch-size]")
     if not args.ds_factors or args.ds_factors[0] != 0 or args.ds_factors != sorted(set(args.ds_factors)):
         parser.error("--ds-factors must be unique, sorted, non-negative, and start with 0")
-    if args.fusion_weights is not None and (
-        len(args.fusion_weights) != len(args.ds_factors)
-        or any(weight < 0 for weight in args.fusion_weights)
-        or sum(args.fusion_weights) <= 0
-    ):
-        parser.error("--fusion-weights must match --ds-factors and have a positive sum")
     if args.batch_size <= 0 or args.thumbnail_size <= 0:
         parser.error("--batch-size and --thumbnail-size must be positive")
     if args.thumbnail_size % DINO_PATCH_SIZE:
         parser.error(f"--thumbnail-size must be a multiple of {DINO_PATCH_SIZE}")
+    if args.micro_patch_size <= 0 or args.micro_patch_size % DINO_PATCH_SIZE:
+        parser.error(
+            f"--micro-patch-size must be a positive multiple of {DINO_PATCH_SIZE}"
+        )
+    if not math.isfinite(args.refinement_quantile) or not 0 < args.refinement_quantile < 1:
+        parser.error("--refinement-quantile must be in the range (0, 1)")
+    if args.refinement_min_area <= 0:
+        parser.error("--refinement-min-area must be positive")
+    if not 0 < args.refinement_safety_fraction <= 1:
+        parser.error("--refinement-safety-fraction must be in the range (0, 1]")
     return args
 
 
@@ -71,10 +80,16 @@ if __name__ == "__main__":
         loaded_config = yaml.safe_load(stream)
     if not isinstance(loaded_config, dict):
         raise TypeError("Training config must be a mapping")
+    validate_required_config(loaded_config)
 
     patch_config = EasyDict(copy.deepcopy(loaded_config))
+    refinement_config = EasyDict(copy.deepcopy(loaded_config))
     thumbnail_config = EasyDict(copy.deepcopy(loaded_config))
-    config = EasyDict(patch=patch_config, thumbnail=thumbnail_config)
+    config = EasyDict(
+        patch=patch_config,
+        refinement=refinement_config,
+        thumbnail=thumbnail_config,
+    )
 
     main_logger = create_logger(
         "main",
@@ -90,7 +105,13 @@ if __name__ == "__main__":
         patch_size=args.patch_size,
         ds_factors=args.ds_factors,
         stride=None if args.stride == -1 else args.stride,
-    ).create_tasks(thumbnail_size=args.thumbnail_size)
+    ).create_tasks(
+        thumbnail_size=args.thumbnail_size,
+        micro_patch_size=args.micro_patch_size,
+        refinement_quantile=args.refinement_quantile,
+        refinement_min_area=args.refinement_min_area,
+        refinement_safety_fraction=args.refinement_safety_fraction,
+    )
     print_task_summary(tasks)
 
     trainer = HRTrainer(
@@ -101,7 +122,6 @@ if __name__ == "__main__":
         log_root=args.log_root,
         tasks=tasks,
         seed=args.seed,
-        fusion_weights=args.fusion_weights,
     )
     trainer.train(train_samples=train_samples, gpu_ids=gpu_ids, main_logger=main_logger)
     main_logger.info("Training done. Checkpoints saved to %s", args.checkpoint_root)

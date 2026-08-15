@@ -1,12 +1,13 @@
-import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from hiad.runtime.score_calibration import (
+    build_component_calibration,
     build_score_calibration,
+    component_thresholds_for_samples,
     load_score_calibration,
-    pixel_thresholds_for_samples,
     summarize_anomaly_map,
 )
 
@@ -15,17 +16,9 @@ def _sample(clsname):
     return SimpleNamespace(clsname=clsname)
 
 
-def test_load_score_calibration_accepts_existing_files_without_version_checks(tmp_path):
-    calibration = {
-        "schema_version": 1,
-        "score_top_k": 4,
-        "global_threshold": 0.3,
-        "categories": {"part": {"threshold": 0.2}},
-    }
-    (tmp_path / "score_calibration.json").write_text(json.dumps(calibration))
-
-    assert load_score_calibration(tmp_path) == calibration
-    assert pixel_thresholds_for_samples(calibration, [_sample("part")]) is None
+def test_load_score_calibration_requires_file(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Score calibration not found"):
+        load_score_calibration(tmp_path)
 
 
 def test_pixel_calibration_uses_scalar_map_summaries():
@@ -43,8 +36,30 @@ def test_pixel_calibration_uses_scalar_map_summaries():
         percentile=0.5,
         pixel_percentile=0.5,
         pixel_image_percentile=0.5,
-        score_top_k=4,
     )
 
     assert calibration["global_pixel_threshold"] == np.quantile(statistics, 0.5)
-    assert "schema_version" not in calibration
+
+
+def test_component_calibration_adds_category_decision_thresholds():
+    samples = [_sample("a"), _sample("a"), _sample("b")]
+    calibration = build_score_calibration(
+        samples,
+        [0.1, 0.2, 0.4],
+        [0.3, 0.5, 0.7],
+        percentile=0.5,
+        pixel_percentile=0.9,
+        pixel_image_percentile=0.5,
+    )
+
+    completed = build_component_calibration(
+        calibration,
+        samples,
+        [1.0, 2.0, 4.0],
+        percentile=0.5,
+    )
+
+    np.testing.assert_allclose(
+        component_thresholds_for_samples(completed, samples),
+        [1.5, 1.5, 4.0],
+    )

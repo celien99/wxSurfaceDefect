@@ -122,7 +122,12 @@ class HRSample:
         foreground: Union[str, HRImage] = None,
     ):
         self.image = HRImage(image, is_mask=False) if isinstance(image, str) else image
-        self.image = self._apply_foreground(self.image, foreground)
+        self.foreground = (
+            HRImage(foreground, is_mask=True)
+            if isinstance(foreground, str)
+            else foreground
+        )
+        self.image = self._apply_foreground(self.image, self.foreground)
         self.mask = HRImage(mask, is_mask=True) if isinstance(mask, str) else mask
         self.label = label
         self.label_name = label_name
@@ -211,11 +216,15 @@ class HRSample:
 
     def open(self):
         self.image.open()
+        if self.foreground is not None:
+            self.foreground.open()
         if self.mask is not None:
             self.mask.open()
 
     def close(self):
         self.image.close()
+        if self.foreground is not None:
+            self.foreground.close()
         if self.mask is not None:
             self.mask.close()
 

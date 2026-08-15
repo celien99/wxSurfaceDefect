@@ -10,14 +10,31 @@ from easydict import EasyDict
 from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
 
-from hiad.constants import TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_THUMBNAIL
-from hiad.data import HRSample
+from hiad.constants import (
+    TASK_TYPE_DYNAMIC_PATCH,
+    TASK_TYPE_REFINEMENT_PATCH,
+    TASK_TYPE_THUMBNAIL,
+)
+from hiad.data import HRImageIndex, HRSample
 from hiad.datasets import StreamingTaskDataset
 from hiad.inferencer.modelmanager import ModelManager
+from hiad.detectors.config import validate_required_config
+from hiad.inferencer.refinement import (
+    build_routing_map,
+    merge_refinement_maps,
+    select_refinement_regions,
+)
 from hiad.runtime.devices import validate_gpu_ids
+from hiad.runtime.decision import (
+    classify_score,
+    component_statistics,
+    image_score_from_statistics,
+)
 from hiad.runtime.partition import round_robin_partition
 from hiad.runtime.prediction import threshold_anomaly_maps
+from hiad.runtime.quality import assess_image_quality
 from hiad.runtime.score_calibration import (
+    component_thresholds_for_samples,
     load_score_calibration,
     pixel_thresholds_for_samples,
     thresholds_for_samples,
@@ -48,17 +65,43 @@ def _gather_patch_predictions(patches, image_size):
     return (accumulated / weight_map).astype(np.float32)
 
 
+def _gather_patch_max_predictions(patches, image_size):
+    image_width, image_height = image_size
+    maximum = np.full((image_height, image_width), -np.inf, dtype=np.float32)
+    coverage = np.zeros((image_height, image_width), dtype=np.uint8)
+    for record, prediction in patches:
+        x, y, _, _ = record["source_xywh"]
+        valid_height, valid_width = record["valid_source_hw"]
+        values = np.asarray(prediction, dtype=np.float32)
+        target = maximum[y:y + valid_height, x:x + valid_width]
+        maximum[y:y + valid_height, x:x + valid_width] = np.maximum(
+            target,
+            values[:valid_height, :valid_width],
+        )
+        coverage[y:y + valid_height, x:x + valid_width] = 1
+    if not np.all(coverage):
+        raise ValueError("Patch predictions do not cover the complete source image")
+    return maximum
+
+
 def inference_in_device(
     test_samples,
     task_group,
     model_manager,
     batch_size,
     *,
-    include_anomaly_maps: bool = True,
+    regions_by_path=None,
 ):
     paths = [sample.image.image_path for sample in test_samples]
     results = {
-        path: {"image_size": None, "patches": [], "thumbnail": None, "scores": []}
+        path: {
+            "image_size": None,
+            "patches": [],
+            "max_patches": [],
+            "thumbnail": None,
+            "max_thumbnail": None,
+            "scores": [],
+        }
         for path in paths
     }
 
@@ -69,6 +112,7 @@ def inference_in_device(
             copy.deepcopy(test_samples),
             task,
             training=False,
+            regions_by_path=regions_by_path,
         )
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -77,30 +121,28 @@ def inference_in_device(
             num_workers=0,
             pin_memory=True,
         )
-        predictions = detector.inference_step(
-            dataloader,
-            task_name,
-            include_anomaly_maps=include_anomaly_maps,
-        )
+        predictions = detector.inference_step(dataloader)
         if len(predictions) != len(dataset.records):
             raise RuntimeError(
                 f"Task {task_name} returned {len(predictions)} predictions for "
                 f"{len(dataset.records)} inputs"
             )
 
-        if task["type"] == TASK_TYPE_DYNAMIC_PATCH:
+        if task["type"] in {TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_REFINEMENT_PATCH}:
             for record, prediction in zip(dataset.records, predictions):
                 path = record["image_path"]
                 results[path]["image_size"] = record["image_size"]
-                if include_anomaly_maps:
-                    results[path]["patches"].append((record, prediction["anomaly_map"]))
+                results[path]["patches"].append((record, prediction["anomaly_map"]))
+                results[path]["max_patches"].append(
+                    (record, prediction["max_evidence_map"])
+                )
                 results[path]["scores"].append(prediction["score"])
         elif task["type"] == TASK_TYPE_THUMBNAIL:
             for record, prediction in zip(dataset.records, predictions):
                 path = record["image_path"]
                 results[path]["image_size"] = record["image_size"]
-                if include_anomaly_maps:
-                    results[path]["thumbnail"] = prediction["anomaly_map"]
+                results[path]["thumbnail"] = prediction["anomaly_map"]
+                results[path]["max_thumbnail"] = prediction["max_evidence_map"]
                 results[path]["scores"].append(prediction["score"])
         else:
             raise ValueError(f"Unsupported task type: {task}")
@@ -140,12 +182,9 @@ class HRInferencer:
         if not os.path.isfile(tasks_path):
             raise FileNotFoundError(f"Task configuration not found: {tasks_path}")
         self.tasks = load_tasks(tasks_path)
-
-        for task in self.tasks:
-            if task["type"] == TASK_TYPE_DYNAMIC_PATCH:
-                self.config.patch.patch_size = task["patch_size"]
-            elif task["type"] == TASK_TYPE_THUMBNAIL:
-                self.config.thumbnail.thumbnail_size = task["thumbnail_size"]
+        validate_required_config(self.config.patch)
+        validate_required_config(self.config.refinement)
+        validate_required_config(self.config.thumbnail)
 
         task_groups = [group for group in round_robin_partition(self.tasks, len(self.gpu_ids)) if group]
         if models_per_gpu == -1:
@@ -153,7 +192,18 @@ class HRInferencer:
         if models_per_gpu <= 0:
             raise ValueError("models_per_gpu must be positive or -1")
 
-        self.tasks_in_devices = task_groups
+        self.coarse_tasks_in_devices = [
+            [task for task in task_group if task["type"] != TASK_TYPE_REFINEMENT_PATCH]
+            for task_group in task_groups
+        ]
+        self.refinement_tasks_in_devices = [
+            [task for task in task_group if task["type"] == TASK_TYPE_REFINEMENT_PATCH]
+            for task_group in task_groups
+        ]
+        refinement_tasks = [
+            task for task in self.tasks if task["type"] == TASK_TYPE_REFINEMENT_PATCH
+        ]
+        self.refinement_task = refinement_tasks[0]
         self.model_managers = [
             ModelManager(
                 tasks,
@@ -165,26 +215,40 @@ class HRInferencer:
             )
             for index, tasks in enumerate(tqdm(task_groups, desc="Loading checkpoints..."))
         ]
-        score_top_k_values = set().union(
-            *(manager.score_top_k_values() for manager in self.model_managers)
+        self.score_calibration = (
+            load_score_calibration(self.checkpoint_root)
+            if require_score_calibration
+            else None
         )
-        if len(score_top_k_values) != 1:
-            raise ValueError("All task checkpoints must use the same score_top_k")
-        self.score_top_k = score_top_k_values.pop()
-        self.score_calibration = load_score_calibration(
-            self.checkpoint_root,
-            required=require_score_calibration,
-        )
-        if (
-            self.score_calibration is not None
-            and self.score_calibration["score_top_k"] != self.score_top_k
-        ):
-            raise ValueError("Score calibration does not match checkpoint score_top_k")
         self.map_gaussian_sigma = float(
             getattr(self.config.patch, "map_gaussian_sigma", 0.0)
         )
         if not np.isfinite(self.map_gaussian_sigma) or self.map_gaussian_sigma < 0:
             raise ValueError("map_gaussian_sigma must be a finite non-negative number")
+        self.decision_recheck_margin_ratio = float(
+            self.config.patch.decision_recheck_margin_ratio
+        )
+        if (
+            not np.isfinite(self.decision_recheck_margin_ratio)
+            or not 0 <= self.decision_recheck_margin_ratio <= 1
+        ):
+            raise ValueError(
+                "decision_recheck_margin_ratio must be finite and in [0, 1]"
+            )
+        self.quality_thresholds = {
+            key: float(self.config.patch[key])
+            for key in (
+                "min_mean_luminance",
+                "max_mean_luminance",
+                "max_clipped_fraction",
+                "min_focus_variance",
+            )
+        }
+        self.global_routing_weight = float(
+            self.config.patch.global_routing_weight
+        )
+        if not np.isfinite(self.global_routing_weight) or not 0 <= self.global_routing_weight <= 1:
+            raise ValueError("global_routing_weight must be finite and in [0, 1]")
         self._executor = ThreadPoolExecutor(max_workers=len(task_groups))
         self._inference_lock = Lock()
         self._closed = False
@@ -194,26 +258,22 @@ class HRInferencer:
             if self._closed:
                 raise RuntimeError("HRInferencer is closed")
             self._validate_samples(test_samples)
+            quality_results = self._assess_quality(test_samples)
 
             batch_size = self.batch_size or len(test_samples)
-            pending = [
-                self._executor.submit(
-                    inference_in_device,
-                    test_samples,
-                    task_group,
-                    manager,
-                    batch_size,
-                    include_anomaly_maps=True,
-                )
-                for task_group, manager in zip(self.tasks_in_devices, self.model_managers)
-            ]
-            worker_results = [future.result() for future in pending]
+            worker_results = self._run_inference_groups(
+                test_samples,
+                self.coarse_tasks_in_devices,
+                batch_size,
+            )
 
             merged = {
                 sample.image.image_path: {
                     "image_size": None,
                     "patches": [],
+                    "max_patches": [],
                     "thumbnail": None,
+                    "max_thumbnail": None,
                     "scores": [],
                 }
                 for sample in test_samples
@@ -226,13 +286,18 @@ class HRInferencer:
                             raise ValueError(f"Task image sizes disagree for {path}")
                         merged[path]["image_size"] = result["image_size"]
                     merged[path]["patches"].extend(result["patches"])
+                    merged[path]["max_patches"].extend(result["max_patches"])
                     merged[path]["scores"].extend(result["scores"])
                     if result["thumbnail"] is not None:
                         if merged[path]["thumbnail"] is not None:
                             raise ValueError(f"Duplicate thumbnail prediction for {path}")
                         merged[path]["thumbnail"] = result["thumbnail"]
+                        merged[path]["max_thumbnail"] = result["max_thumbnail"]
 
             anomaly_maps = []
+            max_evidence_maps = []
+            global_context_maps = []
+            global_max_evidence_maps = []
             task_score_groups = []
             for sample in test_samples:
                 path = sample.image.image_path
@@ -240,75 +305,237 @@ class HRInferencer:
                 if result["image_size"] is None or not result["patches"]:
                     raise ValueError(f"Incomplete dynamic patch prediction for {path}")
                 patch_map = _gather_patch_predictions(result["patches"], result["image_size"])
+                max_patch_map = _gather_patch_max_predictions(
+                    result["max_patches"],
+                    result["image_size"],
+                )
                 final_map = patch_map
-                if result["thumbnail"] is not None:
-                    image_width, image_height = result["image_size"]
-                    thumbnail_map = cv2.resize(
-                        np.asarray(result["thumbnail"], dtype=np.float32),
-                        (image_width, image_height),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    final_map = np.maximum(final_map, thumbnail_map)
+                final_max_map = max_patch_map
+                if result["thumbnail"] is None or result["max_thumbnail"] is None:
+                    raise ValueError(f"Incomplete global context prediction for {path}")
+                image_width, image_height = result["image_size"]
+                global_context_maps.append(cv2.resize(
+                    np.asarray(result["thumbnail"], dtype=np.float32),
+                    (image_width, image_height),
+                    interpolation=cv2.INTER_LINEAR,
+                ))
+                global_max_evidence_maps.append(cv2.resize(
+                    np.asarray(result["max_thumbnail"], dtype=np.float32),
+                    (image_width, image_height),
+                    interpolation=cv2.INTER_LINEAR,
+                ))
                 if self.map_gaussian_sigma > 0:
                     final_map = gaussian_filter(
                         final_map,
                         sigma=self.map_gaussian_sigma,
                     )
                 anomaly_maps.append(np.asarray(final_map, dtype=np.float32))
+                max_evidence_maps.append(np.asarray(final_max_map, dtype=np.float32))
                 task_score_groups.append(result["scores"])
+
+            routing_maps = [
+                build_routing_map(
+                    local_map,
+                    global_map,
+                    self.global_routing_weight,
+                )
+                for local_map, global_map in zip(
+                    anomaly_maps,
+                    global_context_maps,
+                )
+            ]
+            anomaly_maps, max_evidence_maps, refinement_scores = self._apply_refinement(
+                test_samples,
+                anomaly_maps,
+                max_evidence_maps,
+                routing_maps,
+                batch_size,
+            )
+            for score_group, sample in zip(task_score_groups, test_samples):
+                score_group.extend(refinement_scores[sample.image.image_path])
 
             image_scores = self.detector_class.get_image_score(task_score_groups)
             output = {
                 "image_paths": [sample.image.image_path for sample in test_samples],
                 "image_scores": image_scores,
                 "anomaly_maps": anomaly_maps,
+                "max_evidence_maps": max_evidence_maps,
+                "global_context_maps": global_context_maps,
+                "global_max_evidence_maps": global_max_evidence_maps,
                 "display_images": self._build_display_images(test_samples, display_size),
+                "quality_results": quality_results,
             }
             if self.score_calibration is not None:
                 thresholds = thresholds_for_samples(self.score_calibration, test_samples)
                 output["image_thresholds"] = thresholds
-                is_defect = image_scores > thresholds
                 pixel_thresholds = pixel_thresholds_for_samples(
                     self.score_calibration, test_samples
                 )
-                output["is_defect"] = is_defect.tolist()
-                if pixel_thresholds is not None:
-                    output["pixel_thresholds"] = pixel_thresholds
-                    output["binary_anomaly_maps"] = threshold_anomaly_maps(
-                        anomaly_maps, pixel_thresholds
+                component_summaries = [
+                    component_statistics(anomaly_map, pixel_threshold)
+                    for anomaly_map, pixel_threshold in zip(anomaly_maps, pixel_thresholds)
+                ]
+                component_scores = [
+                    image_score_from_statistics(summary, image_score)
+                    for summary, image_score in zip(component_summaries, image_scores)
+                ]
+                decision_thresholds = (
+                    component_thresholds_for_samples(
+                        self.score_calibration,
+                        test_samples,
                     )
+                    if "global_component_threshold" in self.score_calibration
+                    else thresholds
+                )
+                decisions = [
+                    classify_score(
+                        score,
+                        threshold,
+                        threshold * self.decision_recheck_margin_ratio,
+                    )
+                    for score, threshold in zip(component_scores, decision_thresholds)
+                ]
+                output["decision_thresholds"] = decision_thresholds
+                output["component_scores"] = component_scores
+                output["decisions"] = decisions
+                output["decision_reasons"] = [
+                    "score_at_or_below_threshold"
+                    if decision == "OK"
+                    else "score_within_recheck_margin"
+                    if decision == "RECHECK"
+                    else "score_above_recheck_margin"
+                    for decision in decisions
+                ]
+                output["component_summaries"] = component_summaries
+                for index, quality in enumerate(quality_results):
+                    if quality["status"] == "RECHECK":
+                        decisions[index] = "RECHECK"
+                        output["decision_reasons"][index] = (
+                            "quality_gate:" + ",".join(quality["reasons"])
+                        )
+                output["is_defect"] = [decision == "NG" for decision in decisions]
+                output["pixel_thresholds"] = pixel_thresholds
+                output["binary_anomaly_maps"] = threshold_anomaly_maps(
+                    anomaly_maps, pixel_thresholds
+                )
             return output
 
     def score_samples(self, test_samples) -> np.ndarray:
-        """Compute image scores without reconstructing full-resolution maps."""
-        with self._inference_lock:
-            if self._closed:
-                raise RuntimeError("HRInferencer is closed")
-            self._validate_samples(test_samples)
+        """Compute image scores through the mandatory coarse-to-fine path."""
+        return self.inference(test_samples)["image_scores"]
 
-            batch_size = self.batch_size or len(test_samples)
-            pending = [
-                self._executor.submit(
-                    inference_in_device,
-                    test_samples,
-                    task_group,
-                    manager,
-                    batch_size,
-                    include_anomaly_maps=False,
-                )
-                for task_group, manager in zip(self.tasks_in_devices, self.model_managers)
-            ]
-            worker_results = [future.result() for future in pending]
-            scores_by_path = {
-                sample.image.image_path: []
-                for sample in test_samples
-            }
-            for worker_result in worker_results:
-                for path, result in worker_result.items():
-                    scores_by_path[path].extend(result["scores"])
-            return self.detector_class.get_image_score(
-                [scores_by_path[sample.image.image_path] for sample in test_samples]
+    def _run_inference_groups(
+        self,
+        test_samples,
+        task_groups,
+        batch_size,
+        *,
+        regions_by_path=None,
+    ):
+        pending = [
+            self._executor.submit(
+                inference_in_device,
+                test_samples,
+                task_group,
+                manager,
+                batch_size,
+                regions_by_path=regions_by_path,
             )
+            for task_group, manager in zip(task_groups, self.model_managers)
+            if task_group
+        ]
+        return [future.result() for future in pending]
+
+    def _apply_refinement(
+        self,
+        test_samples,
+        base_maps,
+        base_max_maps,
+        routing_maps,
+        batch_size,
+    ):
+        refinement_task = self.refinement_task
+        regions_by_path = {
+            sample.image.image_path: select_refinement_regions(
+                anomaly_map,
+                threshold=float(
+                    np.quantile(
+                        anomaly_map,
+                        refinement_task["refinement_quantile"],
+                    )
+                ),
+                tile_size=refinement_task["patch_size"],
+                min_area=refinement_task["refinement_min_area"],
+                safety_fraction=refinement_task["refinement_safety_fraction"],
+            )
+            for sample, anomaly_map in zip(test_samples, routing_maps)
+        }
+        worker_results = self._run_inference_groups(
+            test_samples,
+            self.refinement_tasks_in_devices,
+            batch_size,
+            regions_by_path=regions_by_path,
+        )
+        refinements_by_path = {
+            sample.image.image_path: []
+            for sample in test_samples
+        }
+        max_refinements_by_path = {
+            sample.image.image_path: []
+            for sample in test_samples
+        }
+        scores_by_path = {
+            sample.image.image_path: []
+            for sample in test_samples
+        }
+        for worker_result in worker_results:
+            for path, result in worker_result.items():
+                refinements_by_path[path].extend(result["patches"])
+                max_refinements_by_path[path].extend(result["max_patches"])
+                scores_by_path[path].extend(result["scores"])
+
+        refined_maps = []
+        refined_max_maps = []
+        for sample, base_map, base_max_map in zip(
+            test_samples,
+            base_maps,
+            base_max_maps,
+        ):
+            path = sample.image.image_path
+            refinements = []
+            for record, anomaly_map in refinements_by_path[path]:
+                x, y, width, height = record["source_xywh"]
+                refinements.append((
+                    HRImageIndex(
+                        x=x,
+                        y=y,
+                        width=width,
+                        height=height,
+                    ),
+                    anomaly_map,
+                ))
+            refined_maps.append(
+                merge_refinement_maps(
+                    base_map,
+                    refinements,
+                    image_size=(base_map.shape[1], base_map.shape[0]),
+                )
+            )
+            max_refinements = []
+            for record, anomaly_map in max_refinements_by_path[path]:
+                x, y, width, height = record["source_xywh"]
+                max_refinements.append((
+                    HRImageIndex(x=x, y=y, width=width, height=height),
+                    anomaly_map,
+                ))
+            refined_max_maps.append(
+                merge_refinement_maps(
+                    base_max_map,
+                    max_refinements,
+                    image_size=(base_max_map.shape[1], base_max_map.shape[0]),
+                )
+            )
+        return refined_maps, refined_max_maps, scores_by_path
 
     @staticmethod
     def _validate_samples(test_samples) -> None:
@@ -321,6 +548,22 @@ class HRInferencer:
             raise ValueError("Inference sample image paths must be unique")
         if any(not isinstance(sample.clsname, str) or not sample.clsname.strip() for sample in test_samples):
             raise ValueError("Every inference sample must have a non-empty clsname")
+
+    def _assess_quality(self, test_samples) -> list[dict]:
+        results = []
+        for sample in test_samples:
+            sample.open()
+            try:
+                results.append(
+                    assess_image_quality(
+                        sample.image.image,
+                        self.quality_thresholds,
+                        sample.foreground.image if sample.foreground is not None else None,
+                    )
+                )
+            finally:
+                sample.close()
+        return results
 
     @staticmethod
     def _build_display_images(test_samples, display_size):

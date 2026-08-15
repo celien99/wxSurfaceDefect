@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 
@@ -37,7 +38,6 @@ def build_score_calibration(
     percentile,
     pixel_percentile,
     pixel_image_percentile,
-    score_top_k: int,
 ) -> dict:
     samples = tuple(samples)
     scores = np.asarray(scores, dtype=np.float64)
@@ -46,8 +46,6 @@ def build_score_calibration(
     pixel_statistics = np.asarray(pixel_statistics, dtype=np.float64)
     if pixel_statistics.shape != (len(samples),):
         raise ValueError("Pixel statistic count must match the normal sample count")
-    if isinstance(score_top_k, bool) or not isinstance(score_top_k, int) or score_top_k <= 0:
-        raise ValueError("score_top_k must be a positive integer")
     percentile = _validate_percentile(percentile)
     pixel_percentile = _validate_percentile(pixel_percentile)
     pixel_image_percentile = _validate_percentile(pixel_image_percentile)
@@ -62,7 +60,6 @@ def build_score_calibration(
         grouped_pixel_statistics.setdefault(category, []).append(float(pixel_statistic))
 
     return {
-        "score_top_k": score_top_k,
         "percentile": percentile,
         "pixel_percentile": pixel_percentile,
         "pixel_image_percentile": pixel_image_percentile,
@@ -84,27 +81,47 @@ def build_score_calibration(
     }
 
 
+def build_component_calibration(
+    calibration: dict,
+    samples,
+    component_scores,
+    *,
+    percentile,
+) -> dict:
+    samples = tuple(samples)
+    scores = np.asarray(component_scores, dtype=np.float64)
+    if scores.shape != (len(samples),) or not np.isfinite(scores).all():
+        raise ValueError("Component score count must match finite normal samples")
+    percentile = _validate_percentile(percentile)
+    grouped: dict[str, list[float]] = {}
+    for sample, score in zip(samples, scores):
+        grouped.setdefault(sample.clsname, []).append(float(score))
+
+    completed = copy.deepcopy(calibration)
+    completed["component_percentile"] = percentile
+    completed["global_component_threshold"] = _score_threshold(scores, percentile)
+    for category, category_scores in grouped.items():
+        completed["categories"][category]["component_threshold"] = _score_threshold(
+            category_scores,
+            percentile,
+        )
+    return completed
+
+
 def save_score_calibration(calibration: dict, checkpoint_root: str) -> str:
     path = os.path.join(checkpoint_root, SCORE_CALIBRATION_FILE)
-    temporary_path = f"{path}.tmp"
-    with open(temporary_path, "w", encoding="utf-8") as stream:
+    with open(path, "w", encoding="utf-8") as stream:
         json.dump(calibration, stream, indent=2, sort_keys=True)
         stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary_path, path)
     return path
 
 
-def load_score_calibration(checkpoint_root: str, *, required: bool = True) -> dict | None:
+def load_score_calibration(checkpoint_root: str) -> dict:
     path = os.path.join(checkpoint_root, SCORE_CALIBRATION_FILE)
     if not os.path.isfile(path):
-        if required:
-            raise FileNotFoundError(f"Score calibration not found: {path}")
-        return None
+        raise FileNotFoundError(f"Score calibration not found: {path}")
     with open(path, "r", encoding="utf-8") as stream:
-        calibration = json.load(stream)
-    return calibration
+        return json.load(stream)
 
 
 def thresholds_for_samples(calibration: dict, samples) -> np.ndarray:
@@ -119,17 +136,31 @@ def thresholds_for_samples(calibration: dict, samples) -> np.ndarray:
     )
 
 
-def pixel_thresholds_for_samples(calibration: dict, samples) -> np.ndarray | None:
-    global_value = calibration.get("global_pixel_threshold")
-    if global_value is None:
-        return None
-    global_threshold = float(global_value)
+def pixel_thresholds_for_samples(calibration: dict, samples) -> np.ndarray:
+    global_threshold = float(calibration["global_pixel_threshold"])
     categories = calibration["categories"]
     return np.asarray(
         [
             float(
                 categories.get(sample.clsname, {}).get(
                     "pixel_threshold", global_threshold
+                )
+            )
+            for sample in samples
+        ],
+        dtype=np.float32,
+    )
+
+
+def component_thresholds_for_samples(calibration: dict, samples) -> np.ndarray:
+    global_threshold = float(calibration["global_component_threshold"])
+    categories = calibration["categories"]
+    return np.asarray(
+        [
+            float(
+                categories.get(sample.clsname, {}).get(
+                    "component_threshold",
+                    global_threshold,
                 )
             )
             for sample in samples

@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from hiad.detectors.hr_dinomaly import HRDinomaly
+from hiad.models.memory import NormalFeatureMemory
 
 
 def test_image_score_keeps_the_strongest_local_evidence():
@@ -38,3 +39,29 @@ def test_pixel_map_maximizes_layers_after_upsampling():
         anomaly_map,
         torch.tensor([[[[1.0, 0.5, 1.0]]]]),
     )
+
+
+def test_memory_evidence_uses_conditioned_layers_before_dinomaly_aggregation():
+    detector = object.__new__(HRDinomaly)
+    detector.patch_size = [2, 2]
+    detector.device = torch.device("cpu")
+    detector.feature_memory = NormalFeatureMemory(embed_dim=2, layers=8)
+    detector.high_frequency_center = 0.0
+    detector.high_frequency_scale = 1.0
+    detector.evidence_weights = (0.6, 0.3, 0.1)
+    conditioned = [torch.zeros((1, 2, 1, 2)) for _ in range(8)]
+    detector.feature_memory.update(conditioned)
+    detector.feature_memory.update([feature + 0.01 for feature in conditioned])
+    semantic_encoder = [torch.ones((1, 2, 1, 2)) for _ in range(2)]
+    semantic_decoder = [torch.ones((1, 2, 1, 2)) for _ in range(2)]
+
+    pixel_map, token_map, max_map = detector._fused_evidence(
+        {"image": torch.zeros((1, 3, 2, 2))},
+        conditioned,
+        semantic_encoder,
+        semantic_decoder,
+    )
+
+    assert pixel_map.shape == (1, 1, 2, 2)
+    assert token_map.shape == (1, 1, 1, 2)
+    assert max_map.shape == (1, 1, 2, 2)

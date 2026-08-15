@@ -14,7 +14,12 @@ from .dinomaly.models.vision_transformer import Block as VitBlock, bMlp, LinearA
 from .dinomaly.models.uad import ViTill
 from .dinomaly.optimizers import StableAdamW
 from .dinomaly.utils import global_cosine_hm_percent, WarmCosineScheduler
-from hiad.models import TimmDinoV3Encoder
+from hiad.models import (
+    ConditionalFeatureFusion,
+    NormalFeatureMemory,
+    TimmDinoV3Encoder,
+)
+from hiad.runtime.evidence import fuse_evidence_tensors, high_frequency_map
 
 
 def _positive_int(value, name: str) -> int:
@@ -32,7 +37,6 @@ class HRDinomaly(BaseDetector):
                  logger: logging.Logger,  # base
                  device: torch.device,  # base
                  seed: int = 0,  #base
-                 fusion_weights = None,
                  bottleneck_dropout: float = 0.1,
                  grad_clip_norm: float = 1.0,
                  hard_mining_final: float = 0.0,
@@ -42,11 +46,14 @@ class HRDinomaly(BaseDetector):
                  encoder_amp: bool = True,
                  decoder_amp: bool = True,
                  allow_tf32: bool = True,
+                 semantic_weight: float = 0.6,
+                 memory_weight: float = 0.3,
+                 high_frequency_weight: float = 0.1,
                  **kwargs):
 
         total_iters = _positive_int(total_iters, "total_iters")
         log_per_steps = _positive_int(log_per_steps, "log_per_steps")
-        super().__init__(patch_size, device, fusion_weights, logger, seed)
+        super().__init__(patch_size, device, logger, seed)
 
         bottleneck_dropout = float(bottleneck_dropout)
         grad_clip_norm = float(grad_clip_norm)
@@ -74,6 +81,15 @@ class HRDinomaly(BaseDetector):
             raise TypeError("decoder_amp must be a boolean")
         if not isinstance(allow_tf32, bool):
             raise TypeError("allow_tf32 must be a boolean")
+        evidence_weights = (
+            float(semantic_weight),
+            float(memory_weight),
+            float(high_frequency_weight),
+        )
+        if any(not np.isfinite(weight) or weight < 0 for weight in evidence_weights):
+            raise ValueError("evidence weights must be finite and non-negative")
+        if sum(evidence_weights) <= 0:
+            raise ValueError("at least one evidence weight must be positive")
         score_top_k = _positive_int(score_top_k, "score_top_k")
         self.total_iters = total_iters
         self.grad_clip_norm = grad_clip_norm
@@ -84,6 +100,8 @@ class HRDinomaly(BaseDetector):
         self.encoder_amp = encoder_amp
         self.decoder_amp = decoder_amp
         self.allow_tf32 = allow_tf32
+        self.evidence_weights = evidence_weights
+        self.backbone_name = backbone_name
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
             torch.backends.cudnn.allow_tf32 = allow_tf32
@@ -106,6 +124,17 @@ class HRDinomaly(BaseDetector):
         else:
             raise ValueError(f"Unsupported DINOv3 embedding dimension: {embed_dim}")
 
+        self.context_conditioner = ConditionalFeatureFusion(
+            embed_dim=embed_dim,
+            layers=len(self.target_layers),
+        )
+        self.feature_memory = NormalFeatureMemory(
+            embed_dim=embed_dim,
+            layers=len(self.target_layers),
+        )
+        self.high_frequency_center = 0.0
+        self.high_frequency_scale = 1.0
+
         self.bottleneck = []
         self.bottleneck.append(bMlp(embed_dim, embed_dim * 4, embed_dim, drop=bottleneck_dropout))
         self.bottleneck = nn.ModuleList(self.bottleneck)
@@ -125,8 +154,6 @@ class HRDinomaly(BaseDetector):
                             fuse_layer_decoder=self.fuse_layer_decoder)
         self.to_device(device)
         self.log_per_steps = log_per_steps
-        self.max_anomaly_score = None
-        self.min_anomaly_score = None
 
     @torch.no_grad()
     def embedding(self, input_tensor: torch.Tensor ) -> List[torch.Tensor]:
@@ -134,13 +161,106 @@ class HRDinomaly(BaseDetector):
 
     def to_device(self, device):
         self.model = self.model.to(device)
+        self.context_conditioner = self.context_conditioner.to(device)
+        self.feature_memory = self.feature_memory.to(device)
         self.device = device
+
+    @torch.no_grad()
+    def fit_normal_evidence(self, train_dataloader: DataLoader) -> None:
+        """Fit normal token statistics and high-frequency normalization."""
+        self.model.eval()
+        self.context_conditioner.eval()
+        self.feature_memory.reset()
+        count = torch.zeros((), dtype=torch.float32, device=self.device)
+        mean = torch.zeros((), dtype=torch.float32, device=self.device)
+        m2 = torch.zeros((), dtype=torch.float32, device=self.device)
+        for data in train_dataloader:
+            main_features, context_features = self.get_multi_resolution_embeddings(data)
+            conditioned = self.context_conditioner(main_features, context_features)
+            self.feature_memory.update(conditioned)
+
+            image = data["image"].to(self.device, non_blocking=True)
+            values = high_frequency_map(image).reshape(-1).to(dtype=torch.float32)
+            batch_count = torch.as_tensor(values.numel(), dtype=torch.float32, device=self.device)
+            batch_mean = values.mean()
+            batch_m2 = (values - batch_mean).square().sum()
+            total = count + batch_count
+            delta = batch_mean - mean
+            mean = mean + delta * batch_count / total
+            m2 = m2 + batch_m2 + delta.square() * count * batch_count / total
+            count = total
+        if count < 2:
+            raise ValueError("normal evidence fitting requires at least two pixels")
+        self.high_frequency_center = float(mean.item())
+        self.high_frequency_scale = float(torch.sqrt(m2 / (count - 1)).clamp_min(1e-6).item())
+
+    def _fused_evidence(
+        self,
+        data,
+        memory_features,
+        semantic_encoder_features,
+        semantic_decoder_features,
+    ):
+        semantic_pixel, semantic_token = self.cal_anomaly_maps(
+            semantic_encoder_features,
+            semantic_decoder_features,
+            self.patch_size,
+        )
+        memory_layers = self.feature_memory.score(memory_features)
+        memory_token = torch.cat(
+            [
+                F.interpolate(
+                    layer,
+                    size=semantic_token.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                for layer in memory_layers
+            ],
+            dim=1,
+        ).amax(dim=1, keepdim=True)
+        memory_pixel = F.interpolate(
+            memory_token,
+            size=semantic_pixel.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        image = data["image"].to(self.device, non_blocking=True)
+        frequency_pixel = (
+            (high_frequency_map(image) - self.high_frequency_center)
+            / self.high_frequency_scale
+        ).clamp_min(0.0)
+        if frequency_pixel.shape[-2:] != semantic_pixel.shape[-2:]:
+            frequency_pixel = F.interpolate(
+                frequency_pixel,
+                size=semantic_pixel.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        frequency_token = F.adaptive_avg_pool2d(
+            frequency_pixel,
+            output_size=semantic_token.shape[-2:],
+        )
+        fused_pixel, max_pixel = fuse_evidence_tensors(
+            [semantic_pixel, memory_pixel, frequency_pixel],
+            self.evidence_weights,
+        )
+        fused_token, _ = fuse_evidence_tensors(
+            [semantic_token, memory_token, frequency_token],
+            self.evidence_weights,
+        )
+        return fused_pixel, fused_token, max_pixel
 
     def train_step(self,
                    train_dataloader: DataLoader,
                    task_name: str) -> None:
 
-        trainable = nn.ModuleList([self.bottleneck, self.decoder])
+        trainable = nn.ModuleList([
+            self.context_conditioner,
+            self.bottleneck,
+            self.decoder,
+        ])
 
         for m in trainable.modules():
             if isinstance(m, nn.Linear):
@@ -180,6 +300,7 @@ class HRDinomaly(BaseDetector):
         scaler = torch.amp.GradScaler("cuda", enabled=decoder_amp_enabled)
         self.model.train()
         self.model.encoder.eval()
+        self.context_conditioner.train()
         it = 0
         step_started = time.perf_counter()
         for epoch in range(int(np.ceil(training_iters / batches_per_epoch))):
@@ -193,7 +314,8 @@ class HRDinomaly(BaseDetector):
                     dtype=torch.float16,
                     enabled=decoder_amp_enabled,
                 ):
-                    en = self.get_multi_resolution_fusion_embeddings(data)
+                    main_features, context_features = self.get_multi_resolution_embeddings(data)
+                    en = self.context_conditioner(main_features, context_features)
                     en, de = self.model.distillation(en)
 
                     if self.hard_mining_warmup_iters == 0:
@@ -260,32 +382,37 @@ class HRDinomaly(BaseDetector):
     def inference_step(
         self,
         test_dataloader: DataLoader,
-        task_name: str,
-        *,
-        include_anomaly_maps: bool = True,
     ) -> list[dict]:
         self.model.eval()
+        self.context_conditioner.eval()
         predictions = []
         for data in test_dataloader:
-            en = self.get_multi_resolution_fusion_embeddings(data)
-            en, de = self.model.distillation(en)
-            if include_anomaly_maps:
-                # Preserve the recall-first map path: each layer is upsampled
-                # before taking the strongest local anomaly evidence.
-                anomaly_map, token_map = self.cal_anomaly_maps(en, de, self.patch_size)
-                pixel_batch = anomaly_map[:, 0].cpu().numpy()
-                score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
-                predictions.extend(
-                    {
-                        "anomaly_map": self.patch_post_processing(pixel_map),
-                        "score": float(score),
-                    }
-                    for pixel_map, score in zip(pixel_batch, score_batch)
+            main_features, context_features = self.get_multi_resolution_embeddings(data)
+            conditioned_features = self.context_conditioner(main_features, context_features)
+            semantic_encoder, semantic_decoder = self.model.distillation(
+                list(conditioned_features)
+            )
+            anomaly_map, token_map, max_evidence_map = self._fused_evidence(
+                data,
+                conditioned_features,
+                semantic_encoder,
+                semantic_decoder,
+            )
+            pixel_batch = anomaly_map[:, 0].cpu().numpy()
+            max_batch = max_evidence_map[:, 0].cpu().numpy()
+            score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
+            predictions.extend(
+                {
+                    "anomaly_map": pixel_map,
+                    "max_evidence_map": max_map,
+                    "score": float(score),
+                }
+                for pixel_map, max_map, score in zip(
+                    pixel_batch,
+                    max_batch,
+                    score_batch,
                 )
-            else:
-                token_map = self.cal_anomaly_token_map(en, de)
-                score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
-                predictions.extend({"score": float(score)} for score in score_batch)
+            )
         return predictions
 
     @staticmethod
@@ -300,13 +427,6 @@ class HRDinomaly(BaseDetector):
             ).unsqueeze(1)
             for encoder_feature, decoder_feature in zip(encoder_features, decoder_features)
         ]
-
-    def cal_anomaly_token_map(self, encoder_features, decoder_features):
-        token_layer_maps = self._layer_anomaly_token_maps(
-            encoder_features,
-            decoder_features,
-        )
-        return torch.cat(token_layer_maps, dim=1).amax(dim=1, keepdim=True)
 
     def cal_anomaly_maps(self, encoder_features, decoder_features, output_size):
         token_layer_maps = self._layer_anomaly_token_maps(
@@ -335,55 +455,24 @@ class HRDinomaly(BaseDetector):
         count = min(top_k, values.shape[1])
         return torch.topk(values, k=count, dim=1).values.mean(dim=1)
 
-    def patch_post_processing(self, anomaly_map, eps=1e-4):
-        if self.min_anomaly_score is None or self.max_anomaly_score is None:
-            return anomaly_map
-        anomaly_map = (anomaly_map - self.min_anomaly_score) / (
-            self.max_anomaly_score - self.min_anomaly_score + eps
-        )
-        return np.clip(anomaly_map, 0, 1)
-
-
     def save_checkpoint(self, checkpoint_path: str):
-        for module_name, module in (
-            ("bottleneck", self.bottleneck),
-            ("decoder", self.decoder),
-        ):
-            for parameter_name, parameter in module.named_parameters():
-                if not torch.isfinite(parameter).all():
-                    raise FloatingPointError(
-                        f"Refusing to save a non-finite {module_name} parameter: {parameter_name}"
-                    )
         torch.save({
+            "context_conditioner": self.context_conditioner.state_dict(),
+            "feature_memory": self.feature_memory.state_dict(),
             "bottleneck": self.bottleneck.state_dict(),
             "decoder": self.decoder.state_dict(),
-            "max_anomaly_score": self.max_anomaly_score,
-            "min_anomaly_score": self.min_anomaly_score,
-            "fusion_weights": self.fusion_weights,
-            "score_top_k": self.score_top_k,
-            "layer_aggregation": "max",
-            "encoder_amp": self.encoder_amp,
-            "decoder_amp": self.decoder_amp,
-            "allow_tf32": self.allow_tf32,
+            "high_frequency_center": self.high_frequency_center,
+            "high_frequency_scale": self.high_frequency_scale,
         }, checkpoint_path)
-
 
     def load_checkpoint(self, checkpoint_path: str):
         state_dict = torch.load(checkpoint_path, map_location=self.device)
+        self.context_conditioner.load_state_dict(state_dict['context_conditioner'])
+        self.feature_memory.load_state_dict(state_dict['feature_memory'])
         self.bottleneck.load_state_dict(state_dict['bottleneck'])
         self.decoder.load_state_dict(state_dict['decoder'])
-        self.min_anomaly_score = state_dict.get("min_anomaly_score")
-        self.max_anomaly_score = state_dict.get("max_anomaly_score")
-        self.fusion_weights = state_dict.get("fusion_weights")
-        aggregation = state_dict.get("layer_aggregation", "max")
-        if aggregation != "max":
-            raise ValueError(f"Unsupported checkpoint layer aggregation: {aggregation}")
-        if state_dict.get("encoder_amp", self.encoder_amp) != self.encoder_amp:
-            raise ValueError("Checkpoint encoder_amp does not match runtime configuration")
-        self.score_top_k = _positive_int(
-            state_dict.get("score_top_k", self.score_top_k),
-            "checkpoint score_top_k",
-        )
+        self.high_frequency_center = state_dict['high_frequency_center']
+        self.high_frequency_scale = state_dict['high_frequency_scale']
 
     @staticmethod
     def get_image_score(task_score_groups):

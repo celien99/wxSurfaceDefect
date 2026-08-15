@@ -64,8 +64,5 @@ class ModelManager:
     def get_device_task_names(self, gpu: bool):
         return [model["name"] for model in self.models if model["gpu"] == gpu]
 
-    def score_top_k_values(self) -> set[int]:
-        return {model["detector"].score_top_k for model in self.models}
-
     def close(self) -> None:
         self.models.clear()

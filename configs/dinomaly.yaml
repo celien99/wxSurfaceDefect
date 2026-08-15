@@ -13,11 +13,18 @@ encoder_amp: true
 decoder_amp: true
 allow_tf32: true
 
+# Complementary anomaly evidence weights used by the runtime configuration.
+semantic_weight: 0.60
+memory_weight: 0.30
+high_frequency_weight: 0.10
+global_routing_weight: 0.25
+
 # Maximum sampled patches contributed by each training image per epoch.
 patches_per_source: 16
 
 score_top_k: 4
 normal_score_percentile: 0.99
+normal_component_percentile: 0.99
 # Pixel localization is calibrated only from normal training anomaly maps.
 normal_pixel_percentile: 0.9999
 # Aggregate per-image normal statistics without letting one outlier set the threshold.
@@ -25,3 +32,14 @@ normal_pixel_image_percentile: 0.95
 # Keep full-resolution anomaly-map memory bounded during post-training calibration.
 calibration_batch_size: 1
 map_gaussian_sigma: 0.0
+
+# Three-state decision band, expressed as a fraction of the calibrated
+# component threshold above the OK boundary.
+decision_recheck_margin_ratio: 0.10
+
+# Generic acquisition quality gate. Production recipes should tune these on
+# representative normal images before deployment.
+min_mean_luminance: 0.05
+max_mean_luminance: 0.95
+max_clipped_fraction: 0.50
+min_focus_variance: 10.0
