@@ -1,4 +1,8 @@
-from hiad.constants import TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_REFINEMENT_PATCH
+from hiad.constants import (
+    TASK_TYPE_DYNAMIC_PATCH,
+    TASK_TYPE_REFINEMENT_PATCH,
+    TASK_TYPE_THUMBNAIL,
+)
 
 from .task import validate_tasks
 
@@ -27,4 +31,13 @@ def print_task_summary(tasks) -> None:
         f"quantile={refinement_task['refinement_quantile']}, "
         f"min_area={refinement_task['refinement_min_area']}, "
         f"safety_fraction={refinement_task['refinement_safety_fraction']}"
+    )
+    thumbnail_task = next(
+        task
+        for task in validated
+        if task["type"] == TASK_TYPE_THUMBNAIL
+    )
+    print(
+        "Thumbnail task: "
+        f"thumbnail_size={thumbnail_task['thumbnail_size']}"
     )
