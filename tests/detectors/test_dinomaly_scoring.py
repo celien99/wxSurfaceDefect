@@ -31,7 +31,7 @@ def test_pixel_map_maximizes_layers_after_upsampling():
     )
 
 
-def test_memory_evidence_uses_conditioned_layers_before_dinomaly_aggregation():
+def test_fused_evidence_uses_normal_feature_memory():
     detector = object.__new__(HRDinomaly)
     detector.patch_size = [2, 2]
     detector.device = torch.device("cpu")
@@ -42,19 +42,27 @@ def test_memory_evidence_uses_conditioned_layers_before_dinomaly_aggregation():
     detector.semantic_scale = 1.0
     detector.memory_center = 0.0
     detector.memory_scale = 1.0
-    detector.evidence_weights = (0.6, 0.3, 0.1)
-    conditioned = [torch.zeros((1, 2, 1, 2)) for _ in range(8)]
-    detector.feature_memory.update(conditioned)
-    detector.feature_memory.update([feature + 0.01 for feature in conditioned])
+    detector.evidence_weights = (0.0, 1.0, 0.0)
+    baseline = [torch.zeros((1, 2, 1, 2)) for _ in range(8)]
+    detector.feature_memory.update(baseline)
+    detector.feature_memory.update([feature + 0.01 for feature in baseline])
     semantic_encoder = [torch.ones((1, 2, 1, 2)) for _ in range(2)]
     semantic_decoder = [torch.ones((1, 2, 1, 2)) for _ in range(2)]
 
-    pixel_map, token_map = detector._fused_evidence(
+    normal_pixel_map, normal_token_map = detector._fused_evidence(
         {"image": torch.zeros((1, 3, 2, 2))},
-        conditioned,
+        [feature + 0.005 for feature in baseline],
+        semantic_encoder,
+        semantic_decoder,
+    )
+    shifted_pixel_map, shifted_token_map = detector._fused_evidence(
+        {"image": torch.zeros((1, 3, 2, 2))},
+        [feature + 1.0 for feature in baseline],
         semantic_encoder,
         semantic_decoder,
     )
 
-    assert pixel_map.shape == (1, 1, 2, 2)
-    assert token_map.shape == (1, 1, 1, 2)
+    assert normal_pixel_map.shape == shifted_pixel_map.shape == (1, 1, 2, 2)
+    assert normal_token_map.shape == shifted_token_map.shape == (1, 1, 1, 2)
+    assert float(shifted_pixel_map.mean()) > float(normal_pixel_map.mean())
+    assert float(shifted_token_map.mean()) > float(normal_token_map.mean())
