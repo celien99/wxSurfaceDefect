@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -19,7 +21,12 @@ from hiad.trainer import HRTrainer
 from hiad.trainer.sources import load_unified_training_samples
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """解析并校验训练尺寸、复核路由、输出路径和 GPU 参数。
+
+    Returns:
+        argparse.Namespace: 通过 DINO 尺寸整除及复核参数范围校验的参数对象。
+    """
     parser = argparse.ArgumentParser(description="HiAD Dinomaly training")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--config", default="configs/dinomaly.yaml")
@@ -42,7 +49,11 @@ def parse_args():
         parser.error(f"--patch-size must be a positive multiple of {DINO_PATCH_SIZE}")
     if args.stride != -1 and (args.stride <= 0 or args.stride > args.patch_size):
         parser.error("--stride must be -1 or in [1, patch-size]")
-    if not args.ds_factors or args.ds_factors[0] != 0 or args.ds_factors != sorted(set(args.ds_factors)):
+    if (
+        not args.ds_factors
+        or args.ds_factors[0] != 0
+        or args.ds_factors != sorted(set(args.ds_factors))
+    ):
         parser.error("--ds-factors must be unique, sorted, non-negative, and start with 0")
     if args.batch_size <= 0 or args.thumbnail_size <= 0:
         parser.error("--batch-size and --thumbnail-size must be positive")
@@ -61,7 +72,8 @@ def parse_args():
     return args
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """加载统一正常样本，创建三类任务并启动多 GPU 训练。"""
     args = parse_args()
     gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]
     if not gpu_ids:
@@ -112,3 +124,7 @@ if __name__ == "__main__":
     )
     trainer.train(train_samples=train_samples, gpu_ids=gpu_ids, main_logger=main_logger)
     main_logger.info("Training done. Checkpoints saved to %s", args.checkpoint_root)
+
+
+if __name__ == "__main__":
+    main()

@@ -22,8 +22,71 @@ dependencies = [
     "tqdm",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.11,<2",
+    "pytest>=8,<10",
+    "ruff>=0.6,<1",
+]
+
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+    "hiad/detectors/dinomaly/models/vision_transformer.py",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"runs/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+    "hiad/constants.py",
+    "hiad/data/geometry.py",
+    "hiad/data/metadata.py",
+    "hiad/data/samples.py",
+    "hiad/datasets/patch_dataset.py",
+    "hiad/datasets/samplers.py",
+    "hiad/datasets/streaming_dataset.py",
+    "hiad/detectors/base.py",
+    "hiad/detectors/config.py",
+    "hiad/detectors/hr_dinomaly.py",
+    "hiad/evaluation",
+    "hiad/inferencer",
+    "hiad/models/context.py",
+    "hiad/models/dinov3.py",
+    "hiad/models/memory.py",
+    "hiad/runtime",
+    "hiad/task",
+    "hiad/trainer",
+    "runs",
+    "tests/typecheck/contracts_usage.py",
+]
+strict = true
+follow_imports = "silent"
+ignore_missing_imports = true
+warn_return_any = false
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = [
+    "hiad.detectors.hr_dinomaly",
+    "hiad.models.dinov3",
+]
+disallow_untyped_calls = false
+warn_return_any = false

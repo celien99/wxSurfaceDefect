@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,11 +11,30 @@ from hiad.data import HRSample
 
 @dataclass(frozen=True)
 class TrainingSources:
+    """通过统一清单校验的正常训练样本及其类别集合。
+
+    Attributes:
+        samples (tuple[HRSample, ...]): 路径唯一、无缺陷掩码且标签为正常的样本。
+        categories (tuple[str, ...]): 去重并排序后的非空类别名称。
+    """
+
     samples: tuple[HRSample, ...]
     categories: tuple[str, ...]
 
 
-def _resolve_training_path(data_root: Path, filename: str) -> Path:
+def _resolve_training_path(data_root: Path, filename: object) -> Path:
+    """把非空相对文件名解析为数据根目录下的绝对路径。
+
+    Args:
+        data_root (Path): 已解析的统一数据集根目录。
+        filename (object): 清单中的相对图像路径。
+
+    Returns:
+        Path: 基于 ``data_root`` 解析后的路径。
+
+    Raises:
+        ValueError: 文件名为空、不是字符串或是绝对路径。
+    """
     if not isinstance(filename, str) or not filename:
         raise ValueError("Training record filename must be a non-empty string")
     relative_path = Path(filename)
@@ -22,13 +43,27 @@ def _resolve_training_path(data_root: Path, filename: str) -> Path:
     return (data_root / relative_path).resolve()
 
 
-def validate_unified_training_samples(samples) -> TrainingSources:
+def validate_unified_training_samples(
+    samples: Iterable[HRSample],
+) -> TrainingSources:
+    """验证训练只使用有类别、无缺陷掩码且路径唯一的正常原图。
+
+    Args:
+        samples (Iterable[HRSample]): 待验证的延迟加载样本。
+
+    Returns:
+        TrainingSources: 固化为元组的样本和排序后的类别集合。
+
+    Raises:
+        TypeError: 任一元素不是 :class:`HRSample`。
+        ValueError: 样本为空，包含异常标签/掩码、空类别/路径或重复解析路径。
+    """
     training_samples = tuple(samples)
     if not training_samples:
         raise ValueError("Training samples must not be empty")
 
-    resolved_paths = []
-    categories = set()
+    resolved_paths: list[Path] = []
+    categories: set[str] = set()
     for index, sample in enumerate(training_samples):
         if not isinstance(sample, HRSample):
             raise TypeError("Training samples must contain HRSample objects")
@@ -59,13 +94,32 @@ def validate_unified_training_samples(samples) -> TrainingSources:
     )
 
 
-def load_unified_training_samples(data_root) -> tuple[list[HRSample], tuple[str, ...]]:
+def load_unified_training_samples(
+    data_root: str | os.PathLike[str],
+) -> tuple[list[HRSample], tuple[str, ...]]:
+    """从统一训练清单创建并验证正常样本。
+
+    Args:
+        data_root (str | os.PathLike[str]): 包含 ``train_uni.jsonl`` 及其相对资源的
+            数据集根目录。
+
+    Returns:
+        tuple[list[HRSample], tuple[str, ...]]: 保持清单行序的延迟加载样本，以及
+        排序去重后的类别名称。
+
+    Raises:
+        FileNotFoundError: 统一训练清单不存在。
+        OSError: 清单无法读取。
+        json.JSONDecodeError: 任一清单行不是合法 JSON。
+        TypeError: 任一记录顶层不是对象。
+        ValueError: 清单包含空行、异常/掩码记录、空类别或无效字段类型。
+    """
     root = Path(data_root).expanduser().resolve()
     metadata_path = root / "train_uni.jsonl"
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Unified training metadata not found: {metadata_path}")
 
-    samples = []
+    samples: list[HRSample] = []
     with metadata_path.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
             if not line.strip():
@@ -80,6 +134,7 @@ def load_unified_training_samples(data_root) -> tuple[list[HRSample], tuple[str,
             label = record.get("label")
             category = record.get("clsname")
             foreground_name = record.get("foreground")
+            label_name = record.get("label_name")
             if (
                 isinstance(label, bool)
                 or label != 0
@@ -91,6 +146,10 @@ def load_unified_training_samples(data_root) -> tuple[list[HRSample], tuple[str,
                     f"{metadata_path} must contain only normal records with clsname; "
                     f"invalid record at line {line_number}"
                 )
+            if label_name is not None and not isinstance(label_name, str):
+                raise ValueError(
+                    f"label_name at {metadata_path}:{line_number} must be a string or null"
+                )
             samples.append(
                 HRSample(
                     image=os.fspath(_resolve_training_path(root, record.get("filename"))),
@@ -101,7 +160,7 @@ def load_unified_training_samples(data_root) -> tuple[list[HRSample], tuple[str,
                     ),
                     clsname=category,
                     label=0,
-                    label_name=record.get("label_name"),
+                    label_name=label_name,
                 )
             )
 

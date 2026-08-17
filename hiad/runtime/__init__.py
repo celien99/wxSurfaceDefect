@@ -1,1 +1,1 @@
-"""Shared detector execution primitives."""
+"""检测器共享的运行时基础能力。"""

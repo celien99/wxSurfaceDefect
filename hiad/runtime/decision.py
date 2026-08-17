@@ -4,9 +4,17 @@ import math
 
 import cv2
 import numpy as np
+from numpy.typing import ArrayLike
+
+from .contracts import (
+    ComponentStatistics,
+    DecisionState,
+    StrongestComponent,
+)
 
 
-def _empty_statistics() -> dict:
+def _empty_statistics() -> ComponentStatistics:
+    """创建没有阈值内异常区域时的稳定摘要结构。"""
     return {
         "component_count": 0,
         "anomalous_pixel_count": 0,
@@ -15,8 +23,24 @@ def _empty_statistics() -> dict:
     }
 
 
-def component_statistics(anomaly_map, pixel_threshold) -> dict:
-    """Summarize eight-connected regions at a calibrated pixel threshold."""
+def component_statistics(
+    anomaly_map: ArrayLike,
+    pixel_threshold: float,
+) -> ComponentStatistics:
+    """在校准像素阈值上汇总八连通异常区域。
+
+    Args:
+        anomaly_map (ArrayLike): 原图分辨率的非空二维异常分数图。非有限像素
+            不参与连通区域统计。
+        pixel_threshold (float): 像素异常阈值，分数大于等于该值视为异常。
+
+    Returns:
+        ComponentStatistics: 连通区域数量、异常像素总数、最大面积及最强区域；
+        外接框使用原图像素 ``xywh`` 坐标。
+
+    Raises:
+        ValueError: 异常图不是非空二维数组，或阈值不是有限数。
+    """
     threshold = float(pixel_threshold)
     values = np.asarray(anomaly_map, dtype=np.float32)
     if values.ndim != 2 or values.size == 0:
@@ -42,14 +66,15 @@ def component_statistics(anomaly_map, pixel_threshold) -> dict:
     maxima = np.full(component_count, -np.inf, dtype=np.float64)
     np.maximum.at(maxima, active_labels, active_values)
 
-    strongest_component = None
+    strongest_component: StrongestComponent | None = None
     strongest_score = -math.inf
     total_pixels = float(values.size)
     for label in range(1, component_count):
         area = int(statistics[label, cv2.CC_STAT_AREA])
         area_fraction = area / total_pixels
         mean_score = float(sums[label] / area)
-        component_score = mean_score * (1.0 + math.sqrt(area_fraction))
+        # 面积比例的加性奖励让连续弱异常优先于孤立尖峰，同时保持分辨率缩放不变性。
+        component_score = mean_score + math.sqrt(area_fraction)
         if component_score <= strongest_score:
             continue
         strongest_score = component_score
@@ -76,8 +101,20 @@ def component_statistics(anomaly_map, pixel_threshold) -> dict:
     }
 
 
-def image_score_from_statistics(statistics, fallback_score) -> float:
-    """Combine a compact component summary with a finite model-score fallback."""
+def image_score_from_statistics(
+    statistics: ComponentStatistics,
+    fallback_score: float,
+) -> float:
+    """组合连通区域摘要与模型全局分数，保留更保守的结果。
+
+    Args:
+        statistics (ComponentStatistics): 最终异常图的连通区域摘要。
+        fallback_score (float): 模型或 Top-K 产生的备用图像级分数；非有限值按
+            ``0.0`` 处理。
+
+    Returns:
+        float: 最强组件分数与备用分数的较大值。
+    """
     fallback = float(fallback_score)
     if not math.isfinite(fallback):
         fallback = 0.0
@@ -87,8 +124,19 @@ def image_score_from_statistics(statistics, fallback_score) -> float:
     return float(max(fallback, strongest["score"]))
 
 
-def top_k_map_score(anomaly_map, top_k: int) -> float:
-    """Return a resolution-stable local score from the final fused map."""
+def top_k_map_score(anomaly_map: ArrayLike, top_k: int) -> float:
+    """从最终融合图计算不依赖整图均值的局部 Top-K 分数。
+
+    Args:
+        anomaly_map (ArrayLike): 任意形状的有限异常分数数组。
+        top_k (int): 参与均值的最高分像素数量；超过像素总数时使用全部像素。
+
+    Returns:
+        float: 最高 ``top_k`` 个异常分数的均值。
+
+    Raises:
+        ValueError: 异常图为空、包含非有限值，或 ``top_k`` 不是正整数。
+    """
     values = np.asarray(anomaly_map, dtype=np.float32).reshape(-1)
     if values.size == 0 or not np.isfinite(values).all():
         raise ValueError("anomaly_map must contain finite values")
@@ -98,8 +146,25 @@ def top_k_map_score(anomaly_map, top_k: int) -> float:
     return float(np.partition(values, values.size - count)[-count:].mean())
 
 
-def classify_score(score, threshold, recheck_margin) -> str:
-    """Return the conservative three-state image decision for a calibrated score."""
+def classify_score(
+    score: float,
+    threshold: float,
+    recheck_margin: float,
+) -> DecisionState:
+    """根据校准阈值和复检带宽生成保守的三态判定。
+
+    Args:
+        score (float): 待判定的图像或组件异常分数。
+        threshold (float): 正常样本校准阈值。
+        recheck_margin (float): 阈值上方的复检带宽，必须为有限非负数。
+
+    Returns:
+        DecisionState: 不超过阈值为 ``OK``，位于复检带为 ``RECHECK``，更高为
+        ``NG``；分数或阈值非有限时保守返回 ``RECHECK``。
+
+    Raises:
+        ValueError: ``recheck_margin`` 不是有限非负数。
+    """
     score = float(score)
     threshold = float(threshold)
     recheck_margin = float(recheck_margin)
@@ -114,8 +179,20 @@ def classify_score(score, threshold, recheck_margin) -> str:
     return "NG"
 
 
-def apply_quality_gate(decision: str, reasons) -> tuple[str, str | None]:
-    """Promote an otherwise acceptable image without hiding an NG decision."""
+def apply_quality_gate(
+    decision: DecisionState,
+    reasons: list[str],
+) -> tuple[DecisionState, str | None]:
+    """应用采集质量门禁，且绝不降低已有异常判定。
+
+    Args:
+        decision (DecisionState): 模型产生的三态判定。
+        reasons (list[str]): 质量检查产生的原因码；空列表表示质量通过。
+
+    Returns:
+        tuple[DecisionState, str | None]: 门禁后的判定及可选原因。质量问题只能
+        将 ``OK`` 提升为 ``RECHECK``，不会覆盖 ``RECHECK`` 或 ``NG``。
+    """
     if decision == "OK" and reasons:
         return "RECHECK", "quality_gate:" + ",".join(str(reason) for reason in reasons)
     return decision, None

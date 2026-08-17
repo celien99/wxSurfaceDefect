@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Final
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
+
+from .contracts import ImageQualityResult
 
 
-_QUALITY_KEYS = (
+_QUALITY_KEYS: Final = (
     "min_mean_luminance",
     "max_mean_luminance",
     "max_clipped_fraction",
@@ -14,8 +18,26 @@ _QUALITY_KEYS = (
 )
 
 
-def assess_image_quality(image, thresholds: Mapping[str, float], valid_mask=None) -> dict:
-    """Evaluate exposure, clipping, and focus before anomaly inference."""
+def assess_image_quality(
+    image: NDArray[np.generic],
+    thresholds: Mapping[str, float],
+    valid_mask: NDArray[np.generic] | None = None,
+) -> ImageQualityResult:
+    """在异常推理前检查 RGB 图像的曝光、截断比例和清晰度。
+
+    Args:
+        image (NDArray[np.generic]): ``(height, width, 3)`` HWC ``uint8`` RGB 图像。
+        thresholds (Mapping[str, float]): 包含最小/最大平均亮度、最大截断比例和
+            最小清晰度方差的有限阈值映射。
+        valid_mask (NDArray[np.generic] | None): 可选二维有效区域；尺寸不一致时
+            使用最近邻插值对齐到图像高宽，非零像素视为有效。
+
+    Returns:
+        ImageQualityResult: ``PASS`` 或 ``RECHECK`` 状态、原因码及三项质量指标。
+
+    Raises:
+        ValueError: 图像格式、阈值范围或有效掩码不符合约定。
+    """
     values = np.asarray(image)
     if values.dtype != np.uint8 or values.ndim != 3 or values.shape[2] != 3:
         raise ValueError("image must be an HWC uint8 RGB array")
@@ -57,7 +79,7 @@ def assess_image_quality(image, thresholds: Mapping[str, float], valid_mask=None
     )
     laplacian = cv2.Laplacian(gray, cv2.CV_32F)
     focus_variance = float(laplacian[valid].var())
-    reasons = []
+    reasons: list[str] = []
     if mean_luminance < limits["min_mean_luminance"]:
         reasons.append("mean_luminance_below_minimum")
     if mean_luminance > limits["max_mean_luminance"]:

@@ -1,12 +1,28 @@
+from __future__ import annotations
+
 import json
 import os
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
 
+from hiad.data import HRSample
 
-def has_complete_image_annotations(records) -> bool:
-    labels_by_category = {}
+from .contracts import BinaryMask, FloatMap, InferenceResult
+
+
+def has_complete_image_annotations(records: Sequence[Mapping[str, object]]) -> bool:
+    """确认每个类别都同时具备正常和异常图像标签。
+
+    Args:
+        records (Sequence[Mapping[str, object]]): 数据清单记录；``label`` 必须为
+            整数 ``0`` 或 ``1``，``clsname`` 缺失时归入 ``default`` 类别。
+
+    Returns:
+        bool: 清单非空且每个类别的标签集合均为 ``{0, 1}`` 时为 ``True``。
+    """
+    labels_by_category: dict[object, set[object]] = {}
     for record in records:
         label = record.get("label")
         if isinstance(label, bool) or label not in {0, 1}:
@@ -17,21 +33,60 @@ def has_complete_image_annotations(records) -> bool:
     )
 
 
-def has_complete_pixel_annotations(records) -> bool:
+def has_complete_pixel_annotations(records: Sequence[Mapping[str, object]]) -> bool:
+    """确认图像级标签完整，且所有异常记录都具有像素级掩码。
+
+    Args:
+        records (Sequence[Mapping[str, object]]): 包含 ``label``、``clsname`` 和
+            可选 ``mask`` 路径的数据清单记录。
+
+    Returns:
+        bool: 图像级标注完整且每条异常记录的 ``mask`` 值非空时为 ``True``。
+    """
     if not has_complete_image_annotations(records):
         return False
     anomalous_records = [record for record in records if record.get("label") == 1]
     return all(record.get("mask") for record in anomalous_records)
 
 
-def threshold_anomaly_maps(anomaly_maps, pixel_thresholds) -> list[np.ndarray]:
+def threshold_anomaly_maps(
+    anomaly_maps: Sequence[FloatMap],
+    pixel_thresholds: Iterable[float],
+) -> list[BinaryMask]:
+    """按逐样本像素阈值把异常图转换为 ``0/1`` 二值掩码。
+
+    Args:
+        anomaly_maps (Sequence[FloatMap]): 原图分辨率的二维异常图序列。
+        pixel_thresholds (Iterable[float]): 与异常图同序的像素阈值。
+
+    Returns:
+        list[BinaryMask]: 二维 ``uint8`` 掩码；长度遵循 ``zip``，调用方必须确保
+        异常图和阈值数量一致。
+    """
     return [
         np.asarray(anomaly_map >= pixel_threshold, dtype=np.uint8)
         for anomaly_map, pixel_threshold in zip(anomaly_maps, pixel_thresholds)
     ]
 
 
-def save_predictions(path, samples, inference_result) -> None:
+def save_predictions(
+    path: str | os.PathLike[str],
+    samples: Sequence[HRSample],
+    inference_result: InferenceResult,
+) -> None:
+    """保存可追溯判定记录，并在完成像素校准后落盘二值掩码。
+
+    Args:
+        path (str | os.PathLike[str]): 输出 JSONL 文件路径。
+        samples (Sequence[HRSample]): 与推理结果顺序一致的源图样本。
+        inference_result (InferenceResult): 至少包含图像分数和异常图的推理结果；
+            所有逐样本可选字段也必须与 ``samples`` 等长。
+
+    Raises:
+        OSError: 输出 JSONL、掩码目录或 PNG 文件无法创建或写入。
+        IndexError: 任一逐样本结果字段与 ``samples`` 长度不一致。
+    """
+    output_path = os.fspath(path)
     thresholds = inference_result.get("image_thresholds")
     decisions = inference_result.get("is_defect")
     decision_states = inference_result.get("decisions")
@@ -42,13 +97,13 @@ def save_predictions(path, samples, inference_result) -> None:
     quality_results = inference_result.get("quality_results")
     pixel_thresholds = inference_result.get("pixel_thresholds")
     binary_maps = inference_result.get("binary_anomaly_maps")
-    masks_root = os.path.join(os.path.dirname(path), "masks")
+    masks_root = os.path.join(os.path.dirname(output_path), "masks")
     if binary_maps is not None:
         os.makedirs(masks_root, exist_ok=True)
 
-    with open(path, "w", encoding="utf-8", newline="\n") as stream:
+    with open(output_path, "w", encoding="utf-8", newline="\n") as stream:
         for index, sample in enumerate(samples):
-            record = {
+            record: dict[str, object] = {
                 "filename": sample.image.image_path,
                 "clsname": sample.clsname,
                 "label": sample.label,

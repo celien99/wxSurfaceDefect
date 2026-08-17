@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import argparse
 import os
 import sys
+from collections.abc import Mapping
 
 import yaml
 
@@ -11,6 +14,7 @@ if parent_dir not in sys.path:
 from hiad.data import HRSample, read_jsonl_records
 from hiad.detectors import HRDinomaly
 from hiad.evaluation import HREvaluator
+from hiad.evaluation.execution import MetricEvaluator
 from hiad.evaluation.metrics import compute_pro
 from hiad.evaluation.metrics.torch_backend import (
     compute_imagewise_metrics,
@@ -25,7 +29,12 @@ from hiad.runtime.prediction import (
 )
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """解析并校验推理脚本的路径、批量、可视化和 GPU 参数。
+
+    Returns:
+        argparse.Namespace: 通过正数批量大小和显示尺寸校验的参数对象。
+    """
     parser = argparse.ArgumentParser(description="HiAD Dinomaly inference")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--manifest", default="test_uni.jsonl")
@@ -42,7 +51,60 @@ def parse_args():
     return args
 
 
-if __name__ == "__main__":
+def _sample_from_record(
+    data_root: str,
+    record: Mapping[str, object],
+    *,
+    include_annotations: bool,
+) -> HRSample:
+    """把统一清单记录转换为推理或评估使用的样本。
+
+    Args:
+        data_root (str): 清单相对路径的根目录。
+        record (Mapping[str, object]): 包含文件名、类别及可选标注的清单记录。
+        include_annotations (bool): 是否加载掩码、图像标签和标签名称；纯推理样本
+            设为 ``False`` 以防标注信息进入推理链路。
+
+    Returns:
+        HRSample: 路径已拼接到 ``data_root`` 的延迟加载样本。
+
+    Raises:
+        ValueError: 文件名、类别或任一可选标注字段类型不合法。
+    """
+    filename = record.get("filename")
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("Every inference record must contain a filename")
+    category = record.get("clsname", "default")
+    if not isinstance(category, str) or not category.strip():
+        raise ValueError("Every inference record must contain a valid clsname")
+    foreground = record.get("foreground")
+    mask = record.get("mask") if include_annotations else None
+    label = record.get("label") if include_annotations else None
+    label_name = record.get("label_name") if include_annotations else None
+    if foreground is not None and not isinstance(foreground, str):
+        raise ValueError("foreground must be a relative path or null")
+    if mask is not None and not isinstance(mask, str):
+        raise ValueError("mask must be a relative path or null")
+    if label is not None and (
+        isinstance(label, bool) or not isinstance(label, int)
+    ):
+        raise ValueError("label must be an integer or null")
+    if label_name is not None and not isinstance(label_name, str):
+        raise ValueError("label_name must be a string or null")
+    return HRSample(
+        image=os.path.join(data_root, filename),
+        foreground=(
+            os.path.join(data_root, foreground) if foreground else None
+        ),
+        mask=os.path.join(data_root, mask) if mask else None,
+        clsname=category,
+        label=label,
+        label_name=label_name,
+    )
+
+
+def main() -> None:
+    """执行完整推理、预测落盘，并在标注完整时计算对应评估指标。"""
     args = parse_args()
     gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]
     if not gpu_ids:
@@ -65,30 +127,11 @@ if __name__ == "__main__":
 
     test_meta = read_jsonl_records(os.path.join(args.data_root, args.manifest))
     test_samples = [
-        HRSample(
-            image=os.path.join(args.data_root, record["filename"]),
-            foreground=(
-                os.path.join(args.data_root, record["foreground"])
-                if isinstance(record.get("foreground"), str) and record["foreground"]
-                else None
-            ),
-            mask=os.path.join(args.data_root, record["mask"]) if record.get("mask") else None,
-            clsname=record.get("clsname", "default"),
-            label=record.get("label"),
-            label_name=record.get("label_name"),
-        )
+        _sample_from_record(args.data_root, record, include_annotations=True)
         for record in test_meta
     ]
     inference_samples = [
-        HRSample(
-            image=os.path.join(args.data_root, record["filename"]),
-            foreground=(
-                os.path.join(args.data_root, record["foreground"])
-                if isinstance(record.get("foreground"), str) and record["foreground"]
-                else None
-            ),
-            clsname=record.get("clsname", "default"),
-        )
+        _sample_from_record(args.data_root, record, include_annotations=False)
         for record in test_meta
     ]
 
@@ -108,7 +151,7 @@ if __name__ == "__main__":
     save_predictions(predictions_path, test_samples, inference_result)
     main_logger.info("Per-image predictions saved to %s", predictions_path)
 
-    evaluators = []
+    evaluators: list[MetricEvaluator] = []
     if has_complete_image_annotations(test_meta):
         evaluators.append(compute_imagewise_metrics)
     else:
@@ -130,3 +173,7 @@ if __name__ == "__main__":
         vis_size=args.vis_size,
     )
     main_logger.info("Inference done. Results logged to %s", args.log_root)
+
+
+if __name__ == "__main__":
+    main()
