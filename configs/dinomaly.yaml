@@ -24,18 +24,18 @@ patches_per_source: 16
 
 score_top_k: 4
 normal_score_percentile: 0.99
-normal_component_percentile: 0.99
+# With a small normal set, 99% is effectively controlled by one tail image.
+# Keep component calibration sensitive, then tune this on a held-out normal set.
+normal_component_percentile: 0.95
 # Pixel localization is calibrated only from normal training anomaly maps.
 normal_pixel_percentile: 0.9999
 # Aggregate per-image normal statistics without letting one outlier set the threshold.
 normal_pixel_image_percentile: 0.95
+# Bridge small gaps between strong candidates so enclosed weak defects enter refinement.
+refinement_bridge_gap_tiles: 1
 # Keep full-resolution anomaly-map memory bounded during post-training calibration.
 calibration_batch_size: 1
 map_gaussian_sigma: 0.0
-
-# Three-state decision band, expressed as a fraction of the calibrated
-# component threshold above the OK boundary.
-decision_recheck_margin_ratio: 0.10
 
 # Generic acquisition quality gate. Production recipes should tune these on
 # representative normal images before deployment.

@@ -2,11 +2,49 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 
 import numpy as np
 import torch
 from numpy.typing import NDArray
 from torch.nn import functional as F
+
+
+@lru_cache(maxsize=32)
+def _imagenet_constants(
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cache normalization constants for each active device and dtype."""
+    with torch.inference_mode(False):
+        mean = torch.tensor(
+            (0.485, 0.456, 0.406), device=device, dtype=dtype
+        ).view(1, 3, 1, 1)
+        std = torch.tensor(
+            (0.229, 0.224, 0.225), device=device, dtype=dtype
+        ).view(1, 3, 1, 1)
+    return mean, std
+
+
+@lru_cache(maxsize=32)
+def _high_frequency_kernels(
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cache fixed edge kernels instead of allocating them per batch."""
+    with torch.inference_mode(False):
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=device,
+            dtype=dtype,
+        ).reshape(1, 1, 3, 3)
+        sobel_y = sobel_x.transpose(-1, -2)
+        laplacian = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+            device=device,
+            dtype=dtype,
+        ).reshape(1, 1, 3, 3)
+    return sobel_x, sobel_y, laplacian
 
 
 def denormalize_imagenet_batch(image_batch: torch.Tensor) -> torch.Tensor:
@@ -29,8 +67,7 @@ def denormalize_imagenet_batch(image_batch: torch.Tensor) -> torch.Tensor:
         or not image_batch.is_floating_point()
     ):
         raise ValueError("image_batch must be a floating-point BCHW RGB tensor")
-    mean = image_batch.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
-    std = image_batch.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    mean, std = _imagenet_constants(image_batch.device, image_batch.dtype)
     return image_batch * std + mean
 
 
@@ -56,17 +93,10 @@ def high_frequency_map(image_batch: torch.Tensor) -> torch.Tensor:
 
     image = image_batch if image_batch.is_floating_point() else image_batch.float()
     image = image.mean(dim=1, keepdim=True)
-    sobel_x = torch.tensor(
-        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
-        device=image.device,
-        dtype=image.dtype,
-    ).reshape(1, 1, 3, 3)
-    sobel_y = sobel_x.transpose(-1, -2)
-    laplacian = torch.tensor(
-        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
-        device=image.device,
-        dtype=image.dtype,
-    ).reshape(1, 1, 3, 3)
+    sobel_x, sobel_y, laplacian = _high_frequency_kernels(
+        image.device,
+        image.dtype,
+    )
     padded = F.pad(image, (1, 1, 1, 1), mode="replicate")
     gradient = torch.sqrt(
         F.conv2d(padded, sobel_x).square() + F.conv2d(padded, sobel_y).square()

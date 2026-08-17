@@ -61,7 +61,7 @@ flowchart LR
     end
 ```
 
-训练时，动态补丁、微补丁复核和缩略图三个任务分别保存权重。训练结束后，框架先用正常训练图校准图像级和像素级阈值，再执行第二次正常样本推理校准连通组件阈值，生成 `score_calibration.json`。推理时使用同一任务定义恢复模型：局部粗扫与缩略图全局先验共同选择复核区域，微补丁结果回填到原图；最终像素异常图只融合局部与复核证据，缩略图只参与候选路由和图像级评分先验，随后应用校准阈值给出 `OK`、`RECHECK` 或 `NG` 判定。
+训练时，动态补丁、微补丁复核和缩略图三个任务分别保存权重。训练结束后，框架先用正常训练图校准图像级和像素级阈值，再执行第二次正常样本推理校准连通组件阈值，生成 `score_calibration.json`。推理时使用同一任务定义恢复模型：局部粗扫与缩略图全局先验共同选择复核区域，微补丁结果回填到原图；最终像素异常图只融合局部与复核证据，缩略图只参与候选路由和图像级评分先验，随后应用校准阈值给出 `OK` 或 `NG` 判定。采集质量状态独立记录为 `PASS` 或 `FAIL`，不改写模型判定。
 
 ## 为什么不是传统两代方案
 
@@ -98,8 +98,8 @@ flowchart LR
 4. **困难正常样本关注**：余弦蒸馏损失支持从 warmup 逐步提高 hard-mining 比例，并以较低系数保留易样本梯度；同时提供梯度裁剪、AMP 与 TF32 开关。
 5. **异常图生成**：各层编码/重建特征的余弦距离分别上采样到补丁尺寸，再逐像素取最大；语义分支同时保留各层 token 异常图的逐位置最大值，供后续证据融合与 Top-K 评分。不同补丁以 Hann 权重回填，减轻拼接边缘不连续。
 6. **互补证据融合**：语义重建误差、正常特征记忆距离和高频纹理响应先使用正常训练数据拟合的中心与尺度标定，再按 `semantic_weight`、`memory_weight`、`high_frequency_weight` 融合。最终证据由 75% 加权均值与 25% 启用分支逐像素最大值组成；权重为零的分支不参与最大值校正，也不额外输出诊断通道。
-7. **粗到细复核与全局路由**：局部粗粒度异常图与稳健归一化后的缩略图全局先验共同选择候选区域，并以二维低差异序列补充确定性安全区域；候选切片只覆盖真实占用网格，不填满稀疏组件的外接矩形。微补丁结果通过 Hann 权重校正原图异常图，既可增强细小缺陷，也可压低粗扫误报；缩略图不写入最终像素图。
-8. **校准与决策**：最终细化图的 Top-K 像素分数与缩略图 token 分数形成原始图像分数；连通组件以平均异常强度和相对图像面积形成分辨率无关分数。全部阈值只从正常训练图像校准，推理优先使用 `clsname` 对应阈值，缺失时回退到全局阈值；超过组件阈值但处于 `decision_recheck_margin_ratio` 内时输出 `RECHECK`，更高时输出 `NG`。质量门禁仅将原本的 `OK` 提升为 `RECHECK`，不会把已有 `NG` 降级。
+7. **粗到细复核与全局路由**：局部粗粒度异常图与稳健归一化后的缩略图全局先验共同选择候选区域；面积较小但峰值很高的候选也会保留，即使没有超过路由分位数阈值，也会保留图内最高 tile，并以二维低差异序列补充确定性安全区域。同一行或列中被强候选夹住的小微补丁缺口会桥接进入精修，防止环状强异常内部的弱缺陷被候选路由遗漏。微补丁结果通过 Hann 权重融合原图异常图，且不会压低已有粗扫异常证据；缩略图不写入最终像素图。
+8. **校准与决策**：最终细化图的 Top-K 像素分数与缩略图 token 分数形成原始图像分数；连通组件以平均异常强度和相对图像面积形成分辨率无关分数。全部阈值只从正常训练图像校准，推理优先使用 `clsname` 对应阈值，缺失时回退到全局阈值；超过组件阈值即输出 `NG`，否则输出 `OK`。质量检查作为独立的 `PASS/FAIL` 状态记录，不覆盖模型判定。
 
 ## 环境要求
 
@@ -195,7 +195,7 @@ python runs/train.py \
 | `--refinement-safety-fraction` | 额外均匀采样的复核覆盖比例，范围为 `(0, 1]` |
 | `--gpus` | 逗号分隔的 CUDA 设备编号。任务以 round-robin 方式分配给设备 |
 
-默认配置在 [`configs/dinomaly.yaml`](configs/dinomaly.yaml)，所有字段均为必填项。训练与推理共享这一份配置映射；补丁尺寸、上下文尺度、细化参数和缩略图尺寸来自任务定义，不再复制三份同内容配置。配置包含训练迭代、困难样本比例、混合精度、每源图像采样补丁数、Top-K 图像评分、三路证据权重、`global_routing_weight`、图像/像素/组件校准分位数、`decision_recheck_margin_ratio` 和质量门禁阈值。
+默认配置在 [`configs/dinomaly.yaml`](configs/dinomaly.yaml)，所有字段均为必填项。训练与推理共享这一份配置映射；补丁尺寸、上下文尺度、细化参数和缩略图尺寸来自任务定义，不再复制三份同内容配置。配置包含训练迭代、困难样本比例、混合精度、每源图像采样补丁数、Top-K 图像评分、三路证据权重、`global_routing_weight`、`refinement_bridge_gap_tiles`、图像/像素/组件校准分位数和质量检查阈值。
 
 ### 训练产物
 
@@ -232,7 +232,7 @@ python runs/inference.py \
 ```text
 results/dinomaly_logs/
 ├── inference.log
-├── predictions.jsonl             # 图像/组件分数、阈值、OK/RECHECK/NG、质量结果和像素统计
+├── predictions.jsonl             # 图像/组件分数、阈值、OK/NG、质量结果和像素统计
 └── masks/                        # 每张图的预测二值异常掩码（有像素阈值时）
 
 results/dinomaly_vis/
@@ -249,7 +249,9 @@ results/dinomaly_vis/
 
 评估指标用于对比模型能力；线上 OK/NG 与像素掩码使用的是训练后保存的正常样本校准阈值，而非测试集上的最优阈值。
 
-`predictions.jsonl` 的每条记录至少包含 `filename`、`clsname`、`score`、`is_defect`；完成校准后还包含 `threshold`、`decision`、`decision_threshold`、`decision_reason`、`component_score`、`component_summary`、`pixel_threshold`、`prediction_mask` 和 `anomaly_pixel_count`。运行时对外保留最终异常图及判定所需结果；缩略图上采样结果和路由图只在单张图选择细化区域时短暂存在，不作为诊断大图返回。`decision` 的取值为 `OK`、`RECHECK`、`NG`，其中 `is_defect` 仅在 `decision == "NG"` 时为真；质量指标和原因写入 `quality` 字段，质量门禁只会把原本的 `OK` 提升为 `RECHECK`。
+`predictions.jsonl` 的每条记录至少包含 `filename`、`clsname`、`score`、`is_defect`；完成校准后还包含 `threshold`、`decision`、`decision_threshold`、`decision_reason`、`component_score`、`component_summary`、`pixel_threshold`、`prediction_mask` 和 `anomaly_pixel_count`。运行时对外保留最终异常图及判定所需结果；缩略图上采样结果和路由图只在单张图选择细化区域时短暂存在，不作为诊断大图返回。若启用精修，记录还包含 `refinement` 字段，给出总 tile 数、实际精修 tile 数和覆盖率，用于监控算力与路由退化。`decision` 的取值为 `OK` 或 `NG`，且与 `is_defect` 一一对应；质量指标和原因写入 `quality` 字段，状态为 `PASS` 或 `FAIL`，不覆盖模型判定。
+
+每次推理还会在 `inference.log` 记录质量检查、粗扫、路由、精修、后处理和总耗时，便于结合 `refinement.coverage_ratio` 判断瓶颈来自候选数量还是单 tile 执行效率。
 
 ## 真实数据评估切分
 

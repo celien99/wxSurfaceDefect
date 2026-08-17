@@ -12,12 +12,12 @@ def _thresholds():
     }
 
 
-def test_quality_gate_rechecks_dark_flat_image():
+def test_quality_check_fails_dark_flat_image():
     image = np.zeros((32, 32, 3), dtype=np.uint8)
 
     result = assess_image_quality(image, _thresholds())
 
-    assert result["status"] == "RECHECK"
+    assert result["status"] == "FAIL"
     assert "mean_luminance_below_minimum" in result["reasons"]
     assert "focus_variance_below_minimum" in result["reasons"]
 

@@ -1,7 +1,6 @@
 import numpy as np
 
 from hiad.runtime.decision import (
-    apply_quality_gate,
     classify_score,
     component_statistics,
     image_score_from_statistics,
@@ -84,18 +83,8 @@ def test_image_score_preserves_a_stronger_global_task_prior():
     assert score == 0.9
 
 
-def test_classify_score_has_three_states():
-    assert classify_score(0.3, 0.5, 0.1) == "OK"
-    assert classify_score(0.55, 0.5, 0.1) == "RECHECK"
-    assert classify_score(0.7, 0.5, 0.1) == "NG"
-
-
-def test_quality_gate_promotes_ok_without_downgrading_ng():
-    reasons = ["focus_variance_below_minimum"]
-
-    assert apply_quality_gate("OK", reasons) == (
-        "RECHECK",
-        "quality_gate:focus_variance_below_minimum",
-    )
-    assert apply_quality_gate("NG", reasons) == ("NG", None)
-    assert apply_quality_gate("RECHECK", reasons) == ("RECHECK", None)
+def test_classify_score_has_binary_states_and_fails_safe_for_invalid_scores():
+    assert classify_score(0.3, 0.5) == "OK"
+    assert classify_score(0.5, 0.5) == "OK"
+    assert classify_score(0.5001, 0.5) == "NG"
+    assert classify_score(float("nan"), 0.5) == "NG"

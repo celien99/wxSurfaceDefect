@@ -44,9 +44,9 @@ class DetectorConfig(Protocol):
         normal_component_percentile (float): 正常连通组件分数校准分位数。
         normal_pixel_percentile (float): 单图异常图压缩分位数。
         normal_pixel_image_percentile (float): 跨正常图像的像素阈值分位数。
+        refinement_bridge_gap_tiles (int): 强候选之间可桥接的最大微补丁缺口数。
         calibration_batch_size (int): 两阶段校准批量大小。
         map_gaussian_sigma (float): 补丁拼图完成后的高斯平滑 sigma。
-        decision_recheck_margin_ratio (float): 图像阈值比例形式的复检带宽。
         min_mean_luminance (float): 质量门禁最小平均亮度。
         max_mean_luminance (float): 质量门禁最大平均亮度。
         max_clipped_fraction (float): 质量门禁最大黑白截断比例。
@@ -77,9 +77,9 @@ class DetectorConfig(Protocol):
     normal_component_percentile: float
     normal_pixel_percentile: float
     normal_pixel_image_percentile: float
+    refinement_bridge_gap_tiles: int
     calibration_batch_size: int
     map_gaussian_sigma: float
-    decision_recheck_margin_ratio: float
     min_mean_luminance: float
     max_mean_luminance: float
     max_clipped_fraction: float
@@ -113,9 +113,9 @@ REQUIRED_CONFIG_KEYS: Final = (
     "normal_component_percentile",
     "normal_pixel_percentile",
     "normal_pixel_image_percentile",
+    "refinement_bridge_gap_tiles",
     "calibration_batch_size",
     "map_gaussian_sigma",
-    "decision_recheck_margin_ratio",
     "min_mean_luminance",
     "max_mean_luminance",
     "max_clipped_fraction",
@@ -225,6 +225,12 @@ def validate_required_config(config: object) -> None:
         or values["hard_mining_warmup_iters"] < 0
     ):
         raise ValueError("hard_mining_warmup_iters must be a non-negative integer")
+    if (
+        isinstance(values["refinement_bridge_gap_tiles"], bool)
+        or not isinstance(values["refinement_bridge_gap_tiles"], int)
+        or values["refinement_bridge_gap_tiles"] < 0
+    ):
+        raise ValueError("refinement_bridge_gap_tiles must be a non-negative integer")
 
     evidence_weights = tuple(
         _finite_number(values[key], key)
@@ -246,11 +252,6 @@ def validate_required_config(config: object) -> None:
             raise ValueError(f"{key} must be in the open interval (0, 1)")
     if _finite_number(values["map_gaussian_sigma"], "map_gaussian_sigma") < 0:
         raise ValueError("map_gaussian_sigma must be non-negative")
-    if not 0 <= _finite_number(
-        values["decision_recheck_margin_ratio"], "decision_recheck_margin_ratio"
-    ) <= 1:
-        raise ValueError("decision_recheck_margin_ratio must be in [0, 1]")
-
     min_luminance = _finite_number(values["min_mean_luminance"], "min_mean_luminance")
     max_luminance = _finite_number(values["max_mean_luminance"], "max_mean_luminance")
     clipped_fraction = _finite_number(values["max_clipped_fraction"], "max_clipped_fraction")

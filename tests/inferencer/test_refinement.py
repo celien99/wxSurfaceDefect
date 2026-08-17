@@ -5,6 +5,7 @@ from hiad.data import HRImageIndex, build_multiresolution_region
 from hiad.inferencer.refinement import (
     build_routing_map,
     merge_refinement_maps,
+    refinement_tile_statistics,
     select_refinement_regions,
 )
 
@@ -61,6 +62,70 @@ def test_select_refinement_regions_covers_large_component_with_multiple_tiles():
         if region.x < 14 and region.y < 14 and region.x + 4 > 2 and region.y + 4 > 2
     ]
     assert len(component_tiles) >= 9
+
+
+def test_select_refinement_regions_bridges_the_gap_between_strong_candidates():
+    anomaly_map = np.zeros((16, 16), dtype=np.float32)
+    anomaly_map[0:4, 4:8] = 1.0
+    anomaly_map[8:12, 4:8] = 1.0
+    anomaly_map[4:8, 0:4] = 1.0
+    anomaly_map[4:8, 8:12] = 1.0
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=1,
+        safety_fraction=0.01,
+        max_bridge_gap_tiles=1,
+    )
+
+    assert HRImageIndex(x=4, y=4, width=4, height=4) in regions
+
+
+def test_select_refinement_regions_keeps_a_small_high_peak():
+    anomaly_map = np.zeros((12, 12), dtype=np.float32)
+    anomaly_map[1, 1] = 1.0
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=4,
+        safety_fraction=0.01,
+    )
+
+    assert HRImageIndex(x=0, y=0, width=4, height=4) in regions
+
+
+def test_select_refinement_regions_keeps_strongest_tile_below_route_threshold():
+    anomaly_map = np.full((8, 8), 0.2, dtype=np.float32)
+    anomaly_map[6, 6] = 0.4
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=4,
+        safety_fraction=0.01,
+    )
+
+    assert HRImageIndex(x=4, y=4, width=4, height=4) in regions
+
+
+def test_refinement_tile_statistics_deduplicates_native_tile_origins():
+    regions = [
+        HRImageIndex(x=4, y=4, width=4, height=4),
+        HRImageIndex(x=4, y=4, width=4, height=4),
+    ]
+
+    statistics = refinement_tile_statistics((8, 8), 4, regions)
+
+    assert statistics == {
+        "total_tiles": 4,
+        "selected_tiles": 1,
+        "coverage_ratio": 0.25,
+    }
 
 
 def test_select_refinement_regions_adds_deterministic_safety_coverage():
@@ -148,7 +213,7 @@ def test_merge_refinement_maps_blends_native_edge_extent():
     assert merged[4, 6] == 0.8
 
 
-def test_merge_refinement_maps_can_suppress_coarse_false_positive():
+def test_merge_refinement_maps_preserves_coarse_anomaly_evidence():
     base_map = np.full((7, 7), 0.8, dtype=np.float32)
     refinement_map = np.full((5, 5), 0.2, dtype=np.float32)
 
@@ -158,8 +223,9 @@ def test_merge_refinement_maps_can_suppress_coarse_false_positive():
         image_size=(7, 7),
     )
 
-    assert merged[3, 3] == 0.2
+    assert merged[3, 3] == 0.8
     assert merged[0, 0] == 0.8
+    assert np.all(merged >= base_map)
 
 
 def test_refinement_region_keeps_nested_multiscale_context_at_image_edge():

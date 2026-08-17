@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import cast
 
 import numpy as np
-import torch
 from numpy.typing import NDArray
 from PIL import Image
 from torch.utils.data import Dataset
@@ -75,6 +74,11 @@ class StreamingTaskDataset(Dataset[PatchItem]):
         # 相邻补丁复用同一解码原图，但绝不跨源图保留多份大图。
         self._cached_path: str | None = None
         self._cached_image: NDArray[np.uint8] | None = None
+        self._patch_converter = PatchDataset(
+            patches=[],
+            training=training,
+            task_name=task["name"],
+        )
         self._build_index()
 
     @staticmethod
@@ -263,7 +267,6 @@ class StreamingTaskDataset(Dataset[PatchItem]):
             or image_array.dtype != np.uint8
             or image_array.ndim != 3
             or image_array.shape[2] != 3
-            or not np.isfinite(image_array).all()
         ):
             raise ValueError("Source image must be a finite HWC uint8 RGB image")
         self._cached_path = path
@@ -284,11 +287,7 @@ class StreamingTaskDataset(Dataset[PatchItem]):
                 patch = sample.down_sampling_to_LR(thumbnail_task["thumbnail_size"])
             else:
                 patch = create_dynamic_patch(sample, region)
-            return PatchDataset(
-                patches=[patch],
-                training=self.training,
-                task_name=self.task["name"],
-            )[0]
+            return self._patch_converter.transform_patch(patch)
         finally:
             sample.image.image = None
             if sample.mask is not None:

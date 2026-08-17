@@ -33,7 +33,7 @@ def assess_image_quality(
             使用最近邻插值对齐到图像高宽，非零像素视为有效。
 
     Returns:
-        ImageQualityResult: ``PASS`` 或 ``RECHECK`` 状态、原因码及三项质量指标。
+        ImageQualityResult: ``PASS`` 或 ``FAIL`` 状态、原因码及三项质量指标。
 
     Raises:
         ValueError: 图像格式、阈值范围或有效掩码不符合约定。
@@ -89,7 +89,7 @@ def assess_image_quality(
     if focus_variance < limits["min_focus_variance"]:
         reasons.append("focus_variance_below_minimum")
     return {
-        "status": "RECHECK" if reasons else "PASS",
+        "status": "FAIL" if reasons else "PASS",
         "reasons": reasons,
         "mean_luminance": mean_luminance,
         "clipped_fraction": clipped_fraction,

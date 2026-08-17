@@ -32,7 +32,6 @@ from .dinomaly.models.vision_transformer import LinearAttention2, bMlp
 from .dinomaly.optimizers import StableAdamW
 from .dinomaly.utils import WarmCosineScheduler, global_cosine_hm_percent
 
-
 RunningMoments: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 FeatureLayers: TypeAlias = Sequence[torch.Tensor]
 DetectorBatch: TypeAlias = Mapping[str, Any]
@@ -408,18 +407,25 @@ class HRDinomaly(BaseDetector):
             ValueError: 特征层契约不匹配。
         """
         memory_layers = self.feature_memory.score(features)
-        return torch.cat(
-            [
+        if not memory_layers:
+            raise ValueError("Feature memory must return at least one score layer")
+        maximum = F.interpolate(
+            memory_layers[0],
+            size=output_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        for layer in memory_layers[1:]:
+            maximum = torch.maximum(
+                maximum,
                 F.interpolate(
                     layer,
                     size=output_size,
                     mode="bilinear",
                     align_corners=False,
-                )
-                for layer in memory_layers
-            ],
-            dim=1,
-        ).amax(dim=1, keepdim=True)
+                ),
+            )
+        return maximum
 
     @staticmethod
     def _positive_normalize(
@@ -673,7 +679,7 @@ class HRDinomaly(BaseDetector):
                 if it >= training_iters:
                     break
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def inference_step(
         self,
         test_dataloader: DataLoader[Any],
@@ -774,17 +780,25 @@ class HRDinomaly(BaseDetector):
             encoder_features,
             decoder_features,
         )
-        token_map = torch.cat(token_layer_maps, dim=1).amax(dim=1, keepdim=True)
-        pixel_layer_maps = [
-            F.interpolate(
-                token_layer_map,
-                size=(output_size[1], output_size[0]),
-                mode="bilinear",
-                align_corners=True,
+        token_map = token_layer_maps[0]
+        for token_layer_map in token_layer_maps[1:]:
+            token_map = torch.maximum(token_map, token_layer_map)
+        anomaly_map = F.interpolate(
+            token_layer_maps[0],
+            size=(output_size[1], output_size[0]),
+            mode="bilinear",
+            align_corners=True,
+        )
+        for token_layer_map in token_layer_maps[1:]:
+            anomaly_map = torch.maximum(
+                anomaly_map,
+                F.interpolate(
+                    token_layer_map,
+                    size=(output_size[1], output_size[0]),
+                    mode="bilinear",
+                    align_corners=True,
+                ),
             )
-            for token_layer_map in token_layer_maps
-        ]
-        anomaly_map = torch.cat(pixel_layer_maps, dim=1).amax(dim=1, keepdim=True)
         return anomaly_map, token_map
 
     @staticmethod

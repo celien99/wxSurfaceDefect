@@ -12,7 +12,7 @@ ScoreVector: TypeAlias = NDArray[np.float32]
 ImageArray: TypeAlias = NDArray[np.uint8]
 BinaryMask: TypeAlias = NDArray[np.uint8]
 ImageSize: TypeAlias = tuple[int, int]
-DecisionState: TypeAlias = Literal["OK", "RECHECK", "NG"]
+DecisionState: TypeAlias = Literal["OK", "NG"]
 
 
 class DetectorPrediction(TypedDict):
@@ -85,14 +85,14 @@ class ImageQualityResult(TypedDict):
     """采集质量门禁的可落盘结果。
 
     Attributes:
-        status (Literal["PASS", "RECHECK"]): 质量是否允许直接使用推理判定。
-        reasons (list[str]): 触发复检的稳定机器可读原因码。
+        status (Literal["PASS", "FAIL"]): 图像采集质量是否通过。
+        reasons (list[str]): 触发质量失败的稳定机器可读原因码。
         mean_luminance (float): 有效区域内归一化灰度均值。
         clipped_fraction (float): 有效区域内接近全黑或全白的像素比例。
         focus_variance (float): 有效区域内 Laplacian 响应方差。
     """
 
-    status: Literal["PASS", "RECHECK"]
+    status: Literal["PASS", "FAIL"]
     reasons: list[str]
     mean_luminance: float
     clipped_fraction: float
@@ -133,6 +133,31 @@ class ComponentStatistics(TypedDict):
     anomalous_pixel_count: int
     largest_component_area: int
     strongest_component: StrongestComponent | None
+
+
+class RefinementStatistics(TypedDict):
+    """Runtime coverage and cost proxy for one refinement grid.
+
+    Attributes:
+        total_tiles (int): Number of native refinement tiles covering the image.
+        selected_tiles (int): Number of unique tiles sent to the high-resolution task.
+        coverage_ratio (float): ``selected_tiles / total_tiles``.
+    """
+
+    total_tiles: int
+    selected_tiles: int
+    coverage_ratio: float
+
+
+class InferenceTiming(TypedDict):
+    """Wall-clock timings for one inference call, in seconds."""
+
+    quality_seconds: float
+    coarse_seconds: float
+    routing_seconds: float
+    refinement_seconds: float
+    postprocess_seconds: float
+    total_seconds: float
 
 
 class CalibrationCategoryRequired(TypedDict):
@@ -220,15 +245,19 @@ class InferenceResult(InferenceResultRequired, total=False):
         display_images (dict[str, ImageArray] | None): 原图路径到固定尺寸 RGB
             ``uint8`` 显示图的映射。
         image_thresholds (ScoreVector): 与最终图像分数比较的分类别阈值。
-        decision_thresholds (ScoreVector): 三态判定实际使用的图像或组件阈值。
+        decision_thresholds (ScoreVector): 二分类判定实际使用的图像或组件阈值。
         pixel_thresholds (ScoreVector): 生成二值掩码和组件统计的分类别像素阈值。
         component_scores (list[float]): 最强组件与原始全局分数的保守组合。
         raw_image_scores (ScoreVector): 应用组件统计前的粗到细图像分数。
-        decisions (list[DecisionState]): ``OK``、``RECHECK`` 或 ``NG`` 判定。
+        decisions (list[DecisionState]): ``OK`` 或 ``NG`` 判定。
         decision_reasons (list[str]): 与判定同序的机器可读原因。
         component_summaries (list[ComponentStatistics]): 每张异常图的连通区域摘要。
-        is_defect (list[bool]): 仅 ``NG`` 映射为 ``True`` 的兼容布尔判定。
+        is_defect (list[bool]): 与 ``NG`` 判定一一对应的兼容布尔判定。
         binary_anomaly_maps (list[BinaryMask]): 取值 ``0/1`` 的原图二维预测掩码。
+        refinement_statistics (list[RefinementStatistics]): 每张图的精修网格覆盖
+            和算力代理统计，顺序与 ``image_paths`` 一致。
+        inference_timing (InferenceTiming): 当前批次各阶段耗时，用于性能监控，
+            不参与模型判定。
     """
 
     display_images: dict[str, ImageArray] | None
@@ -242,3 +271,5 @@ class InferenceResult(InferenceResultRequired, total=False):
     component_summaries: list[ComponentStatistics]
     is_defect: list[bool]
     binary_anomaly_maps: list[BinaryMask]
+    refinement_statistics: list[RefinementStatistics]
+    inference_timing: InferenceTiming

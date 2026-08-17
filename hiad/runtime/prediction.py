@@ -94,6 +94,7 @@ def save_predictions(
     decision_thresholds = inference_result.get("decision_thresholds")
     component_scores = inference_result.get("component_scores")
     component_summaries = inference_result.get("component_summaries")
+    refinement_statistics = inference_result.get("refinement_statistics")
     quality_results = inference_result.get("quality_results")
     pixel_thresholds = inference_result.get("pixel_thresholds")
     binary_maps = inference_result.get("binary_anomaly_maps")
@@ -124,6 +125,8 @@ def save_predictions(
                 record["component_score"] = float(component_scores[index])
             if component_summaries is not None:
                 record["component_summary"] = component_summaries[index]
+            if refinement_statistics is not None:
+                record["refinement"] = refinement_statistics[index]
             if quality_results is not None:
                 record["quality"] = quality_results[index]
             if pixel_thresholds is not None:

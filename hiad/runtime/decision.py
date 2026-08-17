@@ -149,50 +149,20 @@ def top_k_map_score(anomaly_map: ArrayLike, top_k: int) -> float:
 def classify_score(
     score: float,
     threshold: float,
-    recheck_margin: float,
 ) -> DecisionState:
-    """根据校准阈值和复检带宽生成保守的三态判定。
+    """根据校准阈值生成二分类判定。
 
     Args:
         score (float): 待判定的图像或组件异常分数。
         threshold (float): 正常样本校准阈值。
-        recheck_margin (float): 阈值上方的复检带宽，必须为有限非负数。
-
     Returns:
-        DecisionState: 不超过阈值为 ``OK``，位于复检带为 ``RECHECK``，更高为
-        ``NG``；分数或阈值非有限时保守返回 ``RECHECK``。
-
-    Raises:
-        ValueError: ``recheck_margin`` 不是有限非负数。
+        DecisionState: 不超过阈值为 ``OK``，超过阈值为 ``NG``；分数或阈值
+        非有限时保守返回 ``NG``。
     """
     score = float(score)
     threshold = float(threshold)
-    recheck_margin = float(recheck_margin)
     if not (math.isfinite(score) and math.isfinite(threshold)):
-        return "RECHECK"
-    if not math.isfinite(recheck_margin) or recheck_margin < 0:
-        raise ValueError("recheck_margin must be a finite non-negative number")
+        return "NG"
     if score <= threshold:
         return "OK"
-    if score <= threshold + recheck_margin:
-        return "RECHECK"
     return "NG"
-
-
-def apply_quality_gate(
-    decision: DecisionState,
-    reasons: list[str],
-) -> tuple[DecisionState, str | None]:
-    """应用采集质量门禁，且绝不降低已有异常判定。
-
-    Args:
-        decision (DecisionState): 模型产生的三态判定。
-        reasons (list[str]): 质量检查产生的原因码；空列表表示质量通过。
-
-    Returns:
-        tuple[DecisionState, str | None]: 门禁后的判定及可选原因。质量问题只能
-        将 ``OK`` 提升为 ``RECHECK``，不会覆盖 ``RECHECK`` 或 ``NG``。
-    """
-    if decision == "OK" and reasons:
-        return "RECHECK", "quality_gate:" + ",".join(str(reason) for reason in reasons)
-    return decision, None

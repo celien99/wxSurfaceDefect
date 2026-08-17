@@ -9,7 +9,6 @@ from torch.utils.data import Dataset
 
 from hiad.data import LRPatch
 
-
 PatchItem: TypeAlias = dict[str, torch.Tensor | str | int]
 
 
@@ -35,6 +34,7 @@ class PatchDataset(Dataset[PatchItem]):
         self.std: torch.Tensor = torch.tensor(
             [0.229, 0.224, 0.225], dtype=torch.float32
         ).view(3, 1, 1)
+        self._inference_zero_masks: dict[tuple[int, int], torch.Tensor] = {}
 
     def _image_to_tensor(self, image: ArrayLike, name: str) -> torch.Tensor:
         """校验 HWC RGB 数组并转换为标准化 CHW 浮点张量。
@@ -59,16 +59,24 @@ class PatchDataset(Dataset[PatchItem]):
             or image.shape[0] <= 0
             or image.shape[1] <= 0
             or image.dtype not in (np.uint8, np.float32)
-            or not np.isfinite(image).all()
+            or (image.dtype == np.float32 and not np.isfinite(image).all())
         ):
             raise ValueError(f"{name} must be a finite HWC RGB image")
-        tensor = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).float()
+        source = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1)
+        tensor = source.float() if image.dtype == np.uint8 else source.clone()
         if image.dtype == np.uint8:
-            tensor = tensor / 255.0
-        return (tensor - self.mean) / self.std
+            tensor.div_(255.0)
+        return tensor.sub_(self.mean).div_(self.std)
 
     def __getitem__(self, idx: int) -> PatchItem:
-        patch = self.patches[idx]
+        return self.transform_patch(self.patches[idx])
+
+    def transform_patch(self, patch: LRPatch) -> PatchItem:
+        """Convert one in-memory patch without constructing another dataset.
+
+        Streaming inference calls this method repeatedly through one reusable
+        converter, avoiding per-tile dataset and normalization-tensor setup.
+        """
         image = self._image_to_tensor(patch.image, "patch.image")
 
         if patch.mask is not None:
@@ -77,7 +85,14 @@ class PatchDataset(Dataset[PatchItem]):
                 raise ValueError("patch.mask must match the patch image height and width")
             mask = torch.from_numpy(mask_array).ne(0).to(torch.float32)
         else:
-            mask = torch.zeros(image.shape[1:], dtype=torch.float32)
+            shape = (int(image.shape[1]), int(image.shape[2]))
+            if self.training:
+                mask = torch.zeros(shape, dtype=torch.float32)
+            else:
+                mask = self._inference_zero_masks.get(shape)
+                if mask is None:
+                    mask = torch.zeros(shape, dtype=torch.float32)
+                    self._inference_zero_masks[shape] = mask
 
         item: PatchItem = {"image": image, "mask": mask}
         if patch.clsname is not None:

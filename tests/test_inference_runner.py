@@ -90,7 +90,7 @@ def test_pixel_masks_are_not_gated_by_image_decisions():
     assert masks[0].tolist() == [[0, 1]]
 
 
-def test_save_predictions_serializes_three_state_decision_and_components(tmp_path):
+def test_save_predictions_serializes_binary_decision_and_components(tmp_path):
     samples = [
         SimpleNamespace(
             image=SimpleNamespace(image_path="a.bmp"),
@@ -119,19 +119,27 @@ def test_save_predictions_serializes_three_state_decision_and_components(tmp_pat
         samples,
         {
             "image_scores": [0.6],
-            "is_defect": [False],
-            "decisions": ["RECHECK"],
+            "is_defect": [True],
+            "decisions": ["NG"],
             "decision_thresholds": [0.55],
-            "decision_reasons": ["score_within_recheck_margin"],
+            "decision_reasons": ["score_above_threshold"],
             "component_scores": [0.6],
             "component_summaries": [component_summary],
+            "refinement_statistics": [
+                {"total_tiles": 16, "selected_tiles": 3, "coverage_ratio": 0.1875}
+            ],
         },
     )
 
     record = json.loads(output.read_text())
-    assert record["is_defect"] is False
-    assert record["decision"] == "RECHECK"
+    assert record["is_defect"] is True
+    assert record["decision"] == "NG"
     assert record["decision_threshold"] == 0.55
-    assert record["decision_reason"] == "score_within_recheck_margin"
+    assert record["decision_reason"] == "score_above_threshold"
     assert record["component_score"] == 0.6
     assert record["component_summary"] == component_summary
+    assert record["refinement"] == {
+        "total_tiles": 16,
+        "selected_tiles": 3,
+        "coverage_ratio": 0.1875,
+    }

@@ -2,13 +2,69 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from functools import lru_cache
 
 import cv2
 import numpy as np
 from numpy.typing import ArrayLike
 
 from hiad.data import HRImageIndex
-from hiad.runtime.contracts import FloatMap, ImageSize
+from hiad.runtime.contracts import FloatMap, ImageSize, RefinementStatistics
+
+
+@lru_cache(maxsize=32)
+def refinement_blend_weights(height: int, width: int) -> FloatMap:
+    """Return cached Hann weights with a non-zero edge floor.
+
+    Refinement and coarse-map stitching repeatedly use the same patch shapes.
+    Keeping the small weight kernels cached avoids rebuilding them for every
+    patch while returning a read-only array so callers cannot corrupt the cache.
+    """
+    if height <= 0 or width <= 0:
+        raise ValueError("Patch dimensions must be positive")
+    row_hann = np.hanning(height) if height > 1 else np.ones(1)
+    column_hann = np.hanning(width) if width > 1 else np.ones(1)
+    if row_hann.max() > 0:
+        row_hann /= row_hann.max()
+    if column_hann.max() > 0:
+        column_hann /= column_hann.max()
+    weights = (0.05 + 0.95 * np.outer(row_hann, column_hann)).astype(
+        np.float32,
+        copy=False,
+    )
+    weights.setflags(write=False)
+    return weights
+
+
+def refinement_tile_statistics(
+    image_size: ImageSize,
+    tile_size: int,
+    regions: Sequence[HRImageIndex],
+) -> RefinementStatistics:
+    """Summarize refinement-grid coverage for runtime observability.
+
+    The selected count is deduplicated by native tile origin, so overlap or
+    repeated task records cannot inflate the reported compute coverage.
+    """
+    image_width, image_height = image_size
+    x_starts = _tile_axis_starts(image_width, tile_size)
+    y_starts = _tile_axis_starts(image_height, tile_size)
+    valid_origins = {
+        (int(region.y), int(region.x))
+        for region in regions
+    }
+    selected_tiles = sum(
+        1
+        for y in y_starts
+        for x in x_starts
+        if (y, x) in valid_origins
+    )
+    total_tiles = len(x_starts) * len(y_starts)
+    return {
+        "total_tiles": total_tiles,
+        "selected_tiles": selected_tiles,
+        "coverage_ratio": float(selected_tiles / total_tiles),
+    }
 
 
 def _robust_unit_map(values: ArrayLike) -> FloatMap:
@@ -74,6 +130,7 @@ def _validate_selection_arguments(
     tile_size: int,
     min_area: int,
     safety_fraction: float,
+    max_bridge_gap_tiles: int,
 ) -> FloatMap:
     """校验复核候选选择所需的异常图和网格参数。
 
@@ -83,6 +140,7 @@ def _validate_selection_arguments(
         tile_size (int): 正方形复核块边长。
         min_area (int): 最小连通区域像素数。
         safety_fraction (float): 确定性安全采样比例，范围 ``(0, 1]``。
+        max_bridge_gap_tiles (int): 候选补丁之间可桥接的最大缺口数，允许为零。
 
     Returns:
         FloatMap: 转换为 ``float32`` 的路由图。
@@ -107,6 +165,12 @@ def _validate_selection_arguments(
         or safety_fraction > 1
     ):
         raise ValueError("safety_fraction must be finite and in the range (0, 1]")
+    if (
+        isinstance(max_bridge_gap_tiles, bool)
+        or not isinstance(max_bridge_gap_tiles, int)
+        or max_bridge_gap_tiles < 0
+    ):
+        raise ValueError("max_bridge_gap_tiles must be a non-negative integer")
     return values
 
 
@@ -183,6 +247,7 @@ def select_refinement_regions(
     tile_size: int,
     min_area: int,
     safety_fraction: float,
+    max_bridge_gap_tiles: int = 0,
 ) -> list[HRImageIndex]:
     """选择可疑区域，并加入确定性的原图坐标安全采样块以保护召回。
 
@@ -193,17 +258,25 @@ def select_refinement_regions(
         min_area (int): 八连通候选区域的最小像素数。
         safety_fraction (float): 除异常候选外必须覆盖的确定性网格比例，范围
             ``(0, 1]``。
+        max_bridge_gap_tiles (int): 同一行或列中被候选补丁夹住时，额外桥接的
+            最大微补丁缺口数。该扩展不扩大确定性安全采样。
 
     Returns:
-        list[HRImageIndex]: 原图 ``xywh`` 复核区域。先按行列顺序返回异常候选块，
-        再追加不重复的低差异安全采样块；至少包含一个安全块。
+        list[HRImageIndex]: 原图 ``xywh`` 复核区域。先按行列顺序返回异常候选块
+        及其被夹住的微补丁缺口，再追加不重复的低差异安全采样块；至少包含一个
+        安全块。
 
     Raises:
         ValueError: 异常图为空、非二维或含非有限值，阈值非有限，或网格参数
             不符合范围。
     """
     values = _validate_selection_arguments(
-        anomaly_map, threshold, tile_size, min_area, safety_fraction
+        anomaly_map,
+        threshold,
+        tile_size,
+        min_area,
+        safety_fraction,
+        max_bridge_gap_tiles,
     )
     image_height, image_width = values.shape
     x_starts = _tile_axis_starts(image_width, tile_size)
@@ -214,14 +287,75 @@ def select_refinement_regions(
     component_count, labels, statistics, _ = cv2.connectedComponentsWithStats(
         binary, connectivity=8
     )
+    component_maxima = np.full(component_count, -np.inf, dtype=np.float32)
+    np.maximum.at(component_maxima, labels.reshape(-1), values.reshape(-1))
+    # Keep small but sharp peaks: a tiny defect can occupy fewer pixels than
+    # min_area after coarse routing, while still being strong enough to warrant
+    # a high-resolution look.
+    peak_threshold = float(threshold) + 0.5 * max(
+        0.0,
+        float(values.max()) - float(threshold),
+    )
     valid_components = np.zeros(component_count, dtype=bool)
-    valid_components[1:] = statistics[1:, cv2.CC_STAT_AREA] >= min_area
+    valid_components[1:] = (
+        (statistics[1:, cv2.CC_STAT_AREA] >= min_area)
+        | (component_maxima[1:] >= peak_threshold)
+    )
     candidate_y, candidate_x = np.nonzero(valid_components[labels])
     occupied_tiles: set[tuple[int, int]] = set()
     if candidate_x.size:
         x_indexes = np.searchsorted(x_starts, candidate_x, side="right") - 1
         y_indexes = np.searchsorted(y_starts, candidate_y, side="right") - 1
         occupied_tiles.update(zip(y_indexes.tolist(), x_indexes.tolist()))
+    expanded_tiles = set(occupied_tiles)
+    tiles_by_row: dict[int, list[int]] = {}
+    tiles_by_column: dict[int, list[int]] = {}
+    for y_index, x_index in occupied_tiles:
+        tiles_by_row.setdefault(y_index, []).append(x_index)
+        tiles_by_column.setdefault(x_index, []).append(y_index)
+    for fixed_index, coordinates in tiles_by_row.items():
+        coordinates.sort()
+        for left, right in zip(coordinates, coordinates[1:]):
+            if 0 < right - left - 1 <= max_bridge_gap_tiles:
+                expanded_tiles.update(
+                    (fixed_index, x_index)
+                    for x_index in range(left + 1, right)
+                )
+    for fixed_index, coordinates in tiles_by_column.items():
+        coordinates.sort()
+        for top, bottom in zip(coordinates, coordinates[1:]):
+            if 0 < bottom - top - 1 <= max_bridge_gap_tiles:
+                expanded_tiles.update(
+                    (y_index, fixed_index)
+                    for y_index in range(top + 1, bottom)
+                )
+
+    # When no component survived routing, inspect the strongest one or two
+    # tiles. This protects broad, moderate defects whose pixels all sit below
+    # the high quantile route threshold, without forcing full-image refinement.
+    if float(values.max()) > float(values.min()):
+        tile_scores = [
+            (
+                float(
+                    values[
+                        y : min(y + tile_size, image_height),
+                        x : min(x + tile_size, image_width),
+                    ].max()
+                ),
+                y_index,
+                x_index,
+            )
+            for y_index, y in enumerate(y_starts)
+            for x_index, x in enumerate(x_starts)
+        ]
+        guard_count = 2 if not occupied_tiles and len(tile_scores) > 1 else 1
+        for _, y_index, x_index in sorted(
+            tile_scores,
+            key=lambda item: (-item[0], item[1], item[2]),
+        )[:guard_count]:
+            expanded_tiles.add((y_index, x_index))
+
+    selected_indexes = sorted(expanded_tiles)
     selected = [
         HRImageIndex(
             x=x_starts[x_index],
@@ -229,23 +363,30 @@ def select_refinement_regions(
             width=tile_size,
             height=tile_size,
         )
-        for y_index, x_index in sorted(occupied_tiles)
+        for y_index, x_index in selected_indexes
     ]
-    safety_tiles = [
-        HRImageIndex(x=x, y=y, width=tile_size, height=tile_size)
-        for y in y_starts
-        for x in x_starts
-    ]
-    safety_count = max(1, math.ceil(len(safety_tiles) * float(safety_fraction)))
+    column_count = len(x_starts)
+    tile_count = len(y_starts) * column_count
+    safety_count = max(1, math.ceil(tile_count * float(safety_fraction)))
     safety_indexes = _spatial_safety_indexes(
         len(y_starts),
-        len(x_starts),
+        column_count,
         safety_count,
     )
+    selected_set = set(selected_indexes)
     for safety_index in safety_indexes:
-        tile = safety_tiles[int(safety_index)]
-        if tile not in selected:
+        flattened = int(safety_index)
+        tile_index = (flattened // column_count, flattened % column_count)
+        if tile_index not in selected_set:
+            y_index, x_index = tile_index
+            tile = HRImageIndex(
+                x=x_starts[x_index],
+                y=y_starts[y_index],
+                width=tile_size,
+                height=tile_size,
+            )
             selected.append(tile)
+            selected_set.add(tile_index)
     return selected
 
 
@@ -265,7 +406,8 @@ def merge_refinement_maps(
 
     Returns:
         FloatMap: 原图分辨率 ``float32`` 融合图。没有有效覆盖时返回粗扫图副本；
-        重叠区域按带最低边缘权重的二维 Hann 窗平均并与粗扫图混合。
+        重叠区域按带最低边缘权重的二维 Hann 窗平均，再与粗扫图逐点取最大值，
+        从而确保精修不会压低已有异常证据。
 
     Raises:
         TypeError: 复核条目不是 ``(HRImageIndex, anomaly_map)`` 二元组。
@@ -311,13 +453,7 @@ def merge_refinement_maps(
         valid_width = min(index.width, image_width - index.x)
         valid_height = min(index.height, image_height - index.y)
         # Hann 权重削弱补丁边缘伪影，保底权重确保边界像素仍能被复核结果覆盖。
-        row_hann = np.hanning(index.height) if index.height > 1 else np.ones(1)
-        column_hann = np.hanning(index.width) if index.width > 1 else np.ones(1)
-        if row_hann.max() > 0:
-            row_hann /= row_hann.max()
-        if column_hann.max() > 0:
-            column_hann /= column_hann.max()
-        weights = 0.05 + 0.95 * np.outer(row_hann, column_hann)
+        weights = refinement_blend_weights(index.height, index.width)
         target_slice = (
             slice(index.y, index.y + valid_height),
             slice(index.x, index.x + valid_width),
@@ -334,4 +470,5 @@ def merge_refinement_maps(
     refinement_map = np.zeros_like(base, dtype=np.float64)
     refinement_map[covered] = accumulated[covered] / weight_map[covered]
     alpha = np.clip(weight_map, 0.0, 1.0)
-    return ((1.0 - alpha) * base + alpha * refinement_map).astype(np.float32)
+    blended = (1.0 - alpha) * base + alpha * refinement_map
+    return np.maximum(base, blended).astype(np.float32)

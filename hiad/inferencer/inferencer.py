@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from types import TracebackType
@@ -27,6 +28,8 @@ from hiad.inferencer.modelmanager import ModelManager
 from hiad.inferencer.refinement import (
     build_routing_map,
     merge_refinement_maps,
+    refinement_blend_weights,
+    refinement_tile_statistics,
     select_refinement_regions,
 )
 from hiad.runtime.contracts import (
@@ -36,18 +39,19 @@ from hiad.runtime.contracts import (
     ImageQualityResult,
     ImageSize,
     InferenceResult,
+    InferenceTiming,
     PatchPrediction,
+    RefinementStatistics,
     ScoreCalibration,
     ScoreVector,
 )
-from hiad.runtime.devices import validate_gpu_ids
 from hiad.runtime.decision import (
-    apply_quality_gate,
     classify_score,
     component_statistics,
     image_score_from_statistics,
     top_k_map_score,
 )
+from hiad.runtime.devices import validate_gpu_ids
 from hiad.runtime.partition import round_robin_partition
 from hiad.runtime.prediction import threshold_anomaly_maps
 from hiad.runtime.quality import assess_image_quality
@@ -59,7 +63,6 @@ from hiad.runtime.score_calibration import (
 )
 from hiad.task import load_tasks
 from hiad.task.contracts import RefinementPatchTask, TaskDefinition
-
 
 RegionsByPath = dict[str, list[HRImageIndex]]
 
@@ -96,13 +99,7 @@ def _gather_patch_predictions(
         valid_height, valid_width = record["valid_source_hw"]
         prediction = np.asarray(prediction, dtype=np.float32)
         # 边缘保底权重避免整图边界或单补丁区域出现零覆盖。
-        row_hann = (
-            np.hanning(height) if height > 1 else np.ones(1, dtype=np.float64)
-        )
-        column_hann = (
-            np.hanning(width) if width > 1 else np.ones(1, dtype=np.float64)
-        )
-        weights = 0.05 + 0.95 * np.outer(row_hann, column_hann)
+        weights = refinement_blend_weights(height, width)
         valid_weights = weights[:valid_height, :valid_width]
         accumulated[y:y + valid_height, x:x + valid_width] += (
             prediction[:valid_height, :valid_width] * valid_weights
@@ -213,7 +210,7 @@ class HRInferencer:
         refinement_task (RefinementPatchTask): 唯一复核任务及候选选择参数。
         model_managers (list[ModelManager]): 各设备已加载的任务模型。
         score_calibration (ScoreCalibration | None): 可选图像、像素和组件阈值。
-        quality_thresholds (dict[str, float]): 曝光、截断比例和清晰度门禁阈值。
+        quality_thresholds (dict[str, float]): 曝光、截断比例和清晰度质量阈值。
     """
 
     def __init__(
@@ -277,9 +274,6 @@ class HRInferencer:
             else None
         )
         self.map_gaussian_sigma: float = float(detector_config.map_gaussian_sigma)
-        self.decision_recheck_margin_ratio: float = float(
-            detector_config.decision_recheck_margin_ratio
-        )
         self.quality_thresholds: dict[str, float] = {
             key: float(detector_config[key])
             for key in (
@@ -293,6 +287,9 @@ class HRInferencer:
             detector_config.global_routing_weight
         )
         self.score_top_k: int = int(detector_config.score_top_k)
+        self.refinement_bridge_gap_tiles: int = int(
+            detector_config.refinement_bridge_gap_tiles
+        )
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=len(task_groups)
         )
@@ -315,7 +312,7 @@ class HRInferencer:
         Returns:
             InferenceResult: 与输入样本同序的原图路径、原图分辨率 ``float32``
             异常图、图像分数和质量结果。启用校准时还包含分类别阈值、组件摘要、
-            ``OK/RECHECK/NG`` 判定、``0/1`` 二值掩码；请求显示图时包含 HWC RGB
+            ``OK/NG`` 判定、``0/1`` 二值掩码；请求显示图时包含 HWC RGB
             ``uint8`` 图像映射。
 
         Raises:
@@ -332,9 +329,13 @@ class HRInferencer:
             if self._closed:
                 raise RuntimeError("HRInferencer is closed")
             self._validate_samples(test_samples)
+            total_started = time.perf_counter()
+            quality_started = time.perf_counter()
             quality_results = self._assess_quality(test_samples)
+            quality_seconds = time.perf_counter() - quality_started
 
             batch_size = self.batch_size or len(test_samples)
+            coarse_started = time.perf_counter()
             worker_results = self._run_inference_groups(
                 test_samples,
                 self.coarse_tasks_in_devices,
@@ -363,11 +364,14 @@ class HRInferencer:
                             raise ValueError(f"Duplicate thumbnail prediction for {path}")
                         merged[path]["thumbnail"] = result["thumbnail"]
                         merged[path]["thumbnail_score"] = result["thumbnail_score"]
+            coarse_seconds = time.perf_counter() - coarse_started
 
             anomaly_maps: list[FloatMap] = []
             global_scores: list[float] = []
+            refinement_statistics: list[RefinementStatistics] = []
             refinement_task = self.refinement_task
             regions_by_path: RegionsByPath = {}
+            routing_started = time.perf_counter()
             for sample in test_samples:
                 path = sample.image.image_path
                 result = merged[path]
@@ -409,16 +413,29 @@ class HRInferencer:
                     tile_size=refinement_task["patch_size"],
                     min_area=refinement_task["refinement_min_area"],
                     safety_fraction=refinement_task["refinement_safety_fraction"],
+                    max_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
+                )
+                refinement_statistics.append(
+                    refinement_tile_statistics(
+                        (image_width, image_height),
+                        refinement_task["patch_size"],
+                        regions_by_path[path],
+                    )
                 )
                 anomaly_maps.append(final_map)
                 global_scores.append(float(result["thumbnail_score"]))
+            routing_seconds = time.perf_counter() - routing_started
 
+            refinement_started = time.perf_counter()
             anomaly_maps = self._apply_refinement(
                 test_samples,
                 anomaly_maps,
                 regions_by_path,
                 batch_size,
             )
+            refinement_seconds = time.perf_counter() - refinement_started
+
+            postprocess_started = time.perf_counter()
             image_scores = np.asarray(
                 [
                     max(top_k_map_score(anomaly_map, self.score_top_k), global_score)
@@ -432,6 +449,7 @@ class HRInferencer:
                 "anomaly_maps": anomaly_maps,
                 "display_images": self._build_display_images(test_samples, display_size),
                 "quality_results": quality_results,
+                "refinement_statistics": refinement_statistics,
             }
             if self.score_calibration is not None:
                 thresholds = thresholds_for_samples(self.score_calibration, test_samples)
@@ -455,11 +473,7 @@ class HRInferencer:
                     else thresholds
                 )
                 decisions = [
-                    classify_score(
-                        score,
-                        threshold,
-                        threshold * self.decision_recheck_margin_ratio,
-                    )
+                    classify_score(score, threshold)
                     for score, threshold in zip(component_scores, decision_thresholds)
                 ]
                 output["decision_thresholds"] = decision_thresholds
@@ -471,24 +485,25 @@ class HRInferencer:
                 output["decision_reasons"] = [
                     "score_at_or_below_threshold"
                     if decision == "OK"
-                    else "score_within_recheck_margin"
-                    if decision == "RECHECK"
-                    else "score_above_recheck_margin"
+                    else "score_above_threshold"
                     for decision in decisions
                 ]
                 output["component_summaries"] = component_summaries
-                for index, quality in enumerate(quality_results):
-                    decisions[index], quality_reason = apply_quality_gate(
-                        decisions[index],
-                        quality["reasons"],
-                    )
-                    if quality_reason is not None:
-                        output["decision_reasons"][index] = quality_reason
                 output["is_defect"] = [decision == "NG" for decision in decisions]
                 output["pixel_thresholds"] = pixel_thresholds
                 output["binary_anomaly_maps"] = threshold_anomaly_maps(
-                    anomaly_maps, pixel_thresholds
+                    anomaly_maps,
+                    pixel_thresholds,
                 )
+            postprocess_seconds = time.perf_counter() - postprocess_started
+            output["inference_timing"] = InferenceTiming(
+                quality_seconds=quality_seconds,
+                coarse_seconds=coarse_seconds,
+                routing_seconds=routing_seconds,
+                refinement_seconds=refinement_seconds,
+                postprocess_seconds=postprocess_seconds,
+                total_seconds=time.perf_counter() - total_started,
+            )
             return output
 
     def score_samples(self, test_samples: list[HRSample]) -> ScoreVector:
@@ -624,7 +639,7 @@ class HRInferencer:
         self,
         test_samples: list[HRSample],
     ) -> list[ImageQualityResult]:
-        """逐图执行采集质量检查；质量问题不直接判为缺陷。
+        """逐图执行采集质量检查；质量问题不改变模型 OK/NG 判定。
 
         Args:
             test_samples (list[HRSample]): 已通过基础输入校验的样本。
@@ -638,8 +653,7 @@ class HRInferencer:
             ValueError: RGB 图像、前景掩码或质量阈值不符合约定。
 
         Notes:
-            质量原因仅能在最终阶段把 ``OK`` 提升为 ``RECHECK``，不会直接产生
-            ``NG``，也不会覆盖模型已经给出的 ``NG``。
+            质量状态和原因独立落盘，供采集链路处理；它们不会覆盖模型判定。
         """
         results: list[ImageQualityResult] = []
         for sample in test_samples:

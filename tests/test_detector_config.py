@@ -42,8 +42,8 @@ def test_default_config_declares_every_required_production_setting():
     [
         ("semantic_weight", -0.1, "evidence weights"),
         ("global_routing_weight", 1.1, "global_routing_weight"),
+        ("refinement_bridge_gap_tiles", -1, "refinement_bridge_gap_tiles"),
         ("normal_component_percentile", 1.0, "normal_component_percentile"),
-        ("decision_recheck_margin_ratio", 1.1, "decision_recheck_margin_ratio"),
         ("min_mean_luminance", 0.99, "luminance thresholds"),
         ("min_focus_variance", float("nan"), "min_focus_variance"),
     ],

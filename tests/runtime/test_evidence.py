@@ -1,7 +1,7 @@
-import numpy as np
 import pytest
 import torch
 
+import hiad.runtime.evidence as evidence_module
 from hiad.runtime.evidence import (
     denormalize_imagenet_batch,
     fuse_evidence_tensors,
@@ -39,6 +39,18 @@ def test_high_frequency_uses_denormalized_production_input():
 
     torch.testing.assert_close(restored, raw)
     torch.testing.assert_close(high_frequency_map(restored), high_frequency_map(raw))
+
+
+def test_cached_evidence_constants_remain_usable_after_inference_mode():
+    evidence_module._imagenet_constants.cache_clear()
+    evidence_module._high_frequency_kernels.cache_clear()
+    with torch.inference_mode():
+        high_frequency_map(torch.zeros((1, 3, 5, 5)))
+
+    image = torch.zeros((1, 3, 5, 5), requires_grad=True)
+    high_frequency_map(denormalize_imagenet_batch(image)).sum().backward()
+
+    assert image.grad is not None
 
 
 def test_tensor_fusion_preserves_device_shape_and_safety_contribution():
