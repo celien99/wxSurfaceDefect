@@ -147,10 +147,10 @@ class DeviceImagePipeline:
                 * (1 + context_views)
                 * 4
             )
-            records = max(1, budget_bytes // max(1, per_record))
+            records = max(1, budget_bytes // max(1, int(per_record)))
         if self.batch_cap > 0:
             records = min(records, self.batch_cap)
-        return records
+        return int(records)
 
     def _chunk_batch(self, batch: Mapping[str, object], chunk_size: int):
         """把批量字典切成自适应子批，返回 ``(chunk, start, stop)`` 序列。
