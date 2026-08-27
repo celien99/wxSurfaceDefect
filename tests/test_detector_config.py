@@ -40,6 +40,7 @@ def test_default_config_declares_every_required_production_setting():
 @pytest.mark.parametrize(
     ("key", "value", "match"),
     [
+        ("backbone_weights_path", 123, "backbone_weights_path must be a string"),
         ("semantic_weight", -0.1, "evidence weights"),
         ("global_routing_weight", 1.1, "global_routing_weight"),
         ("refinement_bridge_gap_tiles", -1, "refinement_bridge_gap_tiles"),

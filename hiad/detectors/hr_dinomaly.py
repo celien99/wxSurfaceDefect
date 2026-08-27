@@ -175,6 +175,7 @@ class HRDinomaly(BaseDetector):
         memory_weight: float = 0.3,
         high_frequency_weight: float = 0.1,
         use_context_conditioning: bool = True,
+        backbone_weights_path: str | None = None,
         **_: object,
     ) -> None:
         total_iters = _positive_int(total_iters, "total_iters")
@@ -241,6 +242,7 @@ class HRDinomaly(BaseDetector):
             model_name=backbone_name,
             intermediate_layers=self.target_layers,
             use_fp16=self.encoder_amp,
+            weights_path=backbone_weights_path or None,
         )
         embed_dim = self.encoder.embed_dim
         if embed_dim == 384:

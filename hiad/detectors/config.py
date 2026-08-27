@@ -23,6 +23,8 @@ class DetectorConfig(Protocol):
 
     Attributes:
         backbone_name (str): ``timm`` DINOv3 主干名称。
+        backbone_weights_path (str): DINOv3 主干本地权重 ``.pth`` 文件路径；
+            空字符串表示开发回退，允许 ``timm`` 联网下载预训练权重。
         total_iters (int): 补丁任务配置训练迭代数。
         thumbnail_total_iters (int): 缩略图任务配置训练迭代数。
         log_per_steps (int): 训练日志间隔。
@@ -56,6 +58,7 @@ class DetectorConfig(Protocol):
     """
 
     backbone_name: str
+    backbone_weights_path: str
     total_iters: int
     thumbnail_total_iters: int
     log_per_steps: int
@@ -92,6 +95,7 @@ class DetectorConfig(Protocol):
 
 REQUIRED_CONFIG_KEYS: Final = (
     "backbone_name",
+    "backbone_weights_path",
     "total_iters",
     "thumbnail_total_iters",
     "log_per_steps",
@@ -196,6 +200,8 @@ def validate_required_config(config: object) -> None:
     values = {key: _config_value(config, key) for key in REQUIRED_CONFIG_KEYS}
     if not isinstance(values["backbone_name"], str) or not values["backbone_name"].strip():
         raise ValueError("backbone_name must be a non-empty string")
+    if not isinstance(values["backbone_weights_path"], str):
+        raise ValueError("backbone_weights_path must be a string")
     for key in (
         "total_iters",
         "thumbnail_total_iters",

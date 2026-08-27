@@ -1,5 +1,10 @@
 # Dinomaly training and calibration defaults.
 backbone_name: vit_base_patch16_dinov3.lvd1689m
+# Local DINOv3 backbone weights (.pth) exported by runs/export_backbone.py.
+# Industrial machines are offline: ship this file with the deployment package and
+# point at it here. Leave empty only for networked development, which falls back
+# to timm downloading the pretrained weights on first use.
+backbone_weights_path: ""
 total_iters: 300
 thumbnail_total_iters: 100
 log_per_steps: 10
