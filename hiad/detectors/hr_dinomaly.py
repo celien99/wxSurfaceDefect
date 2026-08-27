@@ -18,6 +18,7 @@ from hiad.models import (
     NormalFeatureMemory,
     TimmDinoV3Encoder,
 )
+from hiad.runtime import mapops
 from hiad.runtime.contracts import DetectorPrediction
 from hiad.runtime.evidence import (
     denormalize_imagenet_batch,
@@ -682,44 +683,58 @@ class HRDinomaly(BaseDetector):
                     break
 
     @torch.inference_mode()
+    def inference_batch(
+        self,
+        data: DetectorBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """在检测器设备上计算融合异常图与 token 图，不做任何 CPU 往返。
+
+        Args:
+            data (DetectorBatch): 含 ``image``（BCHW）及可选
+                ``low_resolution_image_<n>``/``low_resolution_index_<n>`` 的批次。
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: ``(fused_pixel, fused_token)``，
+            均为设备驻留张量；前者形状 ``(batch, 1, patch_h, patch_w)``，
+            后者为编码器 token 分辨率。由调用方决定何时（以及是否）拷贝回 CPU。
+        """
+        self.model.eval()
+        if self.context_conditioner is not None:
+            self.context_conditioner.eval()
+        main_features, context_features = self.get_multi_resolution_embeddings(data)
+        conditioned_features = self._condition_features(
+            main_features,
+            context_features,
+        )
+        semantic_encoder, semantic_decoder = self.model.distillation(
+            list(conditioned_features)
+        )
+        fused_pixel, fused_token = self._fused_evidence(
+            data,
+            conditioned_features,
+            semantic_encoder,
+            semantic_decoder,
+        )
+        return fused_pixel, fused_token
+
+    @torch.inference_mode()
     def inference_step(
         self,
         test_dataloader: DataLoader[Any],
     ) -> list[DetectorPrediction]:
         """按 DataLoader 顺序生成融合异常图和 Top-K token 图像分数。
 
-        Args:
-            test_dataloader (DataLoader[Any]): 不打乱的模型输入批次加载器。
-
-        Returns:
-            list[DetectorPrediction]: 每个输入对应一个模型输入分辨率二维
-            ``float32`` 异常图和标量 Top-K token 分数。
-
-        Raises:
-            RuntimeError: 正常证据或特征内存未从检查点恢复。
-            ValueError: 输入批次、特征层或 token 图形状不符合契约。
+        本方法委托 :meth:`inference_batch` 并在每次批次末尾拷贝回 CPU；训练与
+        校准路径保留该 DataLoader 入口，推理热路径使用 :meth:`inference_batch`
+        避免逐批 CPU 往返。
         """
-        self.model.eval()
-        if self.context_conditioner is not None:
-            self.context_conditioner.eval()
         predictions: list[DetectorPrediction] = []
         for data in test_dataloader:
-            main_features, context_features = self.get_multi_resolution_embeddings(data)
-            conditioned_features = self._condition_features(
-                main_features,
-                context_features,
-            )
-            semantic_encoder, semantic_decoder = self.model.distillation(
-                list(conditioned_features)
-            )
-            anomaly_map, token_map = self._fused_evidence(
-                data,
-                conditioned_features,
-                semantic_encoder,
-                semantic_decoder,
-            )
-            pixel_batch = anomaly_map[:, 0].cpu().numpy()
-            score_batch = self._top_k_token_scores(token_map, self.score_top_k).cpu().numpy()
+            fused_pixel, fused_token = self.inference_batch(data)
+            pixel_batch = fused_pixel[:, 0].cpu().numpy()
+            score_batch = mapops.top_k_token_scores_torch(
+                fused_token, self.score_top_k
+            ).cpu().numpy()
             predictions.extend(
                 {
                     "anomaly_map": pixel_map,
@@ -805,24 +820,8 @@ class HRDinomaly(BaseDetector):
 
     @staticmethod
     def _top_k_token_scores(token_maps: torch.Tensor, top_k: int) -> torch.Tensor:
-        """按样本聚合最高异常 token 的均值。
-
-        Args:
-            token_maps (torch.Tensor): ``(batch, 1, height, width)`` token 异常图。
-            top_k (int): 参与均值的最高分 token 数；超过总数时使用全部 token。
-
-        Returns:
-            torch.Tensor: ``(batch,)`` 图像级异常分数。
-
-        Raises:
-            ValueError: ``top_k`` 不是正整数或 token 图不是单通道 BCHW。
-        """
-        top_k = _positive_int(top_k, "top_k")
-        if token_maps.ndim != 4 or token_maps.shape[1] != 1:
-            raise ValueError("token_maps must have shape [batch, 1, height, width]")
-        values = token_maps.flatten(start_dim=1)
-        count = min(top_k, values.shape[1])
-        return torch.topk(values, k=count, dim=1).values.mean(dim=1)
+        """按样本聚合最高异常 token 的均值（委托 ``mapops``）。"""
+        return mapops.top_k_token_scores_torch(token_maps, top_k)
 
     def save_checkpoint(
         self,
