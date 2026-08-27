@@ -54,18 +54,65 @@ def _compare(results_new, results_legacy, tolerance: float) -> dict:
             if new != legacy:
                 flips += 1
                 print(f"DECISION FLIP {path}: legacy={legacy} pipeline={new}")
+
     maps_new = results_new["anomaly_maps"]
     maps_legacy = results_legacy["anomaly_maps"]
-    max_abs_diff = 0.0
+    per_path_diffs: list[tuple[str, float]] = []
     for path, new, legacy in zip(
         results_new["image_paths"], maps_new, maps_legacy
     ):
         if new.shape != legacy.shape:
             raise ValueError(f"Shape mismatch for {path}")
-        max_abs_diff = max(max_abs_diff, float(np.abs(new - legacy).max()))
+        per_path_diffs.append((path, float(np.abs(new - legacy).max())))
+    per_path_diffs.sort(key=lambda item: -item[1])
+    max_abs_diff = per_path_diffs[0][1] if per_path_diffs else 0.0
+    print("--- Top-5 anomaly-map max_abs_diff per image ---")
+    for path, diff in per_path_diffs[:5]:
+        print(f"ANOMALY_MAP MAX_ABS_DIFF {diff:.6f} {path}")
+
+    # 精修区域选择对比：selected_tiles 不一致说明复核区域集合不同，
+    # 是 max_abs_diff 的主要来源（micro 复核值与粗扫值差异显著）。
+    stats_new = results_new.get("refinement_statistics") or []
+    stats_legacy = results_legacy.get("refinement_statistics") or []
+    tile_mismatches = 0
+    print("--- Refinement tile selection (legacy vs pipeline) ---")
+    for path, sn, sl in zip(
+        results_new["image_paths"], stats_new, stats_legacy
+    ):
+        if sn["selected_tiles"] != sl["selected_tiles"] or sn["total_tiles"] != sl["total_tiles"]:
+            tile_mismatches += 1
+            print(
+                f"REFINEMENT_TILE_MISMATCH {path}: "
+                f"legacy={sl['selected_tiles']}/{sl['total_tiles']} "
+                f"pipeline={sn['selected_tiles']}/{sn['total_tiles']}"
+            )
+    if tile_mismatches == 0:
+        print("All refinement tile selections identical (selected_tiles == total_tiles)")
+
+    # 二值掩码一致率（spec §3.8 要求 100%）：存在校准且产出掩码时统计像素级翻转。
+    mask_flip_pixels = None
+    mask_total_pixels = None
+    bin_new = results_new.get("binary_anomaly_maps")
+    bin_legacy = results_legacy.get("binary_anomaly_maps")
+    if bin_new is not None and bin_legacy is not None:
+        mask_flip_pixels = 0
+        mask_total_pixels = 0
+        for new, legacy in zip(bin_new, bin_legacy):
+            if new.shape != legacy.shape:
+                raise ValueError("Binary anomaly mask shape mismatch")
+            mask_total_pixels += int(new.size)
+            mask_flip_pixels += int(np.count_nonzero(new != legacy))
+        print(
+            f"BINARY_MASK FLIP PIXELS: {mask_flip_pixels}/{mask_total_pixels}"
+        )
+
     return {
         "decision_flips": flips,
         "max_abs_diff": max_abs_diff,
+        "worst_path": per_path_diffs[0][0] if per_path_diffs else None,
+        "refinement_tile_mismatches": tile_mismatches,
+        "binary_mask_flip_pixels": mask_flip_pixels,
+        "binary_mask_total_pixels": mask_total_pixels,
         "passed": flips == 0 and max_abs_diff < tolerance,
     }
 
