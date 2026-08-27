@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
@@ -29,13 +30,25 @@ class HRImage:
             ``uint8``，掩码为 ``(H, W)`` ``uint8``；关闭时为 ``None``。
     """
 
-    def __init__(self, image_path: str, is_mask: bool = False) -> None:
-        self.image_path: str = image_path
+    def __init__(self, image_path: str | UInt8Array, is_mask: bool = False) -> None:
         self.is_mask: bool = is_mask
         self.image: UInt8Array | None = None
+        if isinstance(image_path, np.ndarray):
+            self._array_source: UInt8Array | None = np.asarray(
+                image_path, dtype=np.uint8
+            )
+            self.image = self._array_source
+            self.image_path = f"<array:{uuid.uuid4().hex}>"
+        else:
+            self._array_source = None
+            self.image_path = image_path
 
     def open(self) -> None:
-        """使用 PIL 解码，业务图像始终转为 RGB，掩码转为单通道。"""
+        """解码数组；内存数组已就地打开，磁盘路径使用 PIL 解码。"""
+        if self._array_source is not None:
+            if self.image is None:
+                self.image = self._array_source
+            return
         if self.is_mask:
             with Image.open(self.image_path) as image_file:
                 self.image = np.array(image_file.convert("L"), copy=True)
@@ -46,6 +59,11 @@ class HRImage:
     def close(self) -> None:
         """释放当前解码数组，保留文件路径以便后续重新打开。"""
         self.image = None
+
+    @classmethod
+    def from_array(cls, image: UInt8Array, *, is_mask: bool = False) -> HRImage:
+        """从内存数组构造图像，不涉及任何磁盘读写。"""
+        return cls(np.asarray(image, dtype=np.uint8), is_mask=is_mask)
 
     def size(self) -> tuple[int, int]:
         """返回 OpenCV/PIL 通用的 ``(width, height)`` 尺寸。"""
@@ -235,6 +253,35 @@ class HRSample:
         )
         if not isinstance(image.image_path, str) or not isinstance(foreground_path, str):
             return image
+
+        image_from_array = image._array_source is not None
+        foreground_from_array = (
+            isinstance(foreground, HRImage) and foreground._array_source is not None
+        )
+        if image_from_array or foreground_from_array:
+            # 内存数组路径：仅当源图与前景都是内存数组时合成，不落盘；混合输入
+            # （数组 + 磁盘路径）原样返回，避免引入磁盘 I/O。
+            if not (image_from_array and foreground_from_array):
+                return image
+            source_image = image.image
+            foreground_image = (
+                foreground.image if isinstance(foreground, HRImage) else None
+            )
+            if source_image is None or foreground_image is None:
+                return image
+            source_height, source_width = source_image.shape[:2]
+            if foreground_image.shape != (source_height, source_width):
+                foreground_image = cv2.resize(
+                    foreground_image,
+                    (source_width, source_height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            clean_image = cv2.bitwise_and(
+                source_image,
+                source_image,
+                mask=foreground_image,
+            )
+            return HRImage.from_array(clean_image)
 
         try:
             source_path = Path(image.image_path).expanduser().resolve()
