@@ -13,7 +13,6 @@ import numpy as np
 import torch
 from easydict import EasyDict
 from scipy.ndimage import gaussian_filter
-from tqdm import tqdm
 
 from hiad.constants import (
     TASK_TYPE_DYNAMIC_PATCH,
@@ -25,6 +24,7 @@ from hiad.datasets import StreamingTaskDataset
 from hiad.detectors.base import BaseDetector
 from hiad.detectors.config import DetectorConfig, validate_required_config
 from hiad.inferencer.modelmanager import ModelManager
+from hiad.inferencer.pipeline import DeviceImagePipeline, ImagePipelineOutput
 from hiad.inferencer.refinement import (
     build_routing_map,
     merge_refinement_maps,
@@ -52,6 +52,7 @@ from hiad.runtime.decision import (
     top_k_map_score,
 )
 from hiad.runtime.devices import validate_gpu_ids
+from hiad.runtime.inference_config import InferenceConfig, load_inference_config
 from hiad.runtime.partition import round_robin_partition
 from hiad.runtime.prediction import threshold_anomaly_maps
 from hiad.runtime.quality import assess_image_quality
@@ -242,7 +243,7 @@ class HRInferencer:
             raise FileNotFoundError(f"Task configuration not found: {tasks_path}")
         tasks = load_tasks(tasks_path)
 
-        task_groups = [group for group in round_robin_partition(tasks, len(gpu_ids)) if group]
+        task_groups = round_robin_partition(tasks, len(gpu_ids))
 
         self.coarse_tasks_in_devices: list[list[TaskDefinition]] = [
             [task for task in task_group if task["type"] != TASK_TYPE_REFINEMENT_PATCH]
@@ -258,6 +259,12 @@ class HRInferencer:
             if task["type"] == TASK_TYPE_REFINEMENT_PATCH
         ]
         self.refinement_task: RefinementPatchTask = refinement_tasks[0]
+        # 新逐图路径要求每设备可跑完整粗到细链路；legacy 设备分组与模型
+        # 管理器按设备索引同序对齐（空组由 _run_inference_groups 跳过）。
+        self.coarse_task_definitions: list[TaskDefinition] = [
+            task for task in tasks if task["type"] != TASK_TYPE_REFINEMENT_PATCH
+        ]
+        self.inference_config: InferenceConfig = load_inference_config(normalized_config)
         self.model_managers: list[ModelManager] = [
             ModelManager(
                 tasks,
@@ -266,7 +273,7 @@ class HRInferencer:
                 checkpoint_root,
                 gpu_ids[index],
             )
-            for index, tasks in enumerate(tqdm(task_groups, desc="Loading checkpoints..."))
+            for index in range(len(gpu_ids))
         ]
         self.score_calibration: ScoreCalibration | None = (
             load_score_calibration(checkpoint_root)
@@ -291,7 +298,7 @@ class HRInferencer:
             detector_config.refinement_bridge_gap_tiles
         )
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
-            max_workers=len(task_groups)
+            max_workers=len(gpu_ids)
         )
         self._inference_lock = Lock()
         self._closed: bool = False
@@ -301,6 +308,7 @@ class HRInferencer:
         test_samples: list[HRSample],
         *,
         display_size: int | list[int] | tuple[int, int] | None = None,
+        use_pipeline: bool = True,
     ) -> InferenceResult:
         """按固定样本顺序执行完整粗到细推理并返回稳定结果结构。
 
@@ -308,6 +316,8 @@ class HRInferencer:
             test_samples (list[HRSample]): 非空、路径唯一且 ``clsname`` 非空的样本。
             display_size (int | list[int] | tuple[int, int] | None): 可选显示图尺寸；
                 整数表示正方形，二元序列按 ``(width, height)`` 解释。
+            use_pipeline (bool): 为 ``True`` 时走逐图 GPU 驻留路径（默认）；为
+                ``False`` 时走旧 DataLoader 参照路径（parity 对比 / 回退）。
 
         Returns:
             InferenceResult: 与输入样本同序的原图路径、原图分辨率 ``float32``
@@ -334,106 +344,14 @@ class HRInferencer:
             quality_results = self._assess_quality(test_samples)
             quality_seconds = time.perf_counter() - quality_started
 
-            batch_size = self.batch_size or len(test_samples)
-            coarse_started = time.perf_counter()
-            worker_results = self._run_inference_groups(
-                test_samples,
-                self.coarse_tasks_in_devices,
-                batch_size,
-            )
-
-            merged: DeviceInferenceResults = {
-                sample.image.image_path: {
-                    "image_size": None,
-                    "patches": [],
-                    "thumbnail": None,
-                    "thumbnail_score": None,
-                }
-                for sample in test_samples
-            }
-            for worker_result in worker_results:
-                for path, result in worker_result.items():
-                    if result["image_size"] is not None:
-                        current_size = merged[path]["image_size"]
-                        if current_size is not None and current_size != result["image_size"]:
-                            raise ValueError(f"Task image sizes disagree for {path}")
-                        merged[path]["image_size"] = result["image_size"]
-                    merged[path]["patches"].extend(result["patches"])
-                    if result["thumbnail"] is not None:
-                        if merged[path]["thumbnail"] is not None:
-                            raise ValueError(f"Duplicate thumbnail prediction for {path}")
-                        merged[path]["thumbnail"] = result["thumbnail"]
-                        merged[path]["thumbnail_score"] = result["thumbnail_score"]
-            coarse_seconds = time.perf_counter() - coarse_started
-
-            anomaly_maps: list[FloatMap] = []
-            global_scores: list[float] = []
-            refinement_statistics: list[RefinementStatistics] = []
-            refinement_task = self.refinement_task
-            regions_by_path: RegionsByPath = {}
-            routing_started = time.perf_counter()
-            for sample in test_samples:
-                path = sample.image.image_path
-                result = merged[path]
-                if result["image_size"] is None or not result["patches"]:
-                    raise ValueError(f"Incomplete dynamic patch prediction for {path}")
-                patch_map = _gather_patch_predictions(result["patches"], result["image_size"])
-                final_map = patch_map
-                if (
-                    result["thumbnail"] is None
-                    or result["thumbnail_score"] is None
-                ):
-                    raise ValueError(f"Incomplete global context prediction for {path}")
-                image_width, image_height = result["image_size"]
-                global_context_map = cv2.resize(
-                    np.asarray(result["thumbnail"], dtype=np.float32),
-                    (image_width, image_height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                if self.map_gaussian_sigma > 0:
-                    final_map = gaussian_filter(
-                        final_map,
-                        sigma=self.map_gaussian_sigma,
-                    )
-                final_map = np.asarray(final_map, dtype=np.float32)
-                # 缩略图只参与候选路由；最终异常证据仍来自原图补丁与复核结果。
-                routing_map = build_routing_map(
-                    final_map,
-                    global_context_map,
-                    self.global_routing_weight,
-                )
-                regions_by_path[path] = select_refinement_regions(
-                    routing_map,
-                    threshold=float(
-                        np.quantile(
-                            routing_map,
-                            refinement_task["refinement_quantile"],
-                        )
-                    ),
-                    tile_size=refinement_task["patch_size"],
-                    min_area=refinement_task["refinement_min_area"],
-                    safety_fraction=refinement_task["refinement_safety_fraction"],
-                    max_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
-                )
-                refinement_statistics.append(
-                    refinement_tile_statistics(
-                        (image_width, image_height),
-                        refinement_task["patch_size"],
-                        regions_by_path[path],
-                    )
-                )
-                anomaly_maps.append(final_map)
-                global_scores.append(float(result["thumbnail_score"]))
-            routing_seconds = time.perf_counter() - routing_started
-
-            refinement_started = time.perf_counter()
-            anomaly_maps = self._apply_refinement(
-                test_samples,
-                anomaly_maps,
-                regions_by_path,
-                batch_size,
-            )
-            refinement_seconds = time.perf_counter() - refinement_started
+            if use_pipeline:
+                coarse_seconds, routing_seconds, refinement_seconds, (
+                    anomaly_maps, global_scores, refinement_statistics,
+                ) = self._inference_pipeline(test_samples)
+            else:
+                coarse_seconds, routing_seconds, refinement_seconds, (
+                    anomaly_maps, global_scores, refinement_statistics,
+                ) = self._inference_legacy(test_samples)
 
             postprocess_started = time.perf_counter()
             image_scores = np.asarray(
@@ -505,6 +423,180 @@ class HRInferencer:
                 total_seconds=time.perf_counter() - total_started,
             )
             return output
+
+    def _inference_legacy(
+        self,
+        test_samples: list[HRSample],
+    ) -> tuple[
+        float,
+        float,
+        float,
+        tuple[list[FloatMap], list[float], list[RefinementStatistics]],
+    ]:
+        """旧 DataLoader 路径（保留为 parity 参照与回退开关）。
+
+        逻辑为重构前 ``inference()`` 的粗扫→合并→路由→复核→融合主体，逐字
+        保留；判定与显示等后处理仍由 ``inference()`` 统一完成。
+        """
+        batch_size = self.batch_size or len(test_samples)
+        coarse_started = time.perf_counter()
+        worker_results = self._run_inference_groups(
+            test_samples,
+            self.coarse_tasks_in_devices,
+            batch_size,
+        )
+
+        merged: DeviceInferenceResults = {
+            sample.image.image_path: {
+                "image_size": None,
+                "patches": [],
+                "thumbnail": None,
+                "thumbnail_score": None,
+            }
+            for sample in test_samples
+        }
+        for worker_result in worker_results:
+            for path, result in worker_result.items():
+                if result["image_size"] is not None:
+                    current_size = merged[path]["image_size"]
+                    if current_size is not None and current_size != result["image_size"]:
+                        raise ValueError(f"Task image sizes disagree for {path}")
+                    merged[path]["image_size"] = result["image_size"]
+                merged[path]["patches"].extend(result["patches"])
+                if result["thumbnail"] is not None:
+                    if merged[path]["thumbnail"] is not None:
+                        raise ValueError(f"Duplicate thumbnail prediction for {path}")
+                    merged[path]["thumbnail"] = result["thumbnail"]
+                    merged[path]["thumbnail_score"] = result["thumbnail_score"]
+        coarse_seconds = time.perf_counter() - coarse_started
+
+        anomaly_maps: list[FloatMap] = []
+        global_scores: list[float] = []
+        refinement_statistics: list[RefinementStatistics] = []
+        regions_by_path: RegionsByPath = {}
+        routing_started = time.perf_counter()
+        for sample in test_samples:
+            path = sample.image.image_path
+            result = merged[path]
+            if result["image_size"] is None or not result["patches"]:
+                raise ValueError(f"Incomplete dynamic patch prediction for {path}")
+            patch_map = _gather_patch_predictions(result["patches"], result["image_size"])
+            final_map = patch_map
+            if (
+                result["thumbnail"] is None
+                or result["thumbnail_score"] is None
+            ):
+                raise ValueError(f"Incomplete global context prediction for {path}")
+            image_width, image_height = result["image_size"]
+            global_context_map = cv2.resize(
+                np.asarray(result["thumbnail"], dtype=np.float32),
+                (image_width, image_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            if self.map_gaussian_sigma > 0:
+                final_map = gaussian_filter(
+                    final_map,
+                    sigma=self.map_gaussian_sigma,
+                )
+            final_map = np.asarray(final_map, dtype=np.float32)
+            # 缩略图只参与候选路由；最终异常证据仍来自原图补丁与复核结果。
+            routing_map = build_routing_map(
+                final_map,
+                global_context_map,
+                self.global_routing_weight,
+            )
+            regions_by_path[path] = select_refinement_regions(
+                routing_map,
+                threshold=float(
+                    np.quantile(
+                        routing_map,
+                        self.refinement_task["refinement_quantile"],
+                    )
+                ),
+                tile_size=self.refinement_task["patch_size"],
+                min_area=self.refinement_task["refinement_min_area"],
+                safety_fraction=self.refinement_task["refinement_safety_fraction"],
+                max_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
+            )
+            refinement_statistics.append(
+                refinement_tile_statistics(
+                    (image_width, image_height),
+                    self.refinement_task["patch_size"],
+                    regions_by_path[path],
+                )
+            )
+            anomaly_maps.append(final_map)
+            global_scores.append(float(result["thumbnail_score"]))
+        routing_seconds = time.perf_counter() - routing_started
+
+        refinement_started = time.perf_counter()
+        anomaly_maps = self._apply_refinement(
+            test_samples,
+            anomaly_maps,
+            regions_by_path,
+            batch_size,
+        )
+        refinement_seconds = time.perf_counter() - refinement_started
+        return (
+            coarse_seconds,
+            routing_seconds,
+            refinement_seconds,
+            (anomaly_maps, global_scores, refinement_statistics),
+        )
+
+    def _inference_pipeline(
+        self,
+        test_samples: list[HRSample],
+    ) -> tuple[
+        float,
+        float,
+        float,
+        tuple[list[FloatMap], list[float], list[RefinementStatistics]],
+    ]:
+        """逐图 GPU 驻留路径：按图把样本均分到各设备，每设备跑完整链路。"""
+        batch_size = self.batch_size or len(test_samples)
+        pipelines = [
+            DeviceImagePipeline(
+                manager.detectors,
+                self.coarse_task_definitions,
+                self.refinement_task,
+                inference_config=self.inference_config,
+                global_routing_weight=self.global_routing_weight,
+                score_top_k=self.score_top_k,
+                refinement_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
+                map_gaussian_sigma=self.map_gaussian_sigma,
+                batch_cap=batch_size,
+            )
+            for manager in self.model_managers
+        ]
+
+        device_samples: list[list[HRSample]] = [[] for _ in pipelines]
+        for index, sample in enumerate(test_samples):
+            device_samples[index % len(pipelines)].append(sample)
+
+        pending = [
+            self._executor.submit(pipeline.process_images, samples)
+            for pipeline, samples in zip(pipelines, device_samples)
+            if samples
+        ]
+        worker_outputs = [future.result() for future in pending]
+        flat = [output for outputs in worker_outputs for output in outputs]
+        by_path = {output.image_path: output for output in flat}
+        ordered: list[ImagePipelineOutput] = [
+            by_path[sample.image.image_path] for sample in test_samples
+        ]
+        anomaly_maps = [output.final_map for output in ordered]
+        global_scores = [output.thumbnail_score for output in ordered]
+        refinement_statistics = [output.refinement_statistics for output in ordered]
+        coarse_seconds = sum(output.coarse_seconds for output in ordered)
+        routing_seconds = sum(output.routing_seconds for output in ordered)
+        refinement_seconds = sum(output.refinement_seconds for output in ordered)
+        return (
+            coarse_seconds,
+            routing_seconds,
+            refinement_seconds,
+            (anomaly_maps, global_scores, refinement_statistics),
+        )
 
     def score_samples(self, test_samples: list[HRSample]) -> ScoreVector:
         """通过完整粗到细链路计算图像分数，不提供绕过复核的捷径。
