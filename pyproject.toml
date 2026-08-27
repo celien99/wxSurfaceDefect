@@ -73,6 +73,7 @@ files = [
     "hiad/runtime",
     "hiad/task",
     "hiad/trainer",
+    "hiad/utils/fusion",
     "runs",
     "tests/typecheck/contracts_usage.py",
 ]
