@@ -114,9 +114,14 @@ def _install_timing(async_pipeline: bool = False) -> None:
                 end_event.synchronize()
                 wall_ms = (time.perf_counter() - cpu_started) * 1000.0
                 gpu_busy = start_event.elapsed_time(end_event)
-                # 某些 torch/CUDA 组合的 elapsed_time 实际返回微秒；毫秒下不可能
-                # 超过调用墙钟 5 倍，超出的按微秒换算（训练机实测 41,716% 即此）。
-                if gpu_busy > wall_ms * 5:
+                # elapsed_time 的单位在各 torch/CUDA/驱动组合下并不一致（文档为
+                # 毫秒，但训练机实测为微秒乃至纳秒）。毫秒下 GPU busy 不可能超过
+                # 调用墙钟（CPU 在同步处等 GPU），故用墙钟做锚点：把报告值反复
+                # 除以 1000 直到落在墙钟的合理倍数内，一步归一掉 μs/ns 单位。
+                # 上限 4 次覆盖 ms→μs→ns→ps，也防住无界单位导致死循环。
+                for _ in range(4):
+                    if gpu_busy <= wall_ms * 5:
+                        break
                     gpu_busy = gpu_busy / 1000.0
             else:
                 gpu_busy = 0.0
