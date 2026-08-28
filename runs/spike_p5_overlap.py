@@ -36,7 +36,12 @@ if parent_dir not in sys.path:
 
 import torch
 
-from hiad.data import HRSample, HRImageIndex, read_jsonl_records
+from hiad.data import (
+    HRSample,
+    HRImageIndex,
+    build_multiresolution_region,
+    read_jsonl_records,
+)
 from hiad.data.patch_builder import build_patch_batch
 from hiad.detectors import HRDinomaly
 from hiad.inferencer import HRInferencer
@@ -172,19 +177,26 @@ def _measure(
             pipeline._forward_and_collect(refine_detector, refine_batch, refine_patch)
         )
 
-    s_c = torch.cuda.Stream()
-    s_r = torch.cuda.Stream()
+    # stream 必须建在 pipeline 所在设备上，否则 ``--gpus`` 非当前设备时，
+    # ``stream.synchronize()`` 等的是空 stream，测到的是 CPU 启动时间。
+    s_c = torch.cuda.Stream(device=pipeline.device)
+    s_r = torch.cuda.Stream(device=pipeline.device)
 
     def run(plan: list[tuple[object, torch.cuda.Stream]], streams: list) -> float:
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(pipeline.device)
         started = time.perf_counter()
         for fn, stream in plan:
             with torch.cuda.stream(stream):
                 fn()
         for stream in streams:
             stream.synchronize()
-        torch.cuda.synchronize()
-        return time.perf_counter() - started
+        torch.cuda.synchronize(pipeline.device)
+        elapsed = time.perf_counter() - started
+        # 释放本 run 持有的 GPU 结果，避免跨 repeat/config 累积：否则空闲显存
+        # 单调下降、_records_per_batch 分块随之变细（solo_c 与 par2 分块不同，
+        # 饱和指数失真），且泄漏到 par2 时还可能制造假 OOM。
+        _hold.clear()
+        return elapsed
 
     # 先各跑一次，把 coarse/refine 两套 kernel 都预热，避免首轮编译/加载噪声。
     run([(fwd_c, s_c)], [s_c])
