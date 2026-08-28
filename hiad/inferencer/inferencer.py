@@ -1,46 +1,28 @@
 from __future__ import annotations
 
-import copy
 import os
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from types import TracebackType
 from typing import cast
 
 import cv2
 import numpy as np
-import torch
 from easydict import EasyDict
-from scipy.ndimage import gaussian_filter
 
-from hiad.constants import (
-    TASK_TYPE_DYNAMIC_PATCH,
-    TASK_TYPE_REFINEMENT_PATCH,
-    TASK_TYPE_THUMBNAIL,
-)
-from hiad.data import HRImageIndex, HRSample
-from hiad.datasets import StreamingTaskDataset
+from hiad.constants import TASK_TYPE_REFINEMENT_PATCH
+from hiad.data import HRSample
 from hiad.detectors.base import BaseDetector
 from hiad.detectors.config import DetectorConfig, validate_required_config
 from hiad.inferencer.modelmanager import ModelManager
 from hiad.inferencer.pipeline import DeviceImagePipeline, ImagePipelineOutput
-from hiad.inferencer.refinement import (
-    build_routing_map,
-    merge_refinement_maps,
-    refinement_blend_weights,
-    refinement_tile_statistics,
-    select_refinement_regions,
-)
 from hiad.runtime.contracts import (
-    DeviceInferenceResults,
     FloatMap,
     ImageArray,
     ImageQualityResult,
-    ImageSize,
     InferenceResult,
     InferenceTiming,
-    PatchPrediction,
     RefinementStatistics,
     ScoreCalibration,
     ScoreVector,
@@ -53,7 +35,6 @@ from hiad.runtime.decision import (
 )
 from hiad.runtime.devices import validate_gpu_ids
 from hiad.runtime.inference_config import InferenceConfig, load_inference_config
-from hiad.runtime.partition import round_robin_partition
 from hiad.runtime.prediction import threshold_anomaly_maps
 from hiad.runtime.quality import assess_image_quality
 from hiad.runtime.score_calibration import (
@@ -64,130 +45,6 @@ from hiad.runtime.score_calibration import (
 )
 from hiad.task import load_tasks
 from hiad.task.contracts import RefinementPatchTask, TaskDefinition
-
-RegionsByPath = dict[str, list[HRImageIndex]]
-
-
-def _gather_patch_predictions(
-    patches: list[PatchPrediction],
-    image_size: ImageSize,
-) -> FloatMap:
-    """将原图补丁按坐标和 Hann 权重拼回连续异常图。
-
-    Args:
-        patches (list[PatchPrediction]): 补丁输入记录及对应二维异常图。记录中的
-            ``source_xywh`` 使用原图像素坐标，``valid_source_hw`` 使用
-            ``(height, width)``。
-        image_size (ImageSize): 原图 ``(width, height)``。
-
-    Returns:
-        FloatMap: 原图分辨率 ``(height, width)`` 的连续 ``float32`` 异常图。
-
-    Raises:
-        KeyError: 补丁记录缺少坐标或有效区域字段。
-        ValueError: 补丁不能完整覆盖原图，或预测形状无法与目标区域广播。
-
-    Notes:
-        二维 Hann 权重用于抑制补丁边缘伪影，并增加 ``0.05`` 最低权重以保证
-        单补丁边界和整图外沿仍然得到覆盖。
-    """
-    image_width, image_height = image_size
-    accumulated = np.zeros((image_height, image_width), dtype=np.float64)
-    weight_map = np.zeros((image_height, image_width), dtype=np.float64)
-
-    for record, prediction in patches:
-        x, y, width, height = record["source_xywh"]
-        valid_height, valid_width = record["valid_source_hw"]
-        prediction = np.asarray(prediction, dtype=np.float32)
-        # 边缘保底权重避免整图边界或单补丁区域出现零覆盖。
-        weights = refinement_blend_weights(height, width)
-        valid_weights = weights[:valid_height, :valid_width]
-        accumulated[y:y + valid_height, x:x + valid_width] += (
-            prediction[:valid_height, :valid_width] * valid_weights
-        )
-        weight_map[y:y + valid_height, x:x + valid_width] += valid_weights
-
-    if np.any(weight_map <= 0):
-        raise ValueError("Patch predictions do not cover the complete source image")
-    return (accumulated / weight_map).astype(np.float32)
-
-
-def inference_in_device(
-    test_samples: list[HRSample],
-    task_group: list[TaskDefinition],
-    model_manager: ModelManager,
-    batch_size: int,
-    *,
-    regions_by_path: RegionsByPath | None = None,
-) -> DeviceInferenceResults:
-    """在单设备上执行一组任务，并按原图路径汇总结果。
-
-    Args:
-        test_samples (list[HRSample]): 路径唯一且带类别的推理样本。
-        task_group (list[TaskDefinition]): 分配给当前设备的粗扫、复核或缩略任务。
-        model_manager (ModelManager): 已在当前设备加载任务检查点的模型管理器。
-        batch_size (int): DataLoader 批量大小。
-        regions_by_path (RegionsByPath | None): 复核任务使用的原图 ``xywh`` 区域；
-            ``None`` 表示按任务规则生成整图滑窗。
-
-    Returns:
-        DeviceInferenceResults: 以原图路径为键，累积图像尺寸、补丁异常图和可选
-        缩略图异常图/分数的结果。
-
-    Raises:
-        KeyError: 任务模型或数据记录字段缺失。
-        RuntimeError: 检测器预测数量与数据集输入记录数量不一致。
-        ValueError: 任务类型不受支持，或数据集/模型输入不符合契约。
-    """
-    paths = [sample.image.image_path for sample in test_samples]
-    results: DeviceInferenceResults = {
-        path: {
-            "image_size": None,
-            "patches": [],
-            "thumbnail": None,
-            "thumbnail_score": None,
-        }
-        for path in paths
-    }
-
-    for task in task_group:
-        task_name = task["name"]
-        detector = model_manager.get_detector(task_name)
-        dataset = StreamingTaskDataset(
-            copy.deepcopy(test_samples),
-            task,
-            training=False,
-            regions_by_path=regions_by_path,
-        )
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-        )
-        predictions = detector.inference_step(dataloader)
-        if len(predictions) != len(dataset.records):
-            raise RuntimeError(
-                f"Task {task_name} returned {len(predictions)} predictions for "
-                f"{len(dataset.records)} inputs"
-            )
-
-        if task["type"] in {TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_REFINEMENT_PATCH}:
-            for record, prediction in zip(dataset.records, predictions):
-                path = record["image_path"]
-                results[path]["image_size"] = record["image_size"]
-                results[path]["patches"].append((record, prediction["anomaly_map"]))
-        elif task["type"] == TASK_TYPE_THUMBNAIL:
-            for record, prediction in zip(dataset.records, predictions):
-                path = record["image_path"]
-                results[path]["image_size"] = record["image_size"]
-                results[path]["thumbnail"] = prediction["anomaly_map"]
-                results[path]["thumbnail_score"] = prediction["score"]
-        else:
-            raise ValueError(f"Unsupported task type: {task}")
-
-    return results
 
 
 class HRInferencer:
@@ -204,10 +61,7 @@ class HRInferencer:
             可设为 ``False``。
 
     Attributes:
-        coarse_tasks_in_devices (list[list[TaskDefinition]]): 按设备分配的粗扫和缩略
-            图任务。
-        refinement_tasks_in_devices (list[list[TaskDefinition]]): 按设备分配的复核
-            任务。
+        coarse_task_definitions (list[TaskDefinition]): 粗扫与缩略图任务定义。
         refinement_task (RefinementPatchTask): 唯一复核任务及候选选择参数。
         model_managers (list[ModelManager]): 各设备已加载的任务模型。
         score_calibration (ScoreCalibration | None): 可选图像、像素和组件阈值。
@@ -243,24 +97,12 @@ class HRInferencer:
             raise FileNotFoundError(f"Task configuration not found: {tasks_path}")
         tasks = load_tasks(tasks_path)
 
-        task_groups = round_robin_partition(tasks, len(gpu_ids))
-
-        self.coarse_tasks_in_devices: list[list[TaskDefinition]] = [
-            [task for task in task_group if task["type"] != TASK_TYPE_REFINEMENT_PATCH]
-            for task_group in task_groups
-        ]
-        self.refinement_tasks_in_devices: list[list[TaskDefinition]] = [
-            [task for task in task_group if task["type"] == TASK_TYPE_REFINEMENT_PATCH]
-            for task_group in task_groups
-        ]
         refinement_tasks = [
             cast(RefinementPatchTask, task)
             for task in tasks
             if task["type"] == TASK_TYPE_REFINEMENT_PATCH
         ]
         self.refinement_task: RefinementPatchTask = refinement_tasks[0]
-        # 新逐图路径要求每设备可跑完整粗到细链路；legacy 设备分组与模型
-        # 管理器按设备索引同序对齐（空组由 _run_inference_groups 跳过）。
         self.coarse_task_definitions: list[TaskDefinition] = [
             task for task in tasks if task["type"] != TASK_TYPE_REFINEMENT_PATCH
         ]
@@ -308,7 +150,6 @@ class HRInferencer:
         test_samples: list[HRSample],
         *,
         display_size: int | list[int] | tuple[int, int] | None = None,
-        use_pipeline: bool = True,
     ) -> InferenceResult:
         """按固定样本顺序执行完整粗到细推理并返回稳定结果结构。
 
@@ -316,8 +157,6 @@ class HRInferencer:
             test_samples (list[HRSample]): 非空、路径唯一且 ``clsname`` 非空的样本。
             display_size (int | list[int] | tuple[int, int] | None): 可选显示图尺寸；
                 整数表示正方形，二元序列按 ``(width, height)`` 解释。
-            use_pipeline (bool): 为 ``True`` 时走逐图 GPU 驻留路径（默认）；为
-                ``False`` 时走旧 DataLoader 参照路径（parity 对比 / 回退）。
 
         Returns:
             InferenceResult: 与输入样本同序的原图路径、原图分辨率 ``float32``
@@ -344,14 +183,9 @@ class HRInferencer:
             quality_results = self._assess_quality(test_samples)
             quality_seconds = time.perf_counter() - quality_started
 
-            if use_pipeline:
-                coarse_seconds, routing_seconds, refinement_seconds, (
-                    anomaly_maps, global_scores, refinement_statistics,
-                ) = self._inference_pipeline(test_samples)
-            else:
-                coarse_seconds, routing_seconds, refinement_seconds, (
-                    anomaly_maps, global_scores, refinement_statistics,
-                ) = self._inference_legacy(test_samples)
+            coarse_seconds, routing_seconds, refinement_seconds, (
+                anomaly_maps, global_scores, refinement_statistics,
+            ) = self._run_inference(test_samples)
 
             postprocess_started = time.perf_counter()
             image_scores = np.asarray(
@@ -424,127 +258,7 @@ class HRInferencer:
             )
             return output
 
-    def _inference_legacy(
-        self,
-        test_samples: list[HRSample],
-    ) -> tuple[
-        float,
-        float,
-        float,
-        tuple[list[FloatMap], list[float], list[RefinementStatistics]],
-    ]:
-        """旧 DataLoader 路径（保留为 parity 参照与回退开关）。
-
-        逻辑为重构前 ``inference()`` 的粗扫→合并→路由→复核→融合主体，逐字
-        保留；判定与显示等后处理仍由 ``inference()`` 统一完成。
-        """
-        batch_size = self.batch_size or len(test_samples)
-        coarse_started = time.perf_counter()
-        worker_results = self._run_inference_groups(
-            test_samples,
-            self.coarse_tasks_in_devices,
-            batch_size,
-        )
-
-        merged: DeviceInferenceResults = {
-            sample.image.image_path: {
-                "image_size": None,
-                "patches": [],
-                "thumbnail": None,
-                "thumbnail_score": None,
-            }
-            for sample in test_samples
-        }
-        for worker_result in worker_results:
-            for path, result in worker_result.items():
-                if result["image_size"] is not None:
-                    current_size = merged[path]["image_size"]
-                    if current_size is not None and current_size != result["image_size"]:
-                        raise ValueError(f"Task image sizes disagree for {path}")
-                    merged[path]["image_size"] = result["image_size"]
-                merged[path]["patches"].extend(result["patches"])
-                if result["thumbnail"] is not None:
-                    if merged[path]["thumbnail"] is not None:
-                        raise ValueError(f"Duplicate thumbnail prediction for {path}")
-                    merged[path]["thumbnail"] = result["thumbnail"]
-                    merged[path]["thumbnail_score"] = result["thumbnail_score"]
-        coarse_seconds = time.perf_counter() - coarse_started
-
-        anomaly_maps: list[FloatMap] = []
-        global_scores: list[float] = []
-        refinement_statistics: list[RefinementStatistics] = []
-        regions_by_path: RegionsByPath = {}
-        routing_started = time.perf_counter()
-        for sample in test_samples:
-            path = sample.image.image_path
-            result = merged[path]
-            if result["image_size"] is None or not result["patches"]:
-                raise ValueError(f"Incomplete dynamic patch prediction for {path}")
-            patch_map = _gather_patch_predictions(result["patches"], result["image_size"])
-            final_map = patch_map
-            if (
-                result["thumbnail"] is None
-                or result["thumbnail_score"] is None
-            ):
-                raise ValueError(f"Incomplete global context prediction for {path}")
-            image_width, image_height = result["image_size"]
-            global_context_map = cv2.resize(
-                np.asarray(result["thumbnail"], dtype=np.float32),
-                (image_width, image_height),
-                interpolation=cv2.INTER_LINEAR,
-            )
-            if self.map_gaussian_sigma > 0:
-                final_map = gaussian_filter(
-                    final_map,
-                    sigma=self.map_gaussian_sigma,
-                )
-            final_map = np.asarray(final_map, dtype=np.float32)
-            # 缩略图只参与候选路由；最终异常证据仍来自原图补丁与复核结果。
-            routing_map = build_routing_map(
-                final_map,
-                global_context_map,
-                self.global_routing_weight,
-            )
-            regions_by_path[path] = select_refinement_regions(
-                routing_map,
-                threshold=float(
-                    np.quantile(
-                        routing_map,
-                        self.refinement_task["refinement_quantile"],
-                    )
-                ),
-                tile_size=self.refinement_task["patch_size"],
-                min_area=self.refinement_task["refinement_min_area"],
-                safety_fraction=self.refinement_task["refinement_safety_fraction"],
-                max_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
-            )
-            refinement_statistics.append(
-                refinement_tile_statistics(
-                    (image_width, image_height),
-                    self.refinement_task["patch_size"],
-                    regions_by_path[path],
-                )
-            )
-            anomaly_maps.append(final_map)
-            global_scores.append(float(result["thumbnail_score"]))
-        routing_seconds = time.perf_counter() - routing_started
-
-        refinement_started = time.perf_counter()
-        anomaly_maps = self._apply_refinement(
-            test_samples,
-            anomaly_maps,
-            regions_by_path,
-            batch_size,
-        )
-        refinement_seconds = time.perf_counter() - refinement_started
-        return (
-            coarse_seconds,
-            routing_seconds,
-            refinement_seconds,
-            (anomaly_maps, global_scores, refinement_statistics),
-        )
-
-    def _inference_pipeline(
+    def _run_inference(
         self,
         test_samples: list[HRSample],
     ) -> tuple[
@@ -566,6 +280,7 @@ class HRInferencer:
                 refinement_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
                 map_gaussian_sigma=self.map_gaussian_sigma,
                 batch_cap=batch_size,
+                async_pipeline=self.inference_config.async_pipeline,
             )
             for manager in self.model_managers
         ]
@@ -610,98 +325,6 @@ class HRInferencer:
             较大值。
         """
         return self.inference(test_samples)["image_scores"]
-
-    def _run_inference_groups(
-        self,
-        test_samples: list[HRSample],
-        task_groups: list[list[TaskDefinition]],
-        batch_size: int,
-        *,
-        regions_by_path: RegionsByPath | None = None,
-    ) -> list[DeviceInferenceResults]:
-        """把任务组并发提交到各设备线程并等待全部结果。
-
-        Args:
-            test_samples (list[HRSample]): 当前推理样本。
-            task_groups (list[list[TaskDefinition]]): 与模型管理器同序的设备任务组。
-            batch_size (int): 单任务 DataLoader 批量大小。
-            regions_by_path (RegionsByPath | None): 可选复核区域映射。
-
-        Returns:
-            list[DeviceInferenceResults]: 保持任务组提交顺序的各设备结果。
-
-        Raises:
-            RuntimeError: 线程中的模型加载、数据读取或推理失败。
-        """
-        pending: list[Future[DeviceInferenceResults]] = [
-            self._executor.submit(
-                inference_in_device,
-                test_samples,
-                task_group,
-                manager,
-                batch_size,
-                regions_by_path=regions_by_path,
-            )
-            for task_group, manager in zip(task_groups, self.model_managers)
-            if task_group
-        ]
-        return [future.result() for future in pending]
-
-    def _apply_refinement(
-        self,
-        test_samples: list[HRSample],
-        base_maps: list[FloatMap],
-        regions_by_path: RegionsByPath,
-        batch_size: int,
-    ) -> list[FloatMap]:
-        """执行高分辨率复核任务并把结果融合回粗扫异常图。
-
-        Args:
-            test_samples (list[HRSample]): 与粗扫图同序的源图样本。
-            base_maps (list[FloatMap]): 每张原图的二维粗扫异常图。
-            regions_by_path (RegionsByPath): 每张图需要复核的原图 ``xywh`` 区域。
-            batch_size (int): 复核任务 DataLoader 批量大小。
-
-        Returns:
-            list[FloatMap]: 与样本和粗扫图同序的原图分辨率融合异常图。
-        """
-        worker_results = self._run_inference_groups(
-            test_samples,
-            self.refinement_tasks_in_devices,
-            batch_size,
-            regions_by_path=regions_by_path,
-        )
-        refinements_by_path: dict[str, list[PatchPrediction]] = {
-            sample.image.image_path: []
-            for sample in test_samples
-        }
-        for worker_result in worker_results:
-            for path, result in worker_result.items():
-                refinements_by_path[path].extend(result["patches"])
-
-        refined_maps: list[FloatMap] = []
-        for sample, base_map in zip(test_samples, base_maps):
-            path = sample.image.image_path
-            refinements: list[tuple[HRImageIndex, FloatMap]] = []
-            for record, anomaly_map in refinements_by_path[path]:
-                x, y, width, height = record["source_xywh"]
-                refinements.append((
-                    HRImageIndex(
-                        x=x,
-                        y=y,
-                        width=width,
-                        height=height,
-                    ),
-                    anomaly_map,
-                ))
-            refined_maps.append(
-                merge_refinement_maps(
-                    base_map,
-                    refinements,
-                    image_size=(base_map.shape[1], base_map.shape[0]),
-                )
-            )
-        return refined_maps
 
     @staticmethod
     def _validate_samples(test_samples: object) -> None:

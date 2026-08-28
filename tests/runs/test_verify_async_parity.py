@@ -1,6 +1,6 @@
 import pytest
 
-from runs.verify_inference_parity import parse_args
+from runs.verify_async_parity import parse_args
 
 
 def test_parse_args_rejects_non_positive_batch_size():

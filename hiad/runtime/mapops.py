@@ -41,8 +41,7 @@ def stitch_patch_maps_torch(
     image_size: tuple[int, int],
     device: torch.device,
 ) -> torch.Tensor:
-    """按坐标与 Hann 权重把补丁图拼回原图分辨率异常图（对应 NumPy
-    ``_gather_patch_predictions``）。补丁重叠区域按加权平均融合。"""
+    """按坐标与 Hann 权重把补丁图拼回原图分辨率异常图。补丁重叠区域按加权平均融合。"""
     image_width, image_height = image_size
     accumulated = torch.zeros(
         (image_height, image_width), dtype=torch.float32, device=device

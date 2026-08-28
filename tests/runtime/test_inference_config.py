@@ -39,3 +39,18 @@ def test_rejects_unknown_preprocess_backend():
 def test_rejects_context_share_true_before_implementation():
     with pytest.raises(ValueError, match="not enabled"):
         load_inference_config({"inference": {"context_share": True}})
+
+
+def test_async_pipeline_parses_bool():
+    config = load_inference_config({"inference": {"async_pipeline": True}})
+    assert config.async_pipeline is True
+
+
+def test_async_pipeline_defaults_false():
+    config = load_inference_config({})
+    assert config.async_pipeline is False
+
+
+def test_async_pipeline_rejects_non_bool():
+    with pytest.raises(ValueError):
+        load_inference_config({"inference": {"async_pipeline": "yes"}})

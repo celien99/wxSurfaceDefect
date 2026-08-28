@@ -13,11 +13,14 @@ class InferenceConfig:
             由空闲显存自动决定。
         preprocess_backend (str): 预处理后端；当前仅支持 ``vectorized_cpu``。
         context_share (bool): 网格对齐 context 复用开关；当前版本强制关闭。
+        async_pipeline (bool): 阶段级异步流水（P0 双缓冲）开关；默认关闭，
+            训练机 parity + 性能门槛通过后翻转默认。
     """
 
     batch_memory_budget_gb: float = 0.0
     preprocess_backend: str = "vectorized_cpu"
     context_share: bool = False
+    async_pipeline: bool = False
 
 
 def _inference_section(config: object) -> object:
@@ -71,8 +74,12 @@ def load_inference_config(config: object) -> InferenceConfig:
             "inference.context_share is not enabled in this version; "
             "keep it false until the gated architecture candidate lands"
         )
+    async_pipeline = section.get("async_pipeline", False)
+    if not isinstance(async_pipeline, bool):
+        raise ValueError("inference.async_pipeline must be a boolean")
     return InferenceConfig(
         batch_memory_budget_gb=budget,
         preprocess_backend=backend,
         context_share=False,
+        async_pipeline=async_pipeline,
     )

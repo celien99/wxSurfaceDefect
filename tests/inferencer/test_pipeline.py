@@ -42,7 +42,7 @@ def _sample(image):
     return HRSample(image=HRImage.from_array(image), clsname="part")
 
 
-def _make_pipeline():
+def _make_pipeline(async_pipeline: bool = False):
     return DeviceImagePipeline(
         detectors={"dynamic_patch": _StubDetector(16), "thumbnail": _StubDetector(16),
                    "refinement_patch": _StubDetector(16)},
@@ -53,6 +53,7 @@ def _make_pipeline():
         score_top_k=4,
         refinement_bridge_gap_tiles=1,
         map_gaussian_sigma=0.0,
+        async_pipeline=async_pipeline,
     )
 
 
@@ -87,3 +88,21 @@ def test_process_images_reuses_prefetch_worker():
     outputs = pipeline.process_images([_sample(image) for image in images])
     assert len(outputs) == 3
     assert [output.image_size for output in outputs] == [(32, 32)] * 3
+
+
+def test_async_and_serial_are_bit_identical():
+    """双缓冲异步与阶段化串行输出逐位相等（P0 的 bit-identical 门）。"""
+    rng = np.random.default_rng(3)
+    images = [
+        rng.integers(0, 256, size=(48, 48, 3), dtype=np.uint8),
+        rng.integers(0, 256, size=(48, 48, 3), dtype=np.uint8),
+    ]
+    samples = [_sample(image) for image in images]
+    serial = _make_pipeline(async_pipeline=False).process_images(samples)
+    async_ = _make_pipeline(async_pipeline=True).process_images(samples)
+    for a, b in zip(serial, async_):
+        assert np.array_equal(a.final_map, b.final_map)
+        assert a.thumbnail_score == b.thumbnail_score
+        assert a.image_size == b.image_size
+        assert a.refinement_statistics["total_tiles"] == b.refinement_statistics["total_tiles"]
+        assert a.refinement_statistics["selected_tiles"] == b.refinement_statistics["selected_tiles"]
