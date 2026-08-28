@@ -102,16 +102,22 @@ def _install_timing(async_pipeline: bool = False) -> None:
         def timed(self, *args, method=original, stats=stats, **kwargs):
             cpu_started = time.perf_counter()
             if not async_pipeline and self.device.type == "cuda":
+                stream = torch.cuda.current_stream()
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
+                start_event.record(stream)
             else:
-                start_event = end_event = None
+                start_event = end_event = stream = None
             result = method(self, *args, **kwargs)
             if start_event is not None:
-                end_event.record()
+                end_event.record(stream)
                 end_event.synchronize()
+                wall_ms = (time.perf_counter() - cpu_started) * 1000.0
                 gpu_busy = start_event.elapsed_time(end_event)
+                # 某些 torch/CUDA 组合的 elapsed_time 实际返回微秒；毫秒下不可能
+                # 超过调用墙钟 5 倍，超出的按微秒换算（训练机实测 41,716% 即此）。
+                if gpu_busy > wall_ms * 5:
+                    gpu_busy = gpu_busy / 1000.0
             else:
                 gpu_busy = 0.0
             stats.add(time.perf_counter() - cpu_started, gpu_busy)

@@ -101,7 +101,9 @@ def test_merge_matches_numpy_reference():
         (HRImageIndex(x=2, y=2, width=4, height=4),
          torch.ones((4, 4), dtype=torch.float32) * 0.5),
     ]
-    expected = merge_refinement_maps_np(base.numpy(), [(ref[0], ref[1].numpy())], (8, 8))
+    expected = merge_refinement_maps_np(
+        base.numpy(), [(refinements[0][0], refinements[0][1].numpy())], (8, 8)
+    )
     np.testing.assert_allclose(
         merge_refinement_maps_torch(base, refinements, (8, 8), torch.device("cpu")).numpy(),
         expected,
