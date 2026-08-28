@@ -3,7 +3,11 @@ import torch
 
 from hiad.constants import TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_THUMBNAIL
 from hiad.data import HRImage, HRSample
-from hiad.inferencer.pipeline import DeviceImagePipeline, ImagePipelineOutput
+from hiad.inferencer.pipeline import (
+    DeviceImagePipeline,
+    ImagePipelineOutput,
+    _PrefetchWorker,
+)
 from hiad.runtime.inference_config import InferenceConfig
 
 
@@ -87,3 +91,29 @@ def test_process_images_reuses_prefetch_worker():
     outputs = pipeline.process_images([_sample(image) for image in images])
     assert len(outputs) == 3
     assert [output.image_size for output in outputs] == [(32, 32)] * 3
+
+
+def test_staged_serial_matches_legacy_coarse_route():
+    """阶段化串行路径与保留的旧 _coarse_forward/_route 输出逐位一致。"""
+    rng = np.random.default_rng(7)
+    image = rng.integers(0, 256, size=(48, 48, 3), dtype=np.uint8)
+    new_out = _make_pipeline().process_images([_sample(image)])[0]
+
+    pipeline = _make_pipeline()
+    item = None
+    with _PrefetchWorker([_sample(image.copy())], pipeline._build_item) as worker:
+        item = worker.next()
+    assert item is not None
+    image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
+    coarse_map, thumbnail_score, global_context_map = pipeline._coarse_forward(
+        item, image_size
+    )
+    regions, _routing_np, _coarse = pipeline._route(
+        coarse_map, global_context_map, image_size
+    )
+    legacy_map = pipeline._refine_and_merge(item, regions, coarse_map, image_size)
+    item.sample.close()
+
+    assert np.array_equal(new_out.final_map, legacy_map)
+    assert new_out.thumbnail_score == thumbnail_score
+    assert new_out.refinement_statistics["selected_tiles"] == len(regions)

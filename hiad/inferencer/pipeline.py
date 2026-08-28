@@ -67,6 +67,16 @@ class ImagePipelineOutput:
 
 
 @dataclass
+class _CoarseState:
+    """双缓冲中一张图的粗扫阶段 GPU 结果；全部为未同步张量。"""
+
+    coarse_map: torch.Tensor
+    thumb_pixel: torch.Tensor
+    thumb_token: torch.Tensor
+    image_size: ImageSize
+
+
+@dataclass
 class _PrefetchItem:
     """预取线程产出的解码图像与粗扫/缩略批量。"""
 
@@ -255,25 +265,97 @@ class DeviceImagePipeline:
             thumbnail_size=thumbnail_task["thumbnail_size"],
         )
 
+    def _submit_coarse(self, item: _PrefetchItem) -> _CoarseState:
+        """提交粗扫与缩略图前向（异步，不做任何 D2H 同步）。
+
+        复刻旧 ``_coarse_forward`` 的 GPU 部分：粗扫批量前向 + 拼接 + 可选
+        高斯 + 缩略图前向，全部排队到设备 stream 后立即返回。
+        """
+        coarse_task = self._coarse_task()
+        coarse_detector = self.detectors[coarse_task["name"]]
+        image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
+        pixel_maps, _token_scores = self._forward_and_collect(
+            coarse_detector, item.coarse_batch, coarse_task["patch_size"]
+        )
+        coarse_map = mapops.stitch_patch_maps_torch(
+            pixel_maps[:, 0], item.coarse_records, image_size, self.device
+        )
+        if self.map_gaussian_sigma > 0:
+            coarse_map = mapops.gaussian_blur_torch(
+                coarse_map, self.map_gaussian_sigma
+            )
+        thumbnail_detector = self.detectors[self._thumbnail_task()["name"]]
+        thumb_pixel, thumb_token = thumbnail_detector.inference_batch(
+            item.thumbnail_batch
+        )
+        return _CoarseState(
+            coarse_map=coarse_map,
+            thumb_pixel=thumb_pixel,
+            thumb_token=thumb_token,
+            image_size=image_size,
+        )
+
+    def _finish_coarse(
+        self,
+        state: _CoarseState,
+    ) -> tuple[np.ndarray, float, float]:
+        """收尾粗扫结果为路由输入：全局先验放大 + 路由图 + 分位数 + D2H。
+
+        复刻旧 ``_coarse_forward`` 的收尾（缩略图 D2H → cv2 放大 → H2D 全局
+        先验、缩略分数）与旧 ``_route`` 的 GPU 部分（路由图、quantile、D2H）。
+        返回 ``(routing_np, threshold, thumbnail_score)``。
+        """
+        thumbnail_map_np = state.thumb_pixel[0, 0].cpu().numpy()
+        global_context_map = torch.from_numpy(
+            cv2.resize(
+                thumbnail_map_np, state.image_size, interpolation=cv2.INTER_LINEAR
+            )
+        ).to(self.device)
+        thumbnail_detector = self.detectors[self._thumbnail_task()["name"]]
+        thumbnail_score = float(
+            mapops.top_k_token_scores_torch(
+                state.thumb_token, thumbnail_detector.score_top_k
+            ).cpu().item()
+        )
+        routing_map = mapops.build_routing_map_torch(
+            state.coarse_map, global_context_map, self.global_routing_weight
+        )
+        threshold = float(
+            torch.quantile(
+                routing_map, self.refinement_task["refinement_quantile"]
+            )
+        )
+        routing_np = routing_map.cpu().numpy()
+        return routing_np, threshold, thumbnail_score
+
     def _process_item(self, item: _PrefetchItem) -> ImagePipelineOutput:
-        """在主线程执行 GPU 前向、路由、复核、融合，并负责关闭样本。"""
+        """串行模式：逐阶段顺序执行（每个阶段即 async 模式的同名函数）。
+
+        数值与旧 ``_coarse_forward`` + ``_route`` + ``_refine_and_merge`` 路径
+        逐位一致；``_coarse_forward``/``_route`` 在本任务保留供 P1 测试对照，
+        后续任务移除。
+        """
         image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
         try:
             coarse_started = time.perf_counter()
-            coarse_map, thumbnail_score, global_context_map = self._coarse_forward(
-                item, image_size
-            )
+            state = self._submit_coarse(item)
+            routing_np, threshold, thumbnail_score = self._finish_coarse(state)
             coarse_seconds = time.perf_counter() - coarse_started
 
             routing_started = time.perf_counter()
-            regions, _routing_np, _coarse = self._route(
-                coarse_map, global_context_map, image_size
+            regions = select_refinement_regions(
+                routing_np,
+                threshold=threshold,
+                tile_size=self.refinement_task["patch_size"],
+                min_area=self.refinement_task["refinement_min_area"],
+                safety_fraction=self.refinement_task["refinement_safety_fraction"],
+                max_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
             )
             routing_seconds = time.perf_counter() - routing_started
 
             refinement_started = time.perf_counter()
             final_map = self._refine_and_merge(
-                item, regions, coarse_map, image_size
+                item, regions, state.coarse_map, image_size
             )
             refinement_seconds = time.perf_counter() - refinement_started
 
