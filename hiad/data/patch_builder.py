@@ -128,6 +128,106 @@ def build_patch_batch(
     return batch, records
 
 
+def build_cell_batch(
+    image: np.ndarray,
+    cells: Sequence[HRImageIndex],
+    patch_size: int,
+) -> tuple[Mapping[str, object], list[str]]:
+    """把去重网格 cell 批量裁剪缩放为模型输入，返回批次与 cell 顺序。
+
+    context 复用第一步：整图每个网格 cell 只编码一次（spec 2026-08-27 旗舰 B）。
+    裁剪/缩放算子与 ``build_patch_batch`` 的 context 分支一致（``crop_tile`` +
+    ``cv2.resize`` INTER_LINEAR），保证特征语义与现状路径一致。
+
+    Args:
+        image: 已解码的 ``(height, width, 3)`` RGB ``uint8`` 原图。
+        cells: 去重网格 cell 区域，与 ``build_grid_contexts`` 返回一致。
+        patch_size: 正方形模型输入边长。
+
+    Returns:
+        ``(batch, cell_ids)``：batch 含 ``image``（``(N, 3, P, P)`` 标准化）与
+        与行对应的 ``cell_id``（cell 区域 JSON 字符串，作为特征缓存键）。
+    """
+    count = len(cells)
+    stack = np.empty((count, patch_size, patch_size, 3), dtype=np.uint8)
+    for index, cell in enumerate(cells):
+        low = crop_tile(image, cell)
+        stack[index] = cv2.resize(
+            low, (patch_size, patch_size), interpolation=cv2.INTER_LINEAR
+        )
+    cell_ids = [str(cell) for cell in cells]
+    return {"image": normalize_rgb_stack(stack), "cell_id": cell_ids}, cell_ids
+
+
+def build_shared_context_patch_batch(
+    image: np.ndarray,
+    multi_indexes: Sequence[MultiResolutionIndex],
+    patch_size: int,
+    base_record: Mapping[str, object],
+) -> tuple[Mapping[str, object], list[TaskInputRecord]]:
+    """context 复用模式下的粗扫建批：只含主补丁与 cell 引用，不含 context 图像。
+
+    每个主补丁的 context 由 ``build_grid_contexts`` 预映射到网格 cell；本函数
+    提取主补丁并记录 ``cell_id``/``cell_index``（主补丁在该 cell 中缩放到模型
+    输入坐标系的 JSON ``xywh``）。context 特征由
+    :meth:`BaseDetector.encode_grid_cells` 编码一次后按 ``cell_index`` 切片。
+
+    Args:
+        image: 已解码的 ``(height, width, 3)`` RGB ``uint8`` 原图。
+        multi_indexes: 与任务记录顺序一致的网格多尺度索引（每个含一个 cell）。
+        patch_size: 正方形模型输入边长。
+        base_record: 任务追溯字段模板。
+
+    Returns:
+        ``(batch, records)``；batch 含 ``image``、``cell_id``、``cell_index``。
+
+    Raises:
+        ValueError: 任一索引的上下文不是恰好一个 cell。
+    """
+    count = len(multi_indexes)
+    image_height, image_width = image.shape[:2]
+    main_stack = np.empty((count, patch_size, patch_size, 3), dtype=np.uint8)
+    cell_ids: list[str] = []
+    cell_index_strings: list[str] = []
+    records: list[TaskInputRecord] = []
+    for index, multi_index in enumerate(multi_indexes):
+        main_index = multi_index.main_index
+        main_stack[index] = crop_tile(image, main_index)
+        records.append({
+            **base_record,
+            "source_xywh": (
+                main_index.x, main_index.y, main_index.width, main_index.height,
+            ),
+            "valid_source_hw": (
+                min(main_index.height, image_height - main_index.y),
+                min(main_index.width, image_width - main_index.x),
+            ),
+        })
+        cell_indexes = multi_index.low_resolution_indexes
+        if cell_indexes is None or len(cell_indexes) != 1:
+            raise ValueError(
+                "shared-context batch requires exactly one cell per main patch"
+            )
+        cell = cell_indexes[0]
+        cell_ids.append(str(cell))
+        low = crop_tile(image, cell)
+        low_height, low_width = low.shape[:2]
+        cell_index_strings.append(str(HRImageIndex(
+            x=int((main_index.x - cell.x) / low_width * patch_size),
+            y=int((main_index.y - cell.y) / low_height * patch_size),
+            width=int(main_index.width / cell.width * patch_size),
+            height=int(main_index.height / cell.height * patch_size),
+        )))
+    return (
+        {
+            "image": normalize_rgb_stack(main_stack),
+            "cell_id": cell_ids,
+            "cell_index": cell_index_strings,
+        },
+        records,
+    )
+
+
 def build_thumbnail_batch(
     image: np.ndarray,
     thumbnail_size: int,

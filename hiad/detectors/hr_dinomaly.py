@@ -705,12 +705,17 @@ class HRDinomaly(BaseDetector):
     def inference_batch(
         self,
         data: DetectorBatch,
+        cell_cache: Mapping[str, list[torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """在检测器设备上计算融合异常图与 token 图，不做任何 CPU 往返。
 
         Args:
             data (DetectorBatch): 含 ``image``（BCHW）及可选
-                ``low_resolution_image_<n>``/``low_resolution_index_<n>`` 的批次。
+                ``low_resolution_image_<n>``/``low_resolution_index_<n>`` 的批次；
+                ``cell_cache`` 非空时另需 ``cell_id``/``cell_index``（见
+                :meth:`BaseDetector.get_multi_resolution_embeddings`）。
+            cell_cache (Mapping[str, list[torch.Tensor]] | None): context 复用
+                的 cell 特征缓存；``None`` 时走逐 tile 独立编码现状路径。
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]: ``(fused_pixel, fused_token)``，
@@ -720,7 +725,9 @@ class HRDinomaly(BaseDetector):
         self.model.eval()
         if self.context_conditioner is not None:
             self.context_conditioner.eval()
-        main_features, context_features = self.get_multi_resolution_embeddings(data)
+        main_features, context_features = self.get_multi_resolution_embeddings(
+            data, cell_cache=cell_cache
+        )
         conditioned_features = self._condition_features(
             main_features,
             context_features,

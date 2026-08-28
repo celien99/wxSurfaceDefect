@@ -302,3 +302,57 @@ def split_image_regions(
         for y in y_starts
         for x in x_starts
     ]
+
+
+def build_grid_contexts(
+    image_size: SizeLike,
+    main_indexes: Sequence[HRImageIndex],
+    cell_size: int = 1024,
+) -> tuple[list[HRImageIndex], list[MultiResolutionIndex]]:
+    """为 context 复用构建网格对齐的 cell 布局与主补丁→cell 映射。
+
+    现状每个主补丁独立编码其居中 context，相邻补丁的 context 大量重叠、
+    重复编码（spec 2026-08-27 旗舰 B）。本函数把 context 换成覆盖整图的
+    网格 cell：每个 cell 只需编码一次，主补丁复用"包含其中心"的 cell 特征
+    切片。cell 尺寸对应粗扫 ``ds_factors=[0,1]`` 的 2×patch context 原始
+    尺寸（默认 1024）。
+
+    Args:
+        image_size (SizeLike): 原图尺寸；整数表示正方形，否则按
+            ``(width, height)`` 解释。
+        main_indexes (Sequence[HRImageIndex]): 粗扫主补丁区域，与
+            ``split_image_regions`` 输出顺序一致。
+        cell_size (int): 正方形网格 cell 边长（像素）。
+
+    Returns:
+        tuple[list[HRImageIndex], list[MultiResolutionIndex]]: 覆盖整图且
+        ``cell_size`` 整数倍对齐、末端回退边界的去重网格 cell 列表，以及与
+        ``main_indexes`` 一一对应的 ``MultiResolutionIndex``——每个主补丁的
+        ``low_resolution_indexes`` 是包含其中心的那个 cell。
+
+    Raises:
+        ValueError: ``cell_size`` 不是正整数。
+        RuntimeError: 某个主补丁中心落在所有网格 cell 之外（不应发生，
+            cell 布局覆盖整图）。
+    """
+    if not isinstance(cell_size, int) or cell_size <= 0:
+        raise ValueError("cell_size must be a positive integer")
+    cells = split_image_regions(image_size, cell_size, stride=cell_size)
+    results: list[MultiResolutionIndex] = []
+    for main in main_indexes:
+        center_x = main.x + main.width // 2
+        center_y = main.y + main.height // 2
+        enclosing: HRImageIndex | None = None
+        for cell in cells:
+            if (
+                cell.x <= center_x < cell.x + cell.width
+                and cell.y <= center_y < cell.y + cell.height
+            ):
+                enclosing = cell
+                break
+        if enclosing is None:
+            raise RuntimeError(f"No grid cell encloses source index {main}")
+        results.append(
+            MultiResolutionIndex(main_index=main, low_resolution_indexes=[enclosing])
+        )
+    return cells, results

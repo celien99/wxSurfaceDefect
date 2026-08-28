@@ -118,14 +118,23 @@ class BaseDetector(ABC):
     def get_multi_resolution_embeddings(
         self,
         data: Mapping[str, Any],
+        cell_cache: Mapping[str, list[torch.Tensor]] | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
         """一次编码主补丁与上下文，再按原图区域对齐上下文特征。
+
+        ``cell_cache`` 非空时启用 context 复用（spec 2026-08-27 旗舰 B）：
+        主补丁单独编码，context 特征从缓存 cell 特征按 ``cell_id``/``cell_index``
+        切片；此时 ``data`` 需携带与 ``image`` 首维对应的 ``cell_id``
+        （list[str]）与 ``cell_index``（主补丁在该 cell 中缩放到模型输入坐标系
+        的 JSON ``xywh``）。
 
         Args:
             data (Mapping[str, Any]): DataLoader 批次。``image`` 为 BCHW 主补丁；
                 可选 ``low_resolution_image_<n>`` 为同尺寸上下文，配套
                 ``low_resolution_index_<n>`` 保存主补丁在该上下文中的 JSON
                 ``xywh`` 坐标。
+            cell_cache (Mapping[str, list[torch.Tensor]] | None): context 复用
+                的 cell 特征缓存；``None`` 时走逐 tile 独立编码现状路径。
 
         Returns:
             tuple[list[torch.Tensor], list[torch.Tensor] | None]: 主补丁多层 BCHW
@@ -138,6 +147,8 @@ class BaseDetector(ABC):
             RuntimeError: 编码、拼接或特征插值失败。
         """
         image = data["image"].to(self.device, non_blocking=True)
+        if cell_cache is not None:
+            return self._context_reuse_embeddings(image, data, cell_cache)
         low_resolution_image_keys = [
             key for key in data if key.startswith("low_resolution_image")
         ]
@@ -204,6 +215,91 @@ class BaseDetector(ABC):
                     )
                 )
 
+        aggregated_context = [
+            torch.stack(layer_contexts, dim=0).mean(dim=0)
+            for layer_contexts in context_embeddings
+        ]
+        return main_embeddings, aggregated_context
+
+    @torch.no_grad()
+    def encode_grid_cells(
+        self,
+        cell_batch: Mapping[str, Any],
+        cell_ids: Sequence[str],
+    ) -> dict[str, list[torch.Tensor]]:
+        """一次编码去重网格 cell，返回 ``cell_id -> 多层 BCHW 特征`` 的缓存。
+
+        context 复用的第一步：整图只编码一次每个 cell，主补丁后续从缓存切片
+        其 context 特征，避免相邻 tile 重复编码重叠 context。
+
+        Args:
+            cell_batch (Mapping[str, Any]): ``image`` 为 ``(N, 3, P, P)`` 的
+                ImageNet 标准化去重 cell 图堆。
+            cell_ids (Sequence[str]): 与 batch 行一一对应的 cell 标识。
+
+        Returns:
+            dict[str, list[torch.Tensor]]: 每个 cell 的多层 BCHW 特征
+            （每层 ``(C, H, W)``，设备驻留）。
+        """
+        image = cell_batch["image"].to(self.device, non_blocking=True)
+        embeddings = self.embedding(image)
+        cache: dict[str, list[torch.Tensor]] = {}
+        for index, cell_id in enumerate(cell_ids):
+            cache[cell_id] = [
+                layer[index].detach() for layer in embeddings
+            ]
+        return cache
+
+    def _context_reuse_embeddings(
+        self,
+        image: torch.Tensor,
+        data: Mapping[str, Any],
+        cell_cache: Mapping[str, list[torch.Tensor]],
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """context 复用：主补丁单独编码，context 从缓存 cell 特征切片。
+
+        每个主补丁取"包含其中心"的 cell（``cell_id``），按 ``cell_index`` 在
+        该 cell 特征空间切片并插值对齐到主补丁特征尺寸；切片坐标语义与现状
+        ``low_resolution_index`` 一致（模型输入坐标除以特征步长）。
+
+        Args:
+            image (torch.Tensor): BCHW 主补丁图像（已在设备上）。
+            data (Mapping[str, Any]): 含 ``cell_id``（list[str]）与
+                ``cell_index``（list[str] JSON ``xywh``），均与 ``image``
+                首维对应。
+            cell_cache (Mapping[str, list[torch.Tensor]]): ``encode_grid_cells``
+                产生的 cell 特征缓存。
+
+        Returns:
+            tuple[list[torch.Tensor], list[torch.Tensor]]: 主补丁多层 BCHW 特征
+            与对齐后的 context 特征。
+        """
+        main_embeddings = self.embedding(image)
+        cell_ids = data["cell_id"]
+        cell_indexes = [HRImageIndex.from_str(value) for value in data["cell_index"]]
+        context_embeddings: list[list[torch.Tensor]] = [[] for _ in main_embeddings]
+        for cell_id, index in zip(cell_ids, cell_indexes):
+            if cell_id not in cell_cache:
+                raise KeyError(f"No cached cell features for cell_id={cell_id}")
+            cell_features = cell_cache[cell_id]
+            for layer_index, feature in enumerate(cell_features):
+                feature_stride_h = self.patch_size[1] / feature.shape[1]
+                feature_stride_w = self.patch_size[0] / feature.shape[2]
+                x_start = index.x / feature_stride_w
+                y_start = index.y / feature_stride_h
+                x_end = x_start + index.width / feature_stride_w
+                y_end = y_start + index.height / feature_stride_h
+                cropped = feature[
+                    :, int(y_start) : int(y_end), int(x_start) : int(x_end)
+                ]
+                context_embeddings[layer_index].append(
+                    F.interpolate(
+                        cropped.unsqueeze(0),
+                        size=main_embeddings[layer_index].shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+                )
         aggregated_context = [
             torch.stack(layer_contexts, dim=0).mean(dim=0)
             for layer_contexts in context_embeddings
