@@ -59,28 +59,6 @@ class TaskInputRecord(TaskInputRecordRequired, total=False):
     valid_source_hw: tuple[int, int]
 
 
-PatchPrediction: TypeAlias = tuple[TaskInputRecord, FloatMap]
-
-
-class SourceInferenceResult(TypedDict):
-    """一个工作线程对单张原图累积的任务结果。
-
-    Attributes:
-        image_size (ImageSize | None): 原图 ``(width, height)``。
-        patches (list[PatchPrediction]): 补丁输入记录及其二维异常图。
-        thumbnail (FloatMap | None): 整图缩略任务的二维异常图。
-        thumbnail_score (float | None): 整图缩略任务的图像级分数。
-    """
-
-    image_size: ImageSize | None
-    patches: list[PatchPrediction]
-    thumbnail: FloatMap | None
-    thumbnail_score: float | None
-
-
-DeviceInferenceResults: TypeAlias = dict[str, SourceInferenceResult]
-
-
 class ImageQualityResult(TypedDict):
     """采集质量门禁的可落盘结果。
 

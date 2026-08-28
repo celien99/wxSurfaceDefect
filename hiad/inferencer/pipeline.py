@@ -302,8 +302,7 @@ class DeviceImagePipeline:
     ) -> tuple[torch.Tensor, float, torch.Tensor]:
         """执行粗扫任务并返回原图分辨率 GPU 异常图、缩略图分数与全局先验。
 
-        粗扫补丁图为 ``(N, 1, P, P)``，拼接前做 ``[:, 0]`` 二维切片（与 legacy
-        ``_gather_patch_predictions`` 的 2D 契约一致）。
+        粗扫补丁图为 ``(N, 1, P, P)``，拼接前做 ``[:, 0]`` 二维切片。
         """
         coarse_task = self._coarse_task()
         coarse_detector = self.detectors[coarse_task["name"]]
@@ -327,8 +326,7 @@ class DeviceImagePipeline:
                 thumb_token, thumbnail_detector.score_top_k
             ).cpu().item()
         )
-        # 缩略图异常图按原图分辨率线性放大作为路由全局先验。保持 cv2.INTER_LINEAR
-        # 与 legacy 路径逐位一致（不使用 F.interpolate，避免亚像素差异）。
+        # 缩略图异常图按原图分辨率线性放大作为路由全局先验。
         thumbnail_map_np = thumb_pixel[0, 0].cpu().numpy()
         global_context_map = torch.from_numpy(
             cv2.resize(
