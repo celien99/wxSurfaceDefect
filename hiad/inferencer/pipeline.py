@@ -241,7 +241,11 @@ class DeviceImagePipeline:
             item = worker.next()
             if item is None:
                 return outputs
-            state = self._submit_coarse(item)
+            try:
+                state = self._submit_coarse(item)
+            except BaseException:
+                item.sample.close()
+                raise
             while item is not None:
                 image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
 
