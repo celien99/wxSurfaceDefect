@@ -112,20 +112,27 @@ def _install_timing(async_pipeline: bool = False) -> None:
             if start_event is not None:
                 end_event.record(stream)
                 end_event.synchronize()
-                wall_ms = (time.perf_counter() - cpu_started) * 1000.0
-                gpu_busy = start_event.elapsed_time(end_event)
-                # elapsed_time 的单位在各 torch/CUDA/驱动组合下并不一致（文档为
-                # 毫秒，但训练机实测为微秒乃至纳秒）。毫秒下 GPU busy 不可能超过
-                # 调用墙钟（CPU 在同步处等 GPU），故用墙钟做锚点：把报告值反复
-                # 除以 1000 直到落在墙钟的合理倍数内，一步归一掉 μs/ns 单位。
-                # 上限 4 次覆盖 ms→μs→ns→ps，也防住无界单位导致死循环。
+            # 墙钟在同步之后采：同步前的墙钟不含 GPU 等待，会低估锚点，把合法
+            # 毫秒值误归一。
+            cpu_elapsed = time.perf_counter() - cpu_started
+            if start_event is not None:
+                wall_ms = cpu_elapsed * 1000.0
+                gpu_busy_ms = start_event.elapsed_time(end_event)
+                # elapsed_time 文档单位为毫秒，但部分 torch/CUDA 组合返回更细
+                # 单位（微秒/纳秒）。毫秒下 GPU busy 不可能超过调用墙钟（CPU 在
+                # 同步处等 GPU），故用墙钟做锚点：把报告值反复除以 1000 直到落
+                # 在墙钟的合理倍数内。上限 4 次覆盖 ms→μs→ns→ps，防无界单位。
                 for _ in range(4):
-                    if gpu_busy <= wall_ms * 5:
+                    if gpu_busy_ms <= wall_ms * 5:
                         break
-                    gpu_busy = gpu_busy / 1000.0
+                    gpu_busy_ms = gpu_busy_ms / 1000.0
+                gpu_seconds = gpu_busy_ms / 1000.0
             else:
-                gpu_busy = 0.0
-            stats.add(time.perf_counter() - cpu_started, gpu_busy)
+                gpu_seconds = 0.0
+            # StageStats.add 把两个入参都按“秒”换算成毫秒（×1000）；elapsed_time
+            # 返回毫秒，必须再 /1000 转成秒，否则 gpu_busy_ms 会被虚增 1000 倍
+            # （曾误判为“训练机返回微秒”，实为这里少了一层换算）。
+            stats.add(cpu_elapsed, gpu_seconds)
             return result
 
         timed._profiled = True
