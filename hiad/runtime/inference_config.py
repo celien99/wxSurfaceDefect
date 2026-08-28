@@ -16,15 +16,15 @@ class InferenceConfig:
         async_pipeline (bool): 阶段级异步流水（P0 双缓冲）开关；默认关闭，
             训练机 parity + 性能门槛通过后翻转默认。
         decoder_amp (bool): 推理时是否用 FP16 autocast 跑重建解码器（P1）；
-            线性层 FP16、einsum 核心保持 FP32。默认关闭，过 parity + 安全门
-            后翻转默认。
+            线性层 FP16、einsum 核心保持 FP32。2026-08-28 训练机 parity +
+            安全门通过后翻为默认开启。
     """
 
     batch_memory_budget_gb: float = 0.0
     preprocess_backend: str = "vectorized_cpu"
     context_share: bool = False
     async_pipeline: bool = False
-    decoder_amp: bool = False
+    decoder_amp: bool = True
 
 
 def _inference_section(config: object) -> object:
@@ -81,7 +81,7 @@ def load_inference_config(config: object) -> InferenceConfig:
     async_pipeline = section.get("async_pipeline", False)
     if not isinstance(async_pipeline, bool):
         raise ValueError("inference.async_pipeline must be a boolean")
-    decoder_amp = section.get("decoder_amp", False)
+    decoder_amp = section.get("decoder_amp", True)
     if not isinstance(decoder_amp, bool):
         raise ValueError("inference.decoder_amp must be a boolean")
     return InferenceConfig(

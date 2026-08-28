@@ -47,10 +47,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Enable FP16 decoder autocast (P1); compare against baseline",
     )
+    parser.add_argument(
+        "--no-decoder-amp",
+        action="store_true",
+        help="Force FP32 decoder (baseline); explicit override after the default "
+        "flipped to true (2026-08-28)",
+    )
     parser.add_argument("--report", default="results/profile_pipeline_report.txt")
     args = parser.parse_args(argv)
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.decoder_amp and args.no_decoder_amp:
+        parser.error("--decoder-amp and --no-decoder-amp are mutually exclusive")
     return args
 
 
@@ -198,6 +206,8 @@ def main(argv=None) -> int:
         config.setdefault("inference", {})["async_pipeline"] = True
     if args.decoder_amp:
         config.setdefault("inference", {})["decoder_amp"] = True
+    if args.no_decoder_amp:
+        config.setdefault("inference", {})["decoder_amp"] = False
     gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]
     if not gpu_ids:
         raise ValueError("At least one GPU id is required")
