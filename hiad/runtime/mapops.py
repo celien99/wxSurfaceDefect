@@ -149,14 +149,27 @@ def top_k_token_scores_torch(token_maps: torch.Tensor, top_k: int) -> torch.Tens
 
 def gaussian_blur_torch(map_2d: torch.Tensor, sigma: float) -> torch.Tensor:
     """对单通道 2D 图做高斯平滑（对应 ``scipy.ndimage.gaussian_filter`` 语义，
-    供 ``map_gaussian_sigma > 0`` 时使用；默认 0 时不会被调用）。"""
+    供 ``map_gaussian_sigma > 0`` 时使用；默认 0 时不会被调用）。
+
+    ``torch.nn.functional.gaussian_blur`` 在 torch 2.6+ 已移除，这里用可分离
+    一维高斯核 + ``F.conv2d`` 复刻同样语义：核归一化、reflection 边界、输出
+    形状与原图一致。核在输入张量的 device/dtype 上构造，CPU/CUDA 均可用。
+    """
     if sigma <= 0:
         return map_2d
     if map_2d.ndim != 2:
         raise ValueError("gaussian_blur_torch expects a 2D tensor")
     kernel_size = max(3, int(4 * sigma) | 1)
-    return F.gaussian_blur(
+    radius = kernel_size // 2
+    positions = torch.arange(kernel_size, dtype=map_2d.dtype, device=map_2d.device)
+    kernel_1d = torch.exp(-((positions - radius) ** 2) / (2.0 * sigma * sigma))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = torch.outer(kernel_1d, kernel_1d).view(
+        1, 1, kernel_size, kernel_size
+    )
+    padded = F.pad(
         map_2d.unsqueeze(0).unsqueeze(0),
-        kernel_size=(kernel_size, kernel_size),
-        sigma=sigma,
-    ).squeeze(0).squeeze(0)
+        (radius, radius, radius, radius),
+        mode="reflect",
+    )
+    return F.conv2d(padded, kernel_2d).squeeze(0).squeeze(0)
