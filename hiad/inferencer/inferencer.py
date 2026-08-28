@@ -280,6 +280,7 @@ class HRInferencer:
                 refinement_bridge_gap_tiles=self.refinement_bridge_gap_tiles,
                 map_gaussian_sigma=self.map_gaussian_sigma,
                 batch_cap=batch_size,
+                async_pipeline=self.inference_config.async_pipeline,
             )
             for manager in self.model_managers
         ]
