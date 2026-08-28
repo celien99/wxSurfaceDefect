@@ -68,12 +68,16 @@ _STATS: dict[str, StageStats] = {}
 _INSTALLED = False
 
 
-def _install_timing() -> None:
+def _install_timing(async_pipeline: bool = False) -> None:
     """把 pipeline 命名阶段包一层计时器（CPU 墙钟 + GPU busy 归因）。
 
     映射按方法存在性选择，兼容 P0 前后：P0 前 ``_coarse_forward``/``_route``，
     P0 后 ``_submit_coarse``/``_finish_coarse``/``_refine_and_merge``；后两版
     的 ``_submit_coarse`` 与 ``_finish_coarse`` 共享 ``coarse`` 归因桶。
+
+    ``async_pipeline=True`` 时只记录每阶段 CPU 墙钟，不注入 CUDA 事件与同步：
+    串行基线用事件归因找出架构级气泡，但事件 ``synchronize`` 会强制等待当前
+    stream，恰好把双缓冲的重叠窗口吞掉，使 P4 的端到端对比失真。
     """
     global _INSTALLED
     if _INSTALLED:
@@ -97,7 +101,7 @@ def _install_timing() -> None:
 
         def timed(self, *args, method=original, stats=stats, **kwargs):
             cpu_started = time.perf_counter()
-            if self.device.type == "cuda":
+            if not async_pipeline and self.device.type == "cuda":
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
@@ -121,11 +125,18 @@ def render_report(
     stats_by_stage: dict[str, StageStats],
     images: int,
     total_wall_s: float,
+    *,
+    async_mode: bool = False,
 ) -> str:
-    """渲染每阶段归因表与串行/流水理论界。"""
+    """渲染每阶段归因表与串行/流水理论界。
+
+    ``async_mode`` 时阶段归因只有 CPU 墙钟（GPU 事件会注入同步、破坏双缓冲
+    重叠），报告额外标注；P4 对比只看端到端 ``total_wall``。
+    """
     total_gpu = sum(s.gpu_busy_ms for s in stats_by_stage.values())
     total_cpu = sum(s.cpu_wall_ms for s in stats_by_stage.values())
-    lines = ["=== 每阶段归因（跨图累加） ==="]
+    mode_note = "（async 模式：阶段归因仅 CPU 墙钟，GPU busy 不适用）" if async_mode else ""
+    lines = ["=== 每阶段归因（跨图累加） ===" + mode_note]
     lines.append(
         f"{'stage':<12} {'calls':>6} {'cpu_ms':>10} {'gpu_ms':>10} "
         f"{'gpu/cpu':>7} {'cpu_share':>9}"
@@ -173,7 +184,7 @@ def main(argv=None) -> int:
         )
         for record in records
     ]
-    _install_timing()
+    _install_timing(async_pipeline=args.async_pipeline)
     wall_started = time.perf_counter()
     with HRInferencer(
         detector_class=HRDinomaly,
@@ -184,7 +195,9 @@ def main(argv=None) -> int:
     ) as inferencer:
         inferencer.inference(samples)
     total_wall = time.perf_counter() - wall_started
-    report_text = render_report(_STATS, len(samples), total_wall)
+    report_text = render_report(
+        _STATS, len(samples), total_wall, async_mode=args.async_pipeline
+    )
     print(report_text)
     if args.report:
         os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
