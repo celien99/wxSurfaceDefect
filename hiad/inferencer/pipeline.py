@@ -123,6 +123,10 @@ class DeviceImagePipeline:
         # 质量门禁由上层 inference() 统一评估；batch_cap 是自适应批的硬上限
         # （上层 --batch-size 注入，0 = 无上限）。
         self.device = next(iter(self.detectors.values())).device
+        # P1：解码器推理精度由推理配置注入；默认关闭，过 parity+安全门后翻转。
+        for detector in self.detectors.values():
+            if hasattr(detector, "set_decoder_precision"):
+                detector.set_decoder_precision(self.inference_config.decoder_amp)
 
     def _coarse_task(self) -> TaskDefinition:
         return next(task for task in self.coarse_tasks

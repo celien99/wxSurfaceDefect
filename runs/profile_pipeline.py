@@ -42,6 +42,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="profile the P0 async double-buffer loop instead of the serial baseline",
     )
+    parser.add_argument(
+        "--decoder-amp",
+        action="store_true",
+        help="Enable FP16 decoder autocast (P1); compare against baseline",
+    )
     parser.add_argument("--report", default="results/profile_pipeline_report.txt")
     args = parser.parse_args(argv)
     if args.batch_size <= 0:
@@ -191,6 +196,8 @@ def main(argv=None) -> int:
         config = yaml.safe_load(stream)
     if args.async_pipeline:
         config.setdefault("inference", {})["async_pipeline"] = True
+    if args.decoder_amp:
+        config.setdefault("inference", {})["decoder_amp"] = True
     gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]
     if not gpu_ids:
         raise ValueError("At least one GPU id is required")

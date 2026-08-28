@@ -231,6 +231,7 @@ class HRDinomaly(BaseDetector):
         self.encoder_amp: bool = encoder_amp
         self.decoder_amp: bool = decoder_amp
         self.allow_tf32: bool = allow_tf32
+        self.decoder_inference_amp: bool = False
         self.evidence_weights: tuple[float, float, float] = evidence_weights
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
@@ -321,6 +322,24 @@ class HRDinomaly(BaseDetector):
             self.context_conditioner = self.context_conditioner.to(device)
         self.feature_memory = self.feature_memory.to(device)
         self.device = device
+
+    def set_decoder_precision(self, amp: bool) -> None:
+        """推理时是否用 FP16 autocast 跑重建解码器。
+
+        只影响 :meth:`inference_batch`（及其委托方 :meth:`inference_step`）；
+        不影响 :meth:`fit_normal_evidence`（校准基线保持 FP32）与
+        :meth:`train_step`。
+
+        Args:
+            amp (bool): 为真时在 CUDA 上用 ``torch.autocast(float16)`` 包裹
+                重建解码器前向（线性层 FP16、einsum 核心保持 FP32）。
+
+        Raises:
+            TypeError: ``amp`` 不是布尔值。
+        """
+        if not isinstance(amp, bool):
+            raise TypeError("amp must be a boolean")
+        self.decoder_inference_amp = amp
 
     @torch.no_grad()
     def fit_normal_evidence(self, train_dataloader: DataLoader[Any]) -> None:
@@ -706,9 +725,14 @@ class HRDinomaly(BaseDetector):
             main_features,
             context_features,
         )
-        semantic_encoder, semantic_decoder = self.model.distillation(
-            list(conditioned_features)
-        )
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.decoder_inference_amp and self.device.type == "cuda",
+        ):
+            semantic_encoder, semantic_decoder = self.model.distillation(
+                list(conditioned_features)
+            )
         fused_pixel, fused_token = self._fused_evidence(
             data,
             conditioned_features,

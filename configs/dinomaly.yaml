@@ -48,3 +48,7 @@ min_mean_luminance: 0.05
 max_mean_luminance: 0.95
 max_clipped_fraction: 0.50
 min_focus_variance: 10.0
+
+# P1 推理解码器 FP16（autocast）开关；过 parity+安全门后翻为 true。
+inference:
+  decoder_amp: false
