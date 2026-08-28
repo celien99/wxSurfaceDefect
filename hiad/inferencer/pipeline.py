@@ -22,7 +22,6 @@ from hiad.constants import (
 from hiad.data import (
     HRSample,
     HRImageIndex,
-    MultiResolutionIndex,
     build_grid_contexts,
     build_multiresolution_region,
     split_image_regions,
@@ -131,7 +130,7 @@ class DeviceImagePipeline:
         # 质量门禁由上层 inference() 统一评估；batch_cap 是自适应批的硬上限
         # （上层 --batch-size 注入，0 = 无上限）。
         self.device = next(iter(self.detectors.values())).device
-        # P1：解码器推理精度由推理配置注入；默认关闭，过 parity+安全门后翻转。
+        # 解码器推理精度（FP16 autocast）由推理配置注入。
         for detector in self.detectors.values():
             if hasattr(detector, "set_decoder_precision"):
                 detector.set_decoder_precision(self.inference_config.decoder_amp)
@@ -472,7 +471,7 @@ class DeviceImagePipeline:
         """串行模式：逐阶段顺序执行（每个阶段即 async 模式的同名函数）。
 
         数值与旧 ``_coarse_forward`` + ``_route`` + ``_refine_and_merge`` 路径
-        逐位一致；拆分与数值一致性由 P2 模式 parity 测试护栏。
+        逐位一致。
         """
         image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
         try:
