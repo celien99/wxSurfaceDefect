@@ -5,7 +5,7 @@ import os
 import time
 from collections.abc import Mapping, Sequence
 from functools import partial
-from typing import Any, TypeAlias, cast
+from typing import Any, TypeAlias
 
 import numpy as np
 import torch
@@ -13,18 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from hiad.models import (
-    ConditionalFeatureFusion,
-    NormalFeatureMemory,
-    TimmDinoV3Encoder,
-)
-from hiad.runtime import mapops
-from hiad.runtime.contracts import DetectorPrediction
-from hiad.runtime.evidence import (
-    denormalize_imagenet_batch,
-    fuse_evidence_tensors,
-    high_frequency_map,
-)
+from hiad.models import TimmDinoV3Encoder
 
 from .base import BaseDetector
 from .dinomaly.models.uad import ViTill
@@ -33,125 +22,23 @@ from .dinomaly.models.vision_transformer import LinearAttention2, bMlp
 from .dinomaly.optimizers import StableAdamW
 from .dinomaly.utils import WarmCosineScheduler, global_cosine_hm_percent
 
-RunningMoments: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 FeatureLayers: TypeAlias = Sequence[torch.Tensor]
 DetectorBatch: TypeAlias = Mapping[str, Any]
 
 
 def _positive_int(value: object, name: str) -> int:
-    """校验检测器参数为正整数且不是布尔值。
-
-    Args:
-        value (object): 待校验参数。
-        name (str): 用于错误消息的参数名。
-
-    Returns:
-        int: 通过校验的原整数。
-
-    Raises:
-        ValueError: 值不是正整数或是布尔值。
-    """
+    """校验检测器参数为正整数且不是布尔值。"""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
 
 
-def _empty_moments(device: torch.device) -> RunningMoments:
-    """在目标设备创建 ``(count, mean, m2)`` 流式统计初值。
-
-    Args:
-        device (torch.device): 标量统计张量所在设备。
-
-    Returns:
-        RunningMoments: 三个相互独立的 ``float32`` 零维零张量。
-    """
-    zero = torch.zeros((), dtype=torch.float32, device=device)
-    return zero.clone(), zero.clone(), zero.clone()
-
-
-def _update_moments(
-    moments: RunningMoments,
-    values: torch.Tensor,
-) -> RunningMoments:
-    """用一批张量元素通过并行 Welford 公式更新全局矩统计。
-
-    Args:
-        moments (RunningMoments): 当前元素数、均值和二阶中心矩累积量。
-        values (torch.Tensor): 任意形状的新证据值，展平后按 ``float32`` 统计。
-
-    Returns:
-        RunningMoments: 更新后的元素数、均值和二阶中心矩。
-    """
-    count, mean, m2 = moments
-    values = values.reshape(-1).to(dtype=torch.float32)
-    batch_count = torch.as_tensor(values.numel(), dtype=torch.float32, device=values.device)
-    batch_mean = values.mean()
-    batch_m2 = (values - batch_mean).square().sum()
-    total = count + batch_count
-    delta = batch_mean - mean
-    return (
-        total,
-        mean + delta * batch_count / total,
-        m2 + batch_m2 + delta.square() * count * batch_count / total,
-    )
-
-
-def _finalize_moments(
-    moments: RunningMoments,
-    name: str,
-) -> tuple[float, float]:
-    """把流式矩转换为证据标准化使用的均值和样本标准差。
-
-    Args:
-        moments (RunningMoments): 已累计的元素数、均值和二阶中心矩。
-        name (str): 用于异常消息的证据分支名称。
-
-    Returns:
-        tuple[float, float]: Python 浮点均值和不小于 ``1e-6`` 的标准差。
-
-    Raises:
-        ValueError: 累计值少于两个，无法估计样本标准差。
-    """
-    count, mean, m2 = moments
-    if count < 2:
-        raise ValueError(f"{name} fitting requires at least two values")
-    scale = torch.sqrt(m2 / (count - 1)).clamp_min(1e-6)
-    return float(mean.item()), float(scale.item())
-
-
 class HRDinomaly(BaseDetector):
-    """DINOv3 + Dinomaly 高分辨率检测器及其多证据融合实现。
+    """DINOv3 + Dinomaly 高分辨率检测器。
 
-    Args:
-        backbone_name (str): ``timm`` DINOv3 主干名称。
-        total_iters (int): 配置训练迭代数；实际至少覆盖一个完整采样轮次。
-        log_per_steps (int): 训练状态日志间隔。
-        patch_size (int): 正方形模型输入边长，单位为像素。
-        logger (logging.Logger | None): 可选任务日志器。
-        device (torch.device): 模型驻留设备。
-        seed (int): 检测器随机种子。
-        bottleneck_dropout (float): 瓶颈 dropout，范围 ``[0, 1)``。
-        grad_clip_norm (float): 梯度范数裁剪上限；``0`` 表示禁用。
-        hard_mining_final (float): 困难 token 挖掘最终比例，范围 ``[0, 1]``。
-        hard_mining_warmup_iters (int): 困难挖掘线性预热迭代数。
-        easy_grad_factor (float): 易 token 梯度因子，范围 ``[0, 1]``。
-        score_top_k (int): 图像分数聚合的最高异常 token 数。
-        encoder_amp (bool): CUDA 编码器是否使用 FP16 autocast。
-        decoder_amp (bool): CUDA 重建训练是否使用 FP16 和 GradScaler。
-        allow_tf32 (bool): 是否允许 CUDA TF32 计算。
-        semantic_weight (float): 语义重建证据权重。
-        memory_weight (float): 正常特征记忆证据权重。
-        high_frequency_weight (float): 高频纹理证据权重。
-        use_context_conditioning (bool): 是否用多尺度上下文条件化主补丁特征。
-
-    Attributes:
-        encoder (TimmDinoV3Encoder): 冻结的多层 DINOv3 编码器。
-        context_conditioner (ConditionalFeatureFusion | None): 可训练上下文融合模块。
-        feature_memory (NormalFeatureMemory): 正常特征对角高斯记忆。
-        bottleneck (nn.ModuleList): Dinomaly 可训练瓶颈。
-        decoder (nn.ModuleList): Dinomaly 可训练重建解码块。
-        model (ViTill): 组合编码器、瓶颈和解码器的重建模型。
-        evidence_weights (tuple[float, float, float]): 语义、记忆和高频分支权重。
+    用冻结的 DINOv3 编码器配合可训练瓶颈与解码器做重建，异常证据为逐层
+    ``1 - cosine_similarity`` 的跨层最大值；多尺度上下文特征按 ``fusion_weights``
+    加权融合后进入重建，图像分数取最高 ``score_top_k`` 个 token 的均值。
     """
 
     def __init__(
@@ -163,6 +50,7 @@ class HRDinomaly(BaseDetector):
         logger: logging.Logger | None,
         device: torch.device,
         seed: int = 0,
+        fusion_weights: Sequence[float] | None = None,
         bottleneck_dropout: float = 0.1,
         grad_clip_norm: float = 1.0,
         hard_mining_final: float = 0.0,
@@ -172,16 +60,18 @@ class HRDinomaly(BaseDetector):
         encoder_amp: bool = True,
         decoder_amp: bool = True,
         allow_tf32: bool = True,
-        semantic_weight: float = 0.6,
-        memory_weight: float = 0.3,
-        high_frequency_weight: float = 0.1,
-        use_context_conditioning: bool = True,
         backbone_weights_path: str | None = None,
         **_: object,
     ) -> None:
         total_iters = _positive_int(total_iters, "total_iters")
         log_per_steps = _positive_int(log_per_steps, "log_per_steps")
-        super().__init__(patch_size, device, logger, seed)
+        super().__init__(
+            patch_size,
+            device,
+            logger=logger,
+            seed=seed,
+            fusion_weights=fusion_weights,
+        )
 
         bottleneck_dropout = float(bottleneck_dropout)
         grad_clip_norm = float(grad_clip_norm)
@@ -204,24 +94,11 @@ class HRDinomaly(BaseDetector):
             )
         if not 0 <= easy_grad_factor <= 1:
             raise ValueError(f"easy_grad_factor must be in [0, 1], got {easy_grad_factor}")
-        if not isinstance(encoder_amp, bool):
-            raise TypeError("encoder_amp must be a boolean")
-        if not isinstance(decoder_amp, bool):
-            raise TypeError("decoder_amp must be a boolean")
-        if not isinstance(allow_tf32, bool):
-            raise TypeError("allow_tf32 must be a boolean")
-        if not isinstance(use_context_conditioning, bool):
-            raise TypeError("use_context_conditioning must be a boolean")
-        evidence_weights = (
-            float(semantic_weight),
-            float(memory_weight),
-            float(high_frequency_weight),
-        )
-        if any(not np.isfinite(weight) or weight < 0 for weight in evidence_weights):
-            raise ValueError("evidence weights must be finite and non-negative")
-        if sum(evidence_weights) <= 0:
-            raise ValueError("at least one evidence weight must be positive")
+        for name, value in (("encoder_amp", encoder_amp), ("decoder_amp", decoder_amp), ("allow_tf32", allow_tf32)):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean")
         score_top_k = _positive_int(score_top_k, "score_top_k")
+
         self.total_iters: int = total_iters
         self.grad_clip_norm: float = grad_clip_norm
         self.hard_mining_final: float = hard_mining_final
@@ -232,11 +109,12 @@ class HRDinomaly(BaseDetector):
         self.decoder_amp: bool = decoder_amp
         self.allow_tf32: bool = allow_tf32
         self.decoder_inference_amp: bool = False
-        self.evidence_weights: tuple[float, float, float] = evidence_weights
+
         if device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
             torch.backends.cudnn.allow_tf32 = allow_tf32
             torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+
         self.target_layers: list[int] = [2, 3, 4, 5, 6, 7, 8, 9]
         self.fuse_layer_encoder: list[list[int]] = [[0, 1, 2, 3], [4, 5, 6, 7]]
         self.fuse_layer_decoder: list[list[int]] = [[0, 1, 2, 3], [4, 5, 6, 7]]
@@ -256,36 +134,20 @@ class HRDinomaly(BaseDetector):
         else:
             raise ValueError(f"Unsupported DINOv3 embedding dimension: {embed_dim}")
 
-        self.context_conditioner: ConditionalFeatureFusion | None = (
-            ConditionalFeatureFusion(
-                embed_dim=embed_dim,
-                layers=len(self.target_layers),
-            )
-            if use_context_conditioning
-            else None
-        )
-        self.feature_memory: NormalFeatureMemory = NormalFeatureMemory(
-            embed_dim=embed_dim,
-            layers=len(self.target_layers),
-        )
-        self.high_frequency_center: float = 0.0
-        self.high_frequency_scale: float = 1.0
-        self.semantic_center: float = 0.0
-        self.semantic_scale: float = 1.0
-        self.memory_center: float = 0.0
-        self.memory_scale: float = 1.0
-
         self.bottleneck: nn.ModuleList = nn.ModuleList(
             [bMlp(embed_dim, embed_dim * 4, embed_dim, drop=bottleneck_dropout)]
         )
 
         decoder_blocks: list[nn.Module] = []
         for _ in range(8):
-            blk = VitBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.,
-                           qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8),
-
-                           attn=LinearAttention2)
-
+            blk = VitBlock(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=4.0,
+                qkv_bias=True,
+                norm_layer=partial(nn.LayerNorm, eps=1e-8),
+                attn=LinearAttention2,
+            )
             decoder_blocks.append(blk)
         self.decoder: nn.ModuleList = nn.ModuleList(decoder_blocks)
 
@@ -301,292 +163,26 @@ class HRDinomaly(BaseDetector):
 
     @torch.no_grad()
     def embedding(self, input_tensor: torch.Tensor) -> list[torch.Tensor]:
-        """在检测器设备上提取冻结编码器的多层 BCHW 特征。
-
-        Args:
-            input_tensor (torch.Tensor): ImageNet 标准化的 BCHW RGB 输入。
-
-        Returns:
-            list[torch.Tensor]: 八个目标层的 ``float32`` BCHW 特征。
-        """
+        """在检测器设备上提取冻结编码器的多层 BCHW 特征。"""
         return self.model.encoder_image(input_tensor.to(self.device))
 
     def to_device(self, device: torch.device) -> None:
-        """把重建模型、上下文模块和正常特征内存移动到目标设备。
-
-        Args:
-            device (torch.device): 目标 CPU 或 CUDA 设备。
-        """
+        """把重建模型移动到目标设备。"""
         self.model = self.model.to(device)
-        if self.context_conditioner is not None:
-            self.context_conditioner = self.context_conditioner.to(device)
-        self.feature_memory = self.feature_memory.to(device)
         self.device = device
 
     def set_decoder_precision(self, amp: bool) -> None:
         """推理时是否用 FP16 autocast 跑重建解码器。
 
-        只影响 :meth:`inference_batch`（及其委托方 :meth:`inference_step`）；
-        不影响 :meth:`fit_normal_evidence`（校准基线保持 FP32）与
-        :meth:`train_step`。
-
-        Args:
-            amp (bool): 为真时在 CUDA 上用 ``torch.autocast(float16)`` 包裹
-                重建解码器前向（线性层 FP16、einsum 核心保持 FP32）。
-
-        Raises:
-            TypeError: ``amp`` 不是布尔值。
+        只影响 :meth:`inference_batch`，不影响 :meth:`train_step`。
         """
         if not isinstance(amp, bool):
             raise TypeError("amp must be a boolean")
         self.decoder_inference_amp = amp
 
-    @torch.no_grad()
-    def fit_normal_evidence(self, train_dataloader: DataLoader[Any]) -> None:
-        """仅用正常补丁拟合语义、记忆和高频证据的标准化参数。
-
-        Args:
-            train_dataloader (DataLoader[Any]): 产生主补丁及可选多尺度上下文的
-                正常训练加载器。
-
-        Raises:
-            ValueError: 任一证据分支累计值少于两个。
-            RuntimeError: 正常特征内存未成功拟合或模型前向失败。
-
-        Notes:
-            第一遍同时拟合正常特征内存、语义和高频统计；第二遍在固定内存上
-            计算记忆距离统计，避免边更新边打分造成分布漂移。
-        """
-        self.model.eval()
-        if self.context_conditioner is not None:
-            self.context_conditioner.eval()
-        self.feature_memory.reset()
-        semantic_moments = _empty_moments(self.device)
-        frequency_moments = _empty_moments(self.device)
-        for data in train_dataloader:
-            main_features, context_features = self.get_multi_resolution_embeddings(data)
-            conditioned = self._condition_features(main_features, context_features)
-            self.feature_memory.update(conditioned)
-
-            semantic_encoder, semantic_decoder = self.model.distillation(
-                list(conditioned)
-            )
-            semantic_token = torch.cat(
-                self._layer_anomaly_token_maps(semantic_encoder, semantic_decoder),
-                dim=1,
-            ).amax(dim=1, keepdim=True)
-            semantic_moments = _update_moments(semantic_moments, semantic_token)
-
-            image = data["image"].to(self.device, non_blocking=True)
-            frequency_moments = _update_moments(
-                frequency_moments,
-                high_frequency_map(denormalize_imagenet_batch(image)),
-            )
-
-        memory_moments = _empty_moments(self.device)
-        for data in train_dataloader:
-            main_features, context_features = self.get_multi_resolution_embeddings(data)
-            conditioned = self._condition_features(main_features, context_features)
-            semantic_encoder, semantic_decoder = self.model.distillation(
-                list(conditioned)
-            )
-            semantic_token = torch.cat(
-                self._layer_anomaly_token_maps(semantic_encoder, semantic_decoder),
-                dim=1,
-            ).amax(dim=1, keepdim=True)
-            memory_token = self._memory_token_map(conditioned, semantic_token.shape[-2:])
-            memory_moments = _update_moments(memory_moments, memory_token)
-
-        self.semantic_center, self.semantic_scale = _finalize_moments(
-            semantic_moments,
-            "semantic evidence",
-        )
-        self.memory_center, self.memory_scale = _finalize_moments(
-            memory_moments,
-            "memory evidence",
-        )
-        self.high_frequency_center, self.high_frequency_scale = _finalize_moments(
-            frequency_moments,
-            "high-frequency evidence",
-        )
-
-    def _memory_token_map(
-        self,
-        features: FeatureLayers,
-        output_size: Sequence[int],
-    ) -> torch.Tensor:
-        """把多层正常记忆距离对齐并聚合为单通道 token 图。
-
-        Args:
-            features (FeatureLayers): 与正常特征内存层数和通道一致的 BCHW 特征。
-            output_size (Sequence[int]): 输出 ``(height, width)``。
-
-        Returns:
-            torch.Tensor: ``(batch, 1, height, width)`` 的最大层记忆距离。
-
-        Raises:
-            RuntimeError: 正常特征内存尚未拟合。
-            ValueError: 特征层契约不匹配。
-        """
-        memory_layers = self.feature_memory.score(features)
-        if not memory_layers:
-            raise ValueError("Feature memory must return at least one score layer")
-        maximum = F.interpolate(
-            memory_layers[0],
-            size=output_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-        for layer in memory_layers[1:]:
-            maximum = torch.maximum(
-                maximum,
-                F.interpolate(
-                    layer,
-                    size=output_size,
-                    mode="bilinear",
-                    align_corners=False,
-                ),
-            )
-        return maximum
-
-    @staticmethod
-    def _positive_normalize(
-        values: torch.Tensor,
-        center: float,
-        scale: float,
-    ) -> torch.Tensor:
-        """把证据转为只保留高于正常中心的非负标准分数。
-
-        Args:
-            values (torch.Tensor): 任意形状证据张量。
-            center (float): 正常证据均值。
-            scale (float): 正常证据标准差，必须已拟合为正数。
-
-        Returns:
-            torch.Tensor: 与输入同形状的截断标准分数。
-        """
-        return ((values - center) / scale).clamp_min(0.0)
-
-    def _condition_features(
-        self,
-        main_features: FeatureLayers,
-        context_features: FeatureLayers | None,
-    ) -> list[torch.Tensor]:
-        """按当前任务配置决定是否用上下文条件化主特征。
-
-        Args:
-            main_features (FeatureLayers): 主补丁多层 BCHW 特征。
-            context_features (FeatureLayers | None): 对齐后的多层上下文特征。
-
-        Returns:
-            list[torch.Tensor]: 条件化结果；模块禁用时返回主特征的列表副本。
-        """
-        if self.context_conditioner is None:
-            return list(main_features)
-        return self.context_conditioner(main_features, context_features)
-
-    def _fused_evidence(
-        self,
-        data: DetectorBatch,
-        memory_features: FeatureLayers,
-        semantic_encoder_features: FeatureLayers,
-        semantic_decoder_features: FeatureLayers,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """计算并融合语义、正常记忆和高频纹理三类异常证据。
-
-        Args:
-            data (DetectorBatch): 含 ImageNet 标准化 BCHW ``image`` 的批次。
-            memory_features (FeatureLayers): 用于正常特征内存打分的条件化特征。
-            semantic_encoder_features (FeatureLayers): 重建蒸馏的编码器特征。
-            semantic_decoder_features (FeatureLayers): 与编码器逐层对应的解码特征。
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: 模型输入分辨率的
-            ``(batch, 1, patch_height, patch_width)`` 像素证据，以及编码器 token
-            分辨率的 ``(batch, 1, token_height, token_width)`` 证据。
-
-        Raises:
-            KeyError: 批次缺少 ``image``。
-            ValueError: 特征层或证据权重不满足融合契约。
-            RuntimeError: 正常特征内存尚未拟合。
-        """
-        semantic_pixel, semantic_token = self.cal_anomaly_maps(
-            semantic_encoder_features,
-            semantic_decoder_features,
-            self.patch_size,
-        )
-        semantic_pixel = self._positive_normalize(
-            semantic_pixel, self.semantic_center, self.semantic_scale
-        )
-        semantic_token = self._positive_normalize(
-            semantic_token, self.semantic_center, self.semantic_scale
-        )
-        memory_token = self._memory_token_map(
-            memory_features,
-            semantic_token.shape[-2:],
-        )
-        memory_token = self._positive_normalize(
-            memory_token, self.memory_center, self.memory_scale
-        )
-        memory_pixel = F.interpolate(
-            memory_token,
-            size=semantic_pixel.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        image = data["image"].to(self.device, non_blocking=True)
-        frequency_pixel = (
-            (
-                high_frequency_map(denormalize_imagenet_batch(image))
-                - self.high_frequency_center
-            )
-            / self.high_frequency_scale
-        ).clamp_min(0.0)
-        if frequency_pixel.shape[-2:] != semantic_pixel.shape[-2:]:
-            frequency_pixel = F.interpolate(
-                frequency_pixel,
-                size=semantic_pixel.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-        frequency_token = F.adaptive_avg_pool2d(
-            frequency_pixel,
-            output_size=semantic_token.shape[-2:],
-        )
-        fused_pixel = fuse_evidence_tensors(
-            [semantic_pixel, memory_pixel, frequency_pixel],
-            self.evidence_weights,
-        )
-        fused_token = fuse_evidence_tensors(
-            [semantic_token, memory_token, frequency_token],
-            self.evidence_weights,
-        )
-        return fused_pixel, fused_token
-
-    def train_step(
-        self,
-        train_dataloader: DataLoader[Any],
-        task_name: str,
-    ) -> None:
-        """训练当前任务的瓶颈、解码器及可选上下文融合模块。
-
-        Args:
-            train_dataloader (DataLoader[Any]): 按源图公平采样的正常补丁加载器。
-            task_name (str): 用于日志和数值异常消息的任务名称。
-
-        Raises:
-            FloatingPointError: 损失或裁剪前梯度出现非有限值。
-            RuntimeError: 模型前向、反向或优化器步骤失败。
-
-        Notes:
-            冻结 DINOv3 编码器；实际迭代数取配置值与一个完整采样轮次中的较大值，
-            从而保证每张正常原图至少为当前任务贡献过补丁。
-        """
-        trainable_modules: list[nn.Module] = [self.bottleneck, self.decoder]
-        if self.context_conditioner is not None:
-            trainable_modules.insert(0, self.context_conditioner)
-        trainable = nn.ModuleList(trainable_modules)
+    def train_step(self, train_dataloader: DataLoader[Any], task_name: str) -> None:
+        """训练当前任务的瓶颈与解码器重建模块。"""
+        trainable = nn.ModuleList([self.bottleneck, self.decoder])
 
         for m in trainable.modules():
             if isinstance(m, nn.Linear):
@@ -597,9 +193,14 @@ class HRDinomaly(BaseDetector):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
 
-        optimizer = StableAdamW([{'params': trainable.parameters()}], lr=2e-3,
-                                betas=(0.9, 0.999), weight_decay=1e-4, amsgrad=False, eps=1e-10)
-        # 至少跑完首个采样轮次，确保每张正常原图都为当前任务提供过补丁。
+        optimizer = StableAdamW(
+            [{"params": trainable.parameters()}],
+            lr=2e-3,
+            betas=(0.9, 0.999),
+            weight_decay=1e-4,
+            amsgrad=False,
+            eps=1e-10,
+        )
         batches_per_epoch = len(train_dataloader)
         training_iters = max(self.total_iters, batches_per_epoch)
         warmup_iters = min(100, max(training_iters - 1, 0))
@@ -624,8 +225,6 @@ class HRDinomaly(BaseDetector):
         scaler = torch.amp.GradScaler("cuda", enabled=decoder_amp_enabled)
         self.model.train()
         self.model.encoder.eval()
-        if self.context_conditioner is not None:
-            self.context_conditioner.train()
         it = 0
         step_started = time.perf_counter()
         for _epoch in range(int(np.ceil(training_iters / batches_per_epoch))):
@@ -639,8 +238,7 @@ class HRDinomaly(BaseDetector):
                     dtype=torch.float16,
                     enabled=decoder_amp_enabled,
                 ):
-                    main_features, context_features = self.get_multi_resolution_embeddings(data)
-                    en = self._condition_features(main_features, context_features)
+                    en = self.get_multi_resolution_fusion_embeddings(data)
                     en, de = self.model.distillation(en)
 
                     if self.hard_mining_warmup_iters == 0:
@@ -702,100 +300,31 @@ class HRDinomaly(BaseDetector):
                     break
 
     @torch.inference_mode()
-    def inference_batch(
-        self,
-        data: DetectorBatch,
-        cell_cache: Mapping[str, list[torch.Tensor]] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """在检测器设备上计算融合异常图与 token 图，不做任何 CPU 往返。
-
-        Args:
-            data (DetectorBatch): 含 ``image``（BCHW）及可选
-                ``low_resolution_image_<n>``/``low_resolution_index_<n>`` 的批次；
-                ``cell_cache`` 非空时另需 ``cell_id``/``cell_index``（见
-                :meth:`BaseDetector.get_multi_resolution_embeddings`）。
-            cell_cache (Mapping[str, list[torch.Tensor]] | None): context 复用
-                的 cell 特征缓存；``None`` 时走逐 tile 独立编码现状路径。
+    def inference_batch(self, data: DetectorBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        """在检测器设备上计算异常图与 token 图，不做任何 CPU 往返。
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: ``(fused_pixel, fused_token)``，
-            均为设备驻留张量；前者形状 ``(batch, 1, patch_h, patch_w)``，
-            后者为编码器 token 分辨率。由调用方决定何时（以及是否）拷贝回 CPU。
+            tuple[torch.Tensor, torch.Tensor]: ``(anomaly_map, token_map)``，
+            均为设备驻留张量；前者形状 ``(batch, 1, patch_h, patch_w)``，后者
+            为编码器 token 分辨率。由调用方决定何时拷贝回 CPU。
         """
         self.model.eval()
-        if self.context_conditioner is not None:
-            self.context_conditioner.eval()
-        main_features, context_features = self.get_multi_resolution_embeddings(
-            data, cell_cache=cell_cache
-        )
-        conditioned_features = self._condition_features(
-            main_features,
-            context_features,
-        )
+        en = self.get_multi_resolution_fusion_embeddings(data)
         with torch.autocast(
             device_type=self.device.type,
             dtype=torch.float16,
             enabled=self.decoder_inference_amp and self.device.type == "cuda",
         ):
-            semantic_encoder, semantic_decoder = self.model.distillation(
-                list(conditioned_features)
-            )
-        fused_pixel, fused_token = self._fused_evidence(
-            data,
-            conditioned_features,
-            semantic_encoder,
-            semantic_decoder,
-        )
-        return fused_pixel, fused_token
-
-    @torch.inference_mode()
-    def inference_step(
-        self,
-        test_dataloader: DataLoader[Any],
-    ) -> list[DetectorPrediction]:
-        """按 DataLoader 顺序生成融合异常图和 Top-K token 图像分数。
-
-        本方法委托 :meth:`inference_batch` 并在每次批次末尾拷贝回 CPU；训练与
-        校准路径保留该 DataLoader 入口，推理热路径使用 :meth:`inference_batch`
-        避免逐批 CPU 往返。
-        """
-        predictions: list[DetectorPrediction] = []
-        for data in test_dataloader:
-            fused_pixel, fused_token = self.inference_batch(data)
-            pixel_batch = fused_pixel[:, 0].cpu().numpy()
-            score_batch = mapops.top_k_token_scores_torch(
-                fused_token, self.score_top_k
-            ).cpu().numpy()
-            predictions.extend(
-                {
-                    "anomaly_map": pixel_map,
-                    "score": float(score),
-                }
-                for pixel_map, score in zip(
-                    pixel_batch,
-                    score_batch,
-                )
-            )
-        return predictions
+            en, de = self.model.distillation(en)
+        anomaly_map, token_map = self.cal_anomaly_maps(en, de, self.patch_size)
+        return anomaly_map, token_map
 
     @staticmethod
     def _layer_anomaly_token_maps(
         encoder_features: FeatureLayers,
         decoder_features: FeatureLayers,
     ) -> list[torch.Tensor]:
-        """计算逐层编码/重建特征的非负余弦距离 token 图。
-
-        Args:
-            encoder_features (FeatureLayers): 非空多层 BCHW 编码特征。
-            decoder_features (FeatureLayers): 数量和各层形状对应的重建特征。
-
-        Returns:
-            list[torch.Tensor]: 每层一个 ``(batch, 1, height, width)``、范围
-            ``[0, 2]`` 的余弦距离图。
-
-        Raises:
-            ValueError: 特征列表为空或层数不一致。
-        """
+        """计算逐层编码/重建特征的非负余弦距离 token 图。"""
         if not encoder_features or len(encoder_features) != len(decoder_features):
             raise ValueError("Encoder and decoder feature lists must be non-empty and aligned")
         return [
@@ -813,100 +342,61 @@ class HRDinomaly(BaseDetector):
         decoder_features: FeatureLayers,
         output_size: Sequence[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """把逐层语义 token 距离聚合为 token 图和模型像素图。
-
-        Args:
-            encoder_features (FeatureLayers): 多层编码器 BCHW 特征。
-            decoder_features (FeatureLayers): 对应的多层重建 BCHW 特征。
-            output_size (Sequence[int]): 目标模型输入 ``(width, height)``。
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: ``(batch, 1, height, width)`` 像素图，
-            以及编码器空间尺寸的单通道 token 图；两者均跨层取最大响应。
-        """
+        """把逐层语义 token 距离聚合为 token 图和模型像素图。"""
         token_layer_maps = self._layer_anomaly_token_maps(
             encoder_features,
             decoder_features,
         )
-        token_map = token_layer_maps[0]
-        for token_layer_map in token_layer_maps[1:]:
-            token_map = torch.maximum(token_map, token_layer_map)
-        anomaly_map = F.interpolate(
-            token_layer_maps[0],
-            size=(output_size[1], output_size[0]),
-            mode="bilinear",
-            align_corners=True,
-        )
-        for token_layer_map in token_layer_maps[1:]:
-            anomaly_map = torch.maximum(
-                anomaly_map,
-                F.interpolate(
-                    token_layer_map,
-                    size=(output_size[1], output_size[0]),
-                    mode="bilinear",
-                    align_corners=True,
-                ),
+        token_map = torch.cat(token_layer_maps, dim=1).amax(dim=1, keepdim=True)
+        pixel_layer_maps = [
+            F.interpolate(
+                token_layer_map,
+                size=(output_size[1], output_size[0]),
+                mode="bilinear",
+                align_corners=True,
             )
+            for token_layer_map in token_layer_maps
+        ]
+        anomaly_map = torch.cat(pixel_layer_maps, dim=1).amax(dim=1, keepdim=True)
         return anomaly_map, token_map
 
-    @staticmethod
-    def _top_k_token_scores(token_maps: torch.Tensor, top_k: int) -> torch.Tensor:
-        """按样本聚合最高异常 token 的均值（委托 ``mapops``）。"""
-        return mapops.top_k_token_scores_torch(token_maps, top_k)
-
-    def save_checkpoint(
-        self,
-        checkpoint_path: str | os.PathLike[str],
-    ) -> None:
-        """保存当前任务推理所需的可训练模块、正常内存和证据统计。
-
-        Args:
-            checkpoint_path (str | os.PathLike[str]): 目标 PyTorch 检查点路径。
-
-        Raises:
-            OSError: 检查点无法写入。
-        """
-        state: dict[str, object] = {
-            "feature_memory": self.feature_memory.state_dict(),
-            "bottleneck": self.bottleneck.state_dict(),
-            "decoder": self.decoder.state_dict(),
-            "high_frequency_center": self.high_frequency_center,
-            "high_frequency_scale": self.high_frequency_scale,
-            "semantic_center": self.semantic_center,
-            "semantic_scale": self.semantic_scale,
-            "memory_center": self.memory_center,
-            "memory_scale": self.memory_scale,
-        }
-        if self.context_conditioner is not None:
-            state["context_conditioner"] = self.context_conditioner.state_dict()
-        torch.save(state, checkpoint_path)
-
-    def load_checkpoint(
-        self,
-        checkpoint_path: str | os.PathLike[str],
-    ) -> None:
-        """从检查点恢复当前任务推理状态。
-
-        Args:
-            checkpoint_path (str | os.PathLike[str]): 与当前模型结构匹配的检查点。
-
-        Raises:
-            OSError: 检查点无法读取。
-            KeyError: 检查点缺少当前结构必需的模块或证据字段。
-            RuntimeError: 模块参数形状与当前模型不兼容。
-        """
-        state_dict = cast(
-            dict[str, Any],
-            torch.load(checkpoint_path, map_location=self.device),
+    def save_checkpoint(self, checkpoint_path: str | os.PathLike[str]) -> None:
+        """保存当前任务推理所需的瓶颈、解码器与分数配置。"""
+        for module_name, module in (
+            ("bottleneck", self.bottleneck),
+            ("decoder", self.decoder),
+        ):
+            for parameter_name, parameter in module.named_parameters():
+                if not torch.isfinite(parameter).all():
+                    raise FloatingPointError(
+                        f"Refusing to save a non-finite {module_name} parameter: {parameter_name}"
+                    )
+        torch.save(
+            {
+                "bottleneck": self.bottleneck.state_dict(),
+                "decoder": self.decoder.state_dict(),
+                "fusion_weights": self.fusion_weights,
+                "score_top_k": self.score_top_k,
+                "layer_aggregation": "max",
+                "encoder_amp": self.encoder_amp,
+                "decoder_amp": self.decoder_amp,
+                "allow_tf32": self.allow_tf32,
+            },
+            checkpoint_path,
         )
-        if self.context_conditioner is not None:
-            self.context_conditioner.load_state_dict(state_dict["context_conditioner"])
-        self.feature_memory.load_state_dict(state_dict["feature_memory"])
+
+    def load_checkpoint(self, checkpoint_path: str | os.PathLike[str]) -> None:
+        """从检查点恢复当前任务推理状态。"""
+        state_dict = torch.load(checkpoint_path, map_location=self.device)
         self.bottleneck.load_state_dict(state_dict["bottleneck"])
         self.decoder.load_state_dict(state_dict["decoder"])
-        self.high_frequency_center = float(state_dict["high_frequency_center"])
-        self.high_frequency_scale = float(state_dict["high_frequency_scale"])
-        self.semantic_center = float(state_dict["semantic_center"])
-        self.semantic_scale = float(state_dict["semantic_scale"])
-        self.memory_center = float(state_dict["memory_center"])
-        self.memory_scale = float(state_dict["memory_scale"])
+        self.fusion_weights = state_dict.get("fusion_weights")
+        aggregation = state_dict.get("layer_aggregation", "max")
+        if aggregation != "max":
+            raise ValueError(f"Unsupported checkpoint layer aggregation: {aggregation}")
+        if state_dict.get("encoder_amp", self.encoder_amp) != self.encoder_amp:
+            raise ValueError("Checkpoint encoder_amp does not match runtime configuration")
+        self.score_top_k = _positive_int(
+            state_dict.get("score_top_k", self.score_top_k),
+            "checkpoint score_top_k",
+        )

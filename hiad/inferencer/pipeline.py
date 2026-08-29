@@ -22,15 +22,11 @@ from hiad.constants import (
 from hiad.data import (
     HRSample,
     HRImageIndex,
-    build_grid_contexts,
     build_multiresolution_region,
-    split_image_regions,
     split_multiresolution_regions,
 )
 from hiad.data.patch_builder import (
-    build_cell_batch,
     build_patch_batch,
-    build_shared_context_patch_batch,
     build_thumbnail_batch,
 )
 from hiad.detectors.base import BaseDetector
@@ -93,7 +89,6 @@ class _PrefetchItem:
     thumbnail_batch: object
     thumbnail_record: TaskInputRecord
     thumbnail_size: int
-    cell_batch: object | None = None
 
 
 class DeviceImagePipeline:
@@ -195,16 +190,11 @@ class DeviceImagePipeline:
         detector: BaseDetector,
         batch: Mapping[str, object],
         patch_size: int,
-        cell_cache: Mapping[str, list[torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """按自适应子批前向并拼接，返回 ``(pixel_maps, token_scores)``。
 
         ``pixel_maps`` 形状 ``(N, 1, P, P)``；调用方负责在拼接/融合时做
         ``[:, 0]`` 二维切片（见 ``_submit_coarse`` / ``_refine_and_merge``）。
-
-        ``cell_cache`` 非空时把批次交给 context 复用前向（粗扫共享 context
-        批量，主补丁特征从缓存 cell 切片）；此时批次不携带
-        ``low_resolution_image_*``，按单视图估算子批规模即可。
         """
         chunk_size = self._records_per_batch(
             patch_size,
@@ -213,9 +203,7 @@ class DeviceImagePipeline:
         pixel_parts: list[torch.Tensor] = []
         token_parts: list[torch.Tensor] = []
         for chunk, _start, _stop in self._chunk_batch(batch, chunk_size):
-            fused_pixel, fused_token = detector.inference_batch(
-                chunk, cell_cache=cell_cache
-            )
+            fused_pixel, fused_token = detector.inference_batch(chunk)
             pixel_parts.append(fused_pixel)
             token_parts.append(fused_token)
         return torch.cat(pixel_parts, dim=0), torch.cat(token_parts, dim=0)
@@ -330,51 +318,15 @@ class DeviceImagePipeline:
             "image_size": image_size,
             "model_input_size": (coarse_task["patch_size"], coarse_task["patch_size"]),
         }
-        if self.inference_config.context_share:
-            # 复用前提是 cell 完整包含主补丁；仅 ds_factors=[0,1] + 无重叠
-            # 步长时成立，其他配置直接报错。
-            if coarse_task["ds_factors"] != [0, 1]:
-                raise ValueError(
-                    "inference.context_share targets the default coarse config "
-                    f"(ds_factors=[0, 1]); got {coarse_task['ds_factors']}"
-                )
-            if (
-                coarse_task["stride"] is not None
-                and coarse_task["stride"] != coarse_task["patch_size"]
-            ):
-                raise ValueError(
-                    "inference.context_share requires non-overlapping main "
-                    f"patches (stride is None or == patch_size); "
-                    f"got stride={coarse_task['stride']}"
-                )
-            cell_size = (
-                coarse_task["patch_size"] * 2 ** max(coarse_task["ds_factors"])
-            )
-            main_indexes = split_image_regions(
-                image_size,
-                coarse_task["patch_size"],
-                stride=coarse_task["stride"],
-            )
-            cells, multi_indexes = build_grid_contexts(
-                image_size, main_indexes, cell_size
-            )
-            coarse_batch, coarse_records = build_shared_context_patch_batch(
-                image, multi_indexes, coarse_task["patch_size"], base
-            )
-            cell_batch, _cell_ids = build_cell_batch(
-                image, cells, coarse_task["patch_size"]
-            )
-        else:
-            indexes = split_multiresolution_regions(
-                image_size=image_size,
-                patch_size=coarse_task["patch_size"],
-                ds_factors=coarse_task["ds_factors"],
-                stride=coarse_task["stride"],
-            )
-            coarse_batch, coarse_records = build_patch_batch(
-                image, indexes, coarse_task["patch_size"], base
-            )
-            cell_batch = None
+        indexes = split_multiresolution_regions(
+            image_size=image_size,
+            patch_size=coarse_task["patch_size"],
+            ds_factors=coarse_task["ds_factors"],
+            stride=coarse_task["stride"],
+        )
+        coarse_batch, coarse_records = build_patch_batch(
+            image, indexes, coarse_task["patch_size"], base
+        )
         thumb_base = {
             "task_name": thumbnail_task["name"],
             "task_type": thumbnail_task["type"],
@@ -395,7 +347,6 @@ class DeviceImagePipeline:
             thumbnail_batch=thumbnail_batch,
             thumbnail_record=thumbnail_record,
             thumbnail_size=thumbnail_task["thumbnail_size"],
-            cell_batch=cell_batch,
         )
 
     def _submit_coarse(self, item: _PrefetchItem) -> _CoarseState:
@@ -407,14 +358,8 @@ class DeviceImagePipeline:
         coarse_task = self._coarse_task()
         coarse_detector = self.detectors[coarse_task["name"]]
         image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
-        cell_cache = None
-        if item.cell_batch is not None:
-            cell_cache = coarse_detector.encode_grid_cells(
-                item.cell_batch, item.cell_batch["cell_id"]
-            )
         pixel_maps, _token_scores = self._forward_and_collect(
-            coarse_detector, item.coarse_batch, coarse_task["patch_size"],
-            cell_cache=cell_cache,
+            coarse_detector, item.coarse_batch, coarse_task["patch_size"]
         )
         coarse_map = mapops.stitch_patch_maps_torch(
             pixel_maps[:, 0], item.coarse_records, image_size, self.device

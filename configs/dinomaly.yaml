@@ -18,10 +18,7 @@ encoder_amp: true
 decoder_amp: true
 allow_tf32: true
 
-# Complementary anomaly evidence weights used by the runtime configuration.
-semantic_weight: 0.60
-memory_weight: 0.30
-high_frequency_weight: 0.10
+# Thumbnail prior weight in the refinement routing map.
 global_routing_weight: 0.25
 
 # Maximum sampled patches contributed by each training image per epoch.

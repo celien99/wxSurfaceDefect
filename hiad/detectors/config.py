@@ -36,9 +36,6 @@ class DetectorConfig(Protocol):
         encoder_amp (bool): 是否在 CUDA 上用 FP16 编码。
         decoder_amp (bool): 是否在 CUDA 上用 FP16 训练重建模块。
         allow_tf32 (bool): 是否允许 CUDA TF32 矩阵和卷积计算。
-        semantic_weight (float): 语义重建证据融合权重。
-        memory_weight (float): 正常特征记忆证据融合权重。
-        high_frequency_weight (float): 高频纹理证据融合权重。
         global_routing_weight (float): 缩略图先验在复核路由图中的权重。
         patches_per_source (int): 每轮每张正常原图最多采样的补丁数。
         score_top_k (int): 图像分数使用的最高分 token 数。
@@ -54,7 +51,6 @@ class DetectorConfig(Protocol):
         max_clipped_fraction (float): 质量门禁最大黑白截断比例。
         min_focus_variance (float): 质量门禁最小 Laplacian 方差。
         patch_size (int): 当前任务注入的正方形模型输入边长。
-        use_context_conditioning (bool): 当前任务是否启用多尺度上下文条件化。
     """
 
     backbone_name: str
@@ -70,9 +66,6 @@ class DetectorConfig(Protocol):
     encoder_amp: bool
     decoder_amp: bool
     allow_tf32: bool
-    semantic_weight: float
-    memory_weight: float
-    high_frequency_weight: float
     global_routing_weight: float
     patches_per_source: int
     score_top_k: int
@@ -88,7 +81,6 @@ class DetectorConfig(Protocol):
     max_clipped_fraction: float
     min_focus_variance: float
     patch_size: int
-    use_context_conditioning: bool
 
     def __getitem__(self, key: str) -> object: ...
 
@@ -107,9 +99,6 @@ REQUIRED_CONFIG_KEYS: Final = (
     "encoder_amp",
     "decoder_amp",
     "allow_tf32",
-    "semantic_weight",
-    "memory_weight",
-    "high_frequency_weight",
     "global_routing_weight",
     "patches_per_source",
     "score_top_k",
@@ -238,12 +227,6 @@ def validate_required_config(config: object) -> None:
     ):
         raise ValueError("refinement_bridge_gap_tiles must be a non-negative integer")
 
-    evidence_weights = tuple(
-        _finite_number(values[key], key)
-        for key in ("semantic_weight", "memory_weight", "high_frequency_weight")
-    )
-    if any(weight < 0 for weight in evidence_weights) or sum(evidence_weights) <= 0:
-        raise ValueError("evidence weights must be non-negative with a positive sum")
     if not 0 <= _finite_number(
         values["global_routing_weight"], "global_routing_weight"
     ) <= 1:
@@ -291,13 +274,11 @@ def detector_config_for_task(
         patch_task = cast(DynamicPatchTask | RefinementPatchTask, task)
         detector_config = copy.deepcopy(config)
         detector_config.patch_size = patch_task["patch_size"]
-        detector_config.use_context_conditioning = len(patch_task["ds_factors"]) > 1
         return detector_config
     if task["type"] == TASK_TYPE_THUMBNAIL:
         thumbnail_task = cast(ThumbnailTask, task)
         detector_config = copy.deepcopy(config)
         detector_config.patch_size = thumbnail_task["thumbnail_size"]
         detector_config.total_iters = detector_config.thumbnail_total_iters
-        detector_config.use_context_conditioning = False
         return detector_config
     raise ValueError(f"Unsupported task type: {task}")

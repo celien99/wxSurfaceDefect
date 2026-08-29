@@ -42,11 +42,11 @@ def train_tasks_in_device(
     Raises:
         ValueError: 任一任务没有候选训练补丁。
         OSError: 日志、图像或检查点无法读取或写入。
-        RuntimeError: 模型训练、正常证据拟合或 CUDA 执行失败。
+        RuntimeError: 模型训练或 CUDA 执行失败。
 
     Notes:
-        每个任务依次执行重建训练、正常证据拟合和权重保存，随后立即释放模型
-        并清理 CUDA 缓存，确保进程内不同时驻留多个大模型。
+        每个任务依次执行重建训练和权重保存，随后立即释放模型并清理 CUDA 缓存，
+        确保进程内不同时驻留多个大模型。
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = torch.device("cuda")
@@ -110,7 +110,6 @@ def train_tasks_in_device(
         )
         checkpoint_path = os.path.join(checkpoint_root, f"{task_name}_weight.pkl")
         detector.train_step(train_dataloader, task_name)
-        detector.fit_normal_evidence(train_dataloader)
         detector.save_checkpoint(checkpoint_path)
         logger.info("Task %s checkpoint saved as %s", task_name, checkpoint_path)
 
