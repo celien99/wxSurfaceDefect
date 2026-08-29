@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 import torch
 from numpy.typing import NDArray
 

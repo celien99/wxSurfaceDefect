@@ -20,12 +20,9 @@ and timm library (https://github.com/rwightman/pytorch-image-models/blob/master/
 # limitations under the License.
 
 import math
-from functools import partial
 
 import torch
 import torch.nn as nn
-
-from torch.nn.init import trunc_normal_
 
 
 class BatchNorm1d(nn.BatchNorm1d):
