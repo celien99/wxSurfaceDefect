@@ -12,7 +12,6 @@ def test_parses_optional_inference_section():
     config = load_inference_config({"inference": {"batch_memory_budget_gb": 4.0}})
     assert config.batch_memory_budget_gb == 4.0
     assert config.preprocess_backend == "vectorized_cpu"
-    assert config.context_share is False
 
 
 def test_accepts_attribute_object_without_section():
@@ -34,11 +33,6 @@ def test_rejects_negative_budget():
 def test_rejects_unknown_preprocess_backend():
     with pytest.raises(ValueError):
         load_inference_config({"inference": {"preprocess_backend": "cuda"}})
-
-
-def test_rejects_context_share_true_before_implementation():
-    with pytest.raises(ValueError, match="not enabled"):
-        load_inference_config({"inference": {"context_share": True}})
 
 
 def test_async_pipeline_parses_bool():

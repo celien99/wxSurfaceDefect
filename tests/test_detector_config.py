@@ -41,7 +41,6 @@ def test_default_config_declares_every_required_production_setting():
     ("key", "value", "match"),
     [
         ("backbone_weights_path", 123, "backbone_weights_path must be a string"),
-        ("semantic_weight", -0.1, "evidence weights"),
         ("global_routing_weight", 1.1, "global_routing_weight"),
         ("refinement_bridge_gap_tiles", -1, "refinement_bridge_gap_tiles"),
         ("normal_component_percentile", 1.0, "normal_component_percentile"),
@@ -59,9 +58,9 @@ def test_required_config_rejects_malformed_architecture_settings(key, value, mat
 
 def test_required_config_rejects_missing_architecture_setting():
     config = _config()
-    del config["memory_weight"]
+    del config["global_routing_weight"]
 
-    with pytest.raises(ValueError, match="Missing required config setting: memory_weight"):
+    with pytest.raises(ValueError, match="Missing required config setting: global_routing_weight"):
         validate_required_config(config)
 
 
@@ -86,8 +85,7 @@ def test_detector_config_derives_task_fields_from_single_config():
         },
     )
 
-    assert patch_config.use_context_conditioning is True
-    assert thumbnail_config.use_context_conditioning is False
+    assert patch_config.patch_size == 512
     assert thumbnail_config.total_iters == config.thumbnail_total_iters
     assert "patch_size" not in config
 
@@ -97,17 +95,17 @@ def test_checkpoint_save_persists_inference_state(monkeypatch):
         def state_dict(self):
             return {"state": "present"}
 
+        def named_parameters(self):
+            return []
+
     detector = object.__new__(HRDinomaly)
-    detector.context_conditioner = Module()
-    detector.feature_memory = Module()
     detector.bottleneck = Module()
     detector.decoder = Module()
-    detector.high_frequency_center = 0.2
-    detector.high_frequency_scale = 0.7
-    detector.semantic_center = 0.1
-    detector.semantic_scale = 0.4
-    detector.memory_center = 0.3
-    detector.memory_scale = 0.8
+    detector.fusion_weights = None
+    detector.score_top_k = 4
+    detector.encoder_amp = True
+    detector.decoder_amp = True
+    detector.allow_tf32 = True
     captured = {}
 
     monkeypatch.setattr(
@@ -117,64 +115,31 @@ def test_checkpoint_save_persists_inference_state(monkeypatch):
     detector.save_checkpoint("unused.pkl")
 
     assert captured == {
-        "context_conditioner": {"state": "present"},
-        "feature_memory": {"state": "present"},
         "bottleneck": {"state": "present"},
         "decoder": {"state": "present"},
-        "high_frequency_center": 0.2,
-        "high_frequency_scale": 0.7,
-        "semantic_center": 0.1,
-        "semantic_scale": 0.4,
-        "memory_center": 0.3,
-        "memory_scale": 0.8,
+        "fusion_weights": None,
+        "score_top_k": 4,
+        "layer_aggregation": "max",
+        "encoder_amp": True,
+        "decoder_amp": True,
+        "allow_tf32": True,
     }
-
-
-def test_checkpoint_omits_context_state_for_single_resolution_task(monkeypatch):
-    class Module:
-        def state_dict(self):
-            return {"state": "present"}
-
-    detector = object.__new__(HRDinomaly)
-    detector.context_conditioner = None
-    detector.feature_memory = Module()
-    detector.bottleneck = Module()
-    detector.decoder = Module()
-    detector.high_frequency_center = 0.2
-    detector.high_frequency_scale = 0.7
-    detector.semantic_center = 0.1
-    detector.semantic_scale = 0.4
-    detector.memory_center = 0.3
-    detector.memory_scale = 0.8
-    captured = {}
-
-    monkeypatch.setattr(
-        "hiad.detectors.hr_dinomaly.torch.save",
-        lambda payload, _: captured.update(payload),
-    )
-    detector.save_checkpoint("unused.pkl")
-
-    assert "context_conditioner" not in captured
 
 
 def test_checkpoint_load_restores_inference_state(monkeypatch):
     detector = object.__new__(HRDinomaly)
-    detector.device = "cuda:0"
-    detector.context_conditioner = _LoadableModule()
-    detector.feature_memory = _LoadableModule()
+    detector.device = "cpu"
     detector.bottleneck = _LoadableModule()
     detector.decoder = _LoadableModule()
+    detector.encoder_amp = True
+    detector.score_top_k = 4
     payload = {
-        "context_conditioner": {"context": 1},
-        "feature_memory": {"memory": 2},
         "bottleneck": {"bottleneck": 3},
         "decoder": {"decoder": 4},
-        "high_frequency_center": 0.2,
-        "high_frequency_scale": 0.7,
-        "semantic_center": 0.1,
-        "semantic_scale": 0.4,
-        "memory_center": 0.3,
-        "memory_scale": 0.8,
+        "fusion_weights": [0.5, 0.5],
+        "score_top_k": 8,
+        "layer_aggregation": "max",
+        "encoder_amp": True,
     }
     monkeypatch.setattr(
         "hiad.detectors.hr_dinomaly.torch.load",
@@ -183,13 +148,7 @@ def test_checkpoint_load_restores_inference_state(monkeypatch):
 
     detector.load_checkpoint("checkpoint.pkl")
 
-    assert detector.context_conditioner.loaded_state == {"context": 1}
-    assert detector.feature_memory.loaded_state == {"memory": 2}
     assert detector.bottleneck.loaded_state == {"bottleneck": 3}
     assert detector.decoder.loaded_state == {"decoder": 4}
-    assert detector.high_frequency_center == 0.2
-    assert detector.high_frequency_scale == 0.7
-    assert detector.semantic_center == 0.1
-    assert detector.semantic_scale == 0.4
-    assert detector.memory_center == 0.3
-    assert detector.memory_scale == 0.8
+    assert detector.fusion_weights == [0.5, 0.5]
+    assert detector.score_top_k == 8
