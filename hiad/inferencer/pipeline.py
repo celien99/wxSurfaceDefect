@@ -1,7 +1,8 @@
 """逐图粗扫→路由→复核→融合编排：单张原图在单个设备上保持 GPU 驻留。
 
 粗扫补丁与复核结果都在 GPU 上拼接/路由/融合，只有路由图与最终异常图各做
-一次 D2H；解码与批量建批放在有界预取线程，与 GPU 前向重叠。
+一次 D2H；原图解码放在有界预取线程与 GPU 前向重叠，粗扫/缩略图建批在
+``_submit_coarse`` 按需执行且不跨阶段缓存。
 """
 from __future__ import annotations
 
@@ -38,7 +39,6 @@ from hiad.runtime import mapops
 from hiad.runtime.contracts import (
     ImageSize,
     RefinementStatistics,
-    TaskInputRecord,
 )
 from hiad.runtime.inference_config import InferenceConfig
 from hiad.task.contracts import (
@@ -80,15 +80,10 @@ class _CoarseState:
 
 @dataclass
 class _PrefetchItem:
-    """预取线程产出的解码图像与粗扫/缩略批量。"""
+    """预取线程产出的解码原图；粗扫/缩略建批在提交粗扫前按需生成。"""
 
     image: np.ndarray
     sample: HRSample
-    coarse_batch: object
-    coarse_records: list[TaskInputRecord]
-    thumbnail_batch: object
-    thumbnail_record: TaskInputRecord
-    thumbnail_size: int
 
 
 class DeviceImagePipeline:
@@ -300,21 +295,32 @@ class DeviceImagePipeline:
         return outputs
 
     def _build_item(self, sample: HRSample) -> _PrefetchItem:
-        """解码一张图并预建粗扫与缩略批量（CPU 线程执行）。
+        """解码一张原图（CPU 预取线程执行）。
 
-        质量门禁由上层 ``inference()`` 统一评估，这里只解码一次建批。
+        质量门禁由上层 ``inference()`` 统一评估。粗扫/缩略建批在
+        ``_submit_coarse`` 按需生成，复核阶段再按路由结果单独建批。
         """
         sample.open()
         image = sample.image.image
         if image is None:
             raise RuntimeError("Sample image was not decoded")
-        image_size = (int(image.shape[1]), int(image.shape[0]))
+        return _PrefetchItem(image=image, sample=sample)
+
+    def _submit_coarse(self, item: _PrefetchItem) -> _CoarseState:
+        """提交粗扫与缩略图前向（异步，不做任何 D2H 同步）。
+
+        复刻旧 ``_coarse_forward`` 的 GPU 部分：按需建粗扫/缩略批量、前向、
+        拼接 + 可选高斯 + 缩略图前向，全部排队到设备 stream 后立即返回。
+        粗扫/缩略建批在前向与 stitch 完成后立即释放，不跨阶段缓存。
+        """
         coarse_task = self._coarse_task()
         thumbnail_task = self._thumbnail_task()
-        base = {
+        coarse_detector = self.detectors[coarse_task["name"]]
+        image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
+        coarse_base = {
             "task_name": coarse_task["name"],
             "task_type": coarse_task["type"],
-            "image_path": sample.image.image_path,
+            "image_path": item.sample.image.image_path,
             "image_size": image_size,
             "model_input_size": (coarse_task["patch_size"], coarse_task["patch_size"]),
         }
@@ -325,53 +331,36 @@ class DeviceImagePipeline:
             stride=coarse_task["stride"],
         )
         coarse_batch, coarse_records = build_patch_batch(
-            image, indexes, coarse_task["patch_size"], base
+            item.image, indexes, coarse_task["patch_size"], coarse_base
         )
+        pixel_maps, _token_scores = self._forward_and_collect(
+            coarse_detector, coarse_batch, coarse_task["patch_size"]
+        )
+        coarse_map = mapops.stitch_patch_maps_torch(
+            pixel_maps[:, 0], coarse_records, image_size, self.device
+        )
+        del coarse_batch, coarse_records, pixel_maps, _token_scores
+        if self.map_gaussian_sigma > 0:
+            coarse_map = mapops.gaussian_blur_torch(
+                coarse_map, self.map_gaussian_sigma
+            )
         thumb_base = {
             "task_name": thumbnail_task["name"],
             "task_type": thumbnail_task["type"],
-            "image_path": sample.image.image_path,
+            "image_path": item.sample.image.image_path,
             "image_size": image_size,
             "model_input_size": (
                 thumbnail_task["thumbnail_size"], thumbnail_task["thumbnail_size"],
             ),
         }
-        thumbnail_batch, thumbnail_record = build_thumbnail_batch(
-            image, thumbnail_task["thumbnail_size"], thumb_base
+        thumbnail_batch, _thumbnail_record = build_thumbnail_batch(
+            item.image, thumbnail_task["thumbnail_size"], thumb_base
         )
-        return _PrefetchItem(
-            image=image,
-            sample=sample,
-            coarse_batch=coarse_batch,
-            coarse_records=coarse_records,
-            thumbnail_batch=thumbnail_batch,
-            thumbnail_record=thumbnail_record,
-            thumbnail_size=thumbnail_task["thumbnail_size"],
-        )
-
-    def _submit_coarse(self, item: _PrefetchItem) -> _CoarseState:
-        """提交粗扫与缩略图前向（异步，不做任何 D2H 同步）。
-
-        复刻旧 ``_coarse_forward`` 的 GPU 部分：粗扫批量前向 + 拼接 + 可选
-        高斯 + 缩略图前向，全部排队到设备 stream 后立即返回。
-        """
-        coarse_task = self._coarse_task()
-        coarse_detector = self.detectors[coarse_task["name"]]
-        image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
-        pixel_maps, _token_scores = self._forward_and_collect(
-            coarse_detector, item.coarse_batch, coarse_task["patch_size"]
-        )
-        coarse_map = mapops.stitch_patch_maps_torch(
-            pixel_maps[:, 0], item.coarse_records, image_size, self.device
-        )
-        if self.map_gaussian_sigma > 0:
-            coarse_map = mapops.gaussian_blur_torch(
-                coarse_map, self.map_gaussian_sigma
-            )
-        thumbnail_detector = self.detectors[self._thumbnail_task()["name"]]
+        thumbnail_detector = self.detectors[thumbnail_task["name"]]
         thumb_pixel, thumb_token = thumbnail_detector.inference_batch(
-            item.thumbnail_batch
+            thumbnail_batch
         )
+        del thumbnail_batch, _thumbnail_record
         return _CoarseState(
             coarse_map=coarse_map,
             thumb_pixel=thumb_pixel,
@@ -492,17 +481,19 @@ class DeviceImagePipeline:
         refinements = [
             (region, pixel_maps[i, 0]) for i, region in enumerate(regions)
         ]
+        del batch, _records
         merged = mapops.merge_refinement_maps_torch(
             coarse_map, refinements, image_size, self.device
         )
+        del pixel_maps, _token_scores, refinements
         return merged.cpu().numpy().astype(np.float32)
 
 
 class _PrefetchWorker:
-    """有界预取：后台线程解码并建批下一张图，与主线程 GPU 前向重叠。
+    """有界预取：后台线程解码下一张原图，与主线程 GPU 前向重叠。
 
     容量 2 张图；主线程消费 ``next()`` 时若队列已空（异常情况）则在主线程
-    同步构建，保证正确性不依赖调度。
+    同步解码，保证正确性不依赖调度。
     """
 
     def __init__(
