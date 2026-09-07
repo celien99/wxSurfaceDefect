@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from hiad.data import HRImageIndex
+from hiad.data import HRImageIndex, build_multiresolution_region
 from hiad.inferencer.refinement import (
     build_routing_map,
     merge_refinement_maps,
@@ -226,6 +226,19 @@ def test_merge_refinement_maps_preserves_coarse_anomaly_evidence():
     assert merged[3, 3] == 0.8
     assert merged[0, 0] == 0.8
     assert np.all(merged >= base_map)
+
+
+def test_refinement_region_keeps_nested_multiscale_context_at_image_edge():
+    region = build_multiresolution_region(
+        image_size=(100, 80),
+        main_index=HRImageIndex(x=84, y=64, width=16, height=16),
+        ds_factors=[0, 1],
+    )
+
+    assert region.main_index == HRImageIndex(x=84, y=64, width=16, height=16)
+    assert region.low_resolution_indexes == [
+        HRImageIndex(x=68, y=48, width=32, height=32)
+    ]
 
 
 def test_routing_map_uses_global_context_without_replacing_local_evidence():

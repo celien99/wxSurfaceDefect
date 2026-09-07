@@ -21,6 +21,7 @@ dynamic_task: DynamicPatchTask = {
     "type": "dynamic_patch",
     "patch_size": 512,
     "stride": 256,
+    "ds_factors": [0, 1],
 }
 thumbnail_task: ThumbnailTask = {
     "name": "thumbnail",

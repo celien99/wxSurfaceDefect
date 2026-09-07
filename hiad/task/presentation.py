@@ -40,7 +40,8 @@ def print_task_summary(tasks: Sequence[TaskDefinition]) -> None:
     print(
         "Dynamic patch task: "
         f"patch_size={dynamic_task['patch_size']}, "
-        f"stride={dynamic_task['stride']}"
+        f"stride={dynamic_task['stride']}, "
+        f"ds_factors={dynamic_task['ds_factors']}"
     )
     refinement_task = cast(
         RefinementPatchTask,

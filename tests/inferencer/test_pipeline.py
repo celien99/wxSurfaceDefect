@@ -15,17 +15,12 @@ class _StubDetector:
         self.score_top_k = 4
         self.patch_size = [patch_size, patch_size]
 
-    def inference_batch(self, data, return_anchor=False):
+    def inference_batch(self, data):
         batch = data["image"].shape[0]
         height, width = data["image"].shape[2:]
         fused_pixel = torch.full((batch, 1, height, width), 0.25)
         fused_token = torch.full((batch, 1, height // 16, width // 16), 0.25)
-        if return_anchor:
-            return fused_pixel, fused_token, torch.zeros((batch, 2, 768))
         return fused_pixel, fused_token
-
-    def global_anchor(self, canvas):
-        return torch.zeros((canvas.shape[0], 2, 768))
 
 
 _COARSE = {

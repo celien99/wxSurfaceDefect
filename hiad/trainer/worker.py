@@ -6,10 +6,6 @@ from typing import cast
 
 import torch
 
-from hiad.constants import (
-    TASK_TYPE_DYNAMIC_PATCH,
-    TASK_TYPE_REFINEMENT_PATCH,
-)
 from hiad.data import HRSample
 from hiad.datasets import SourceGroupedRandomSampler, StreamingTaskDataset
 from hiad.detectors.base import BaseDetector
@@ -62,9 +58,6 @@ def train_tasks_in_device(
     logger.info("Device %s start training", gpu_id)
     logger.info("Task Num: %d", len(tasks))
 
-    # 每源图全局锚只依赖冻结编码器与源图，与任务无关；同一设备的所有补丁任务共享。
-    device_anchors: list[torch.Tensor] | None = None
-
     for index, task in enumerate(tasks, start=1):
         task_name = task["name"]
         logger.info("[%d/%d] Task %s start loading images", index, len(tasks), task_name)
@@ -93,15 +86,6 @@ def train_tasks_in_device(
             seed=seed,
         )
         logger.info("Task %s detector is resident on %s", task_name, device)
-        if task["type"] in {TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_REFINEMENT_PATCH}:
-            if device_anchors is None:
-                device_anchors = detector.source_global_anchors(train_samples)
-                logger.info(
-                    "Task %s computed %d source global anchors for recentering",
-                    task_name,
-                    len(device_anchors),
-                )
-            dataset.global_anchors = device_anchors
         sampler_generator = torch.Generator()
         sampler_generator.manual_seed(seed)
         train_dataloader = torch.utils.data.DataLoader(

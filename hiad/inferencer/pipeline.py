@@ -17,15 +17,18 @@ import numpy as np
 import torch
 
 from hiad.constants import (
-    ANCHOR_CANVAS,
     TASK_TYPE_DYNAMIC_PATCH,
     TASK_TYPE_THUMBNAIL,
 )
-from hiad.data import HRSample, HRImageIndex, split_image_regions
+from hiad.data import (
+    HRSample,
+    HRImageIndex,
+    build_multiresolution_region,
+    split_multiresolution_regions,
+)
 from hiad.data.patch_builder import (
     build_patch_batch,
     build_thumbnail_batch,
-    square_canvas_tensor,
 )
 from hiad.detectors.base import BaseDetector
 from hiad.inferencer.refinement import (
@@ -67,16 +70,11 @@ class ImagePipelineOutput:
 
 @dataclass
 class _CoarseState:
-    """双缓冲中一张图的粗扫阶段 GPU 结果；全部为未同步张量。
-
-    ``global_anchor`` 为该源图整图缩略前向得到的 ``(1, groups, embed_dim)``
-    全局 recenter 锚，复核阶段复用。
-    """
+    """双缓冲中一张图的粗扫阶段 GPU 结果；全部为未同步张量。"""
 
     coarse_map: torch.Tensor
     thumb_pixel: torch.Tensor
     thumb_token: torch.Tensor
-    global_anchor: torch.Tensor
     image_size: ImageSize
 
 
@@ -135,10 +133,10 @@ class DeviceImagePipeline:
         return next(task for task in self.coarse_tasks
                     if task["type"] == TASK_TYPE_THUMBNAIL)
 
-    def _records_per_batch(self, patch_size: int) -> int:
+    def _records_per_batch(self, patch_size: int, context_views: int) -> int:
         """按显存预算估算单前向批可容纳的记录数（分析模型，保守安全系数）。
 
-        每记录显存 ≈ 编码特征（层数×token²×embed×4B）× 安全 4。
+        每记录显存 ≈ 编码特征（层数×token²×embed×4B）× (1+上下文视图) × 安全 4。
         ``batch_memory_budget_gb=0`` 时取当前设备空闲显存的一半；非 CUDA 或
         预算为零时整批全跑。``batch_cap`` 大于零时作为硬上限（由上层
         ``--batch-size`` 注入）。
@@ -154,7 +152,14 @@ class DeviceImagePipeline:
                     self.inference_config.batch_memory_budget_gb * 1024**3
                 )
             tokens = (patch_size // _TOKEN_STRIDE) ** 2
-            per_record = _SAFETY_FACTOR * _LAYERS * _EMBED_DIM * tokens * 4
+            per_record = (
+                _SAFETY_FACTOR
+                * _LAYERS
+                * _EMBED_DIM
+                * tokens
+                * (1 + context_views)
+                * 4
+            )
             records = max(1, budget_bytes // max(1, int(per_record)))
         if self.batch_cap > 0:
             records = min(records, self.batch_cap)
@@ -163,7 +168,8 @@ class DeviceImagePipeline:
     def _chunk_batch(self, batch: Mapping[str, object], chunk_size: int):
         """把批量字典切成自适应子批，返回 ``(chunk, start, stop)`` 序列。
 
-        张量字段按行切片，保证主图与其逐行 ``global_anchor`` 始终成对。
+        张量字段按行切片，``low_resolution_index_<n>`` 等 list 字段同步切片，
+        保证每张图上下文与其索引成对。
         """
         count = batch["image"].shape[0]
         if chunk_size <= 0 or chunk_size >= count:
@@ -185,7 +191,10 @@ class DeviceImagePipeline:
         ``pixel_maps`` 形状 ``(N, 1, P, P)``；调用方负责在拼接/融合时做
         ``[:, 0]`` 二维切片（见 ``_submit_coarse`` / ``_refine_and_merge``）。
         """
-        chunk_size = self._records_per_batch(patch_size)
+        chunk_size = self._records_per_batch(
+            patch_size,
+            sum(1 for key in batch if key.startswith("low_resolution_image")),
+        )
         pixel_parts: list[torch.Tensor] = []
         token_parts: list[torch.Tensor] = []
         for chunk, _start, _stop in self._chunk_batch(batch, chunk_size):
@@ -264,7 +273,7 @@ class DeviceImagePipeline:
                 try:
                     refinement_started = time.perf_counter()
                     final_map = self._refine_and_merge(
-                        item, regions, state.coarse_map, state.global_anchor, image_size
+                        item, regions, state.coarse_map, image_size
                     )
                     refinement_seconds = time.perf_counter() - refinement_started
                     statistics = refinement_tile_statistics(
@@ -298,42 +307,16 @@ class DeviceImagePipeline:
         return _PrefetchItem(image=image, sample=sample)
 
     def _submit_coarse(self, item: _PrefetchItem) -> _CoarseState:
-        """提交缩略图与粗扫前向（异步，不做任何 D2H 同步）。
+        """提交粗扫与缩略图前向（异步，不做任何 D2H 同步）。
 
-        先做整图缩略前向（路由所需），其编码过程一并产出该源图的全局
-        recenter 锚（自身组 cls），供粗扫/复核补丁复用，避免每图额外一次整图
-        编码；仅当缩略图尺寸与训练锚画布不一致时才单独在锚画布上编码。粗扫/
-        缩略建批在前向与 stitch 完成后立即释放，不跨阶段缓存。
+        复刻旧 ``_coarse_forward`` 的 GPU 部分：按需建粗扫/缩略批量、前向、
+        拼接 + 可选高斯 + 缩略图前向，全部排队到设备 stream 后立即返回。
+        粗扫/缩略建批在前向与 stitch 完成后立即释放，不跨阶段缓存。
         """
         coarse_task = self._coarse_task()
         thumbnail_task = self._thumbnail_task()
         coarse_detector = self.detectors[coarse_task["name"]]
-        thumbnail_detector = self.detectors[thumbnail_task["name"]]
         image_size = (int(item.image.shape[1]), int(item.image.shape[0]))
-
-        thumb_base = {
-            "task_name": thumbnail_task["name"],
-            "task_type": thumbnail_task["type"],
-            "image_path": item.sample.image.image_path,
-            "image_size": image_size,
-            "model_input_size": (
-                thumbnail_task["thumbnail_size"], thumbnail_task["thumbnail_size"],
-            ),
-        }
-        thumbnail_batch, _thumbnail_record = build_thumbnail_batch(
-            item.image, thumbnail_task["thumbnail_size"], thumb_base
-        )
-        thumb_pixel, thumb_token, thumb_anchor = thumbnail_detector.inference_batch(
-            thumbnail_batch,
-            return_anchor=True,
-        )
-        del thumbnail_batch, _thumbnail_record
-        if thumbnail_task["thumbnail_size"] != ANCHOR_CANVAS:
-            # 训练锚画布固定为 ANCHOR_CANVAS：缩略尺寸不同时单独编码保持一致。
-            thumb_anchor = coarse_detector.global_anchor(
-                square_canvas_tensor(item.image)
-            )
-
         coarse_base = {
             "task_name": coarse_task["name"],
             "task_type": coarse_task["type"],
@@ -341,16 +324,14 @@ class DeviceImagePipeline:
             "image_size": image_size,
             "model_input_size": (coarse_task["patch_size"], coarse_task["patch_size"]),
         }
-        indexes = split_image_regions(
+        indexes = split_multiresolution_regions(
             image_size=image_size,
             patch_size=coarse_task["patch_size"],
+            ds_factors=coarse_task["ds_factors"],
             stride=coarse_task["stride"],
         )
         coarse_batch, coarse_records = build_patch_batch(
             item.image, indexes, coarse_task["patch_size"], coarse_base
-        )
-        coarse_batch["global_anchor"] = thumb_anchor.expand(
-            coarse_batch["image"].shape[0], -1, -1
         )
         pixel_maps, _token_scores = self._forward_and_collect(
             coarse_detector, coarse_batch, coarse_task["patch_size"]
@@ -363,11 +344,27 @@ class DeviceImagePipeline:
             coarse_map = mapops.gaussian_blur_torch(
                 coarse_map, self.map_gaussian_sigma
             )
+        thumb_base = {
+            "task_name": thumbnail_task["name"],
+            "task_type": thumbnail_task["type"],
+            "image_path": item.sample.image.image_path,
+            "image_size": image_size,
+            "model_input_size": (
+                thumbnail_task["thumbnail_size"], thumbnail_task["thumbnail_size"],
+            ),
+        }
+        thumbnail_batch, _thumbnail_record = build_thumbnail_batch(
+            item.image, thumbnail_task["thumbnail_size"], thumb_base
+        )
+        thumbnail_detector = self.detectors[thumbnail_task["name"]]
+        thumb_pixel, thumb_token = thumbnail_detector.inference_batch(
+            thumbnail_batch
+        )
+        del thumbnail_batch, _thumbnail_record
         return _CoarseState(
             coarse_map=coarse_map,
             thumb_pixel=thumb_pixel,
             thumb_token=thumb_token,
-            global_anchor=thumb_anchor,
             image_size=image_size,
         )
 
@@ -430,7 +427,7 @@ class DeviceImagePipeline:
 
             refinement_started = time.perf_counter()
             final_map = self._refine_and_merge(
-                item, regions, state.coarse_map, state.global_anchor, image_size
+                item, regions, state.coarse_map, image_size
             )
             refinement_seconds = time.perf_counter() - refinement_started
 
@@ -457,7 +454,6 @@ class DeviceImagePipeline:
         item: _PrefetchItem,
         regions: Sequence[HRImageIndex],
         coarse_map: torch.Tensor,
-        global_anchor: torch.Tensor,
         image_size: ImageSize,
     ) -> np.ndarray:
         """对候选区域建批前向并融合回粗扫图，返回 CPU ``float32`` 最终图。"""
@@ -470,13 +466,14 @@ class DeviceImagePipeline:
             "image_size": image_size,
             "model_input_size": (task["patch_size"], task["patch_size"]),
         }
-        if not regions:
+        indexes = [
+            build_multiresolution_region(image_size, region, task["ds_factors"])
+            for region in regions
+        ]
+        if not indexes:
             return coarse_map.cpu().numpy().astype(np.float32)
         batch, _records = build_patch_batch(
-            item.image, regions, task["patch_size"], base
-        )
-        batch["global_anchor"] = global_anchor.expand(
-            batch["image"].shape[0], -1, -1
+            item.image, indexes, task["patch_size"], base
         )
         pixel_maps, _token_scores = self._forward_and_collect(
             refinement_detector, batch, task["patch_size"]

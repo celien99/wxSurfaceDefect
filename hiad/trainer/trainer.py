@@ -155,12 +155,13 @@ class HRTrainer:
             if task["type"] in {TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_REFINEMENT_PATCH}:
                 patch_task = cast(DynamicPatchTask | RefinementPatchTask, task)
                 main_logger.info(
-                    "[%d/%d] Task %s, patch_size=%s, stride=%s",
+                    "[%d/%d] Task %s, patch_size=%s, stride=%s, ds_factors=%s",
                     index,
                     len(self.tasks),
                     patch_task["name"],
                     patch_task["patch_size"],
                     patch_task["stride"],
+                    patch_task["ds_factors"],
                 )
             else:
                 thumbnail_task = cast(ThumbnailTask, task)
