@@ -16,9 +16,9 @@ import torch.nn.functional as F
 
 from hiad.models.dinov3 import fused_group_anchors
 
-_TARGET_LAYERS = (2, 3, 4, 5, 6, 7, 8, 9)
-_FUSE_LAYER_ENCODER = ((0, 1, 2, 3), (4, 5, 6, 7))
-_FUSE_LAYER_DECODER = ((0, 1, 2, 3), (4, 5, 6, 7))
+DINOMALY_TARGET_LAYERS = (2, 3, 4, 5, 6, 7, 8, 9)
+DINOMALY_FUSE_LAYER_ENCODER = ((0, 1, 2, 3), (4, 5, 6, 7))
+DINOMALY_FUSE_LAYER_DECODER = ((0, 1, 2, 3), (4, 5, 6, 7))
 
 
 class Dinomaly(nn.Module):
@@ -51,18 +51,18 @@ class Dinomaly(nn.Module):
         self.bottleneck = bottleneck
         self.decoder = decoder
         self.target_layers = tuple(
-            target_layers if target_layers is not None else _TARGET_LAYERS
+            target_layers if target_layers is not None else DINOMALY_TARGET_LAYERS
         )
         self.fuse_layer_encoder = tuple(
             tuple(group) for group in (
                 fuse_layer_encoder if fuse_layer_encoder is not None
-                else _FUSE_LAYER_ENCODER
+                else DINOMALY_FUSE_LAYER_ENCODER
             )
         )
         self.fuse_layer_decoder = tuple(
             tuple(group) for group in (
                 fuse_layer_decoder if fuse_layer_decoder is not None
-                else _FUSE_LAYER_DECODER
+                else DINOMALY_FUSE_LAYER_DECODER
             )
         )
         self.fuse_layer_bottleneck = tuple(

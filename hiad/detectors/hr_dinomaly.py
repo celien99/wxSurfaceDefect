@@ -19,7 +19,7 @@ from hiad.data.patch_builder import square_canvas_tensor
 from hiad.models import TimmDinoV3Encoder
 
 from .base import BaseDetector
-from .dinomaly.models.uad import Dinomaly
+from .dinomaly.models.uad import DINOMALY_TARGET_LAYERS, Dinomaly
 from .dinomaly.models.vision_transformer import Block as VitBlock
 from .dinomaly.models.vision_transformer import LinearAttention2
 from .dinomaly.optimizers import StableAdamW
@@ -120,10 +120,8 @@ class HRDinomaly(BaseDetector):
             torch.backends.cudnn.allow_tf32 = allow_tf32
             torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
 
-        self.target_layers: list[int] = [2, 3, 4, 5, 6, 7, 8, 9]
-        self.fuse_layer_encoder: list[list[int]] = [[0, 1, 2, 3], [4, 5, 6, 7]]
-        self.fuse_layer_decoder: list[list[int]] = [[0, 1, 2, 3], [4, 5, 6, 7]]
-        self.fuse_layer_bottleneck: list[int] = [0, 1, 2, 3, 4, 5, 6, 7]
+        # 取层与层分组以 uad.Dinomaly 的公共常量为单一来源。
+        self.target_layers: list[int] = list(DINOMALY_TARGET_LAYERS)
 
         self.encoder: TimmDinoV3Encoder = TimmDinoV3Encoder(
             model_name=backbone_name,
@@ -175,10 +173,6 @@ class HRDinomaly(BaseDetector):
             encoder=self.encoder,
             bottleneck=self.bottleneck,
             decoder=self.decoder,
-            target_layers=self.target_layers,
-            fuse_layer_encoder=self.fuse_layer_encoder,
-            fuse_layer_decoder=self.fuse_layer_decoder,
-            fuse_layer_bottleneck=self.fuse_layer_bottleneck,
             num_prefix_tokens=self.encoder.num_prefix_tokens,
         )
         self.to_device(device)
