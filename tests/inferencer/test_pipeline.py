@@ -22,6 +22,9 @@ class _StubDetector:
         fused_token = torch.full((batch, 1, height // 16, width // 16), 0.25)
         return fused_pixel, fused_token
 
+    def global_anchor(self, canvas):
+        return torch.zeros((canvas.shape[0], 2, 768))
+
 
 _COARSE = {
     "name": "dynamic_patch", "type": TASK_TYPE_DYNAMIC_PATCH,
