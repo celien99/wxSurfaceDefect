@@ -1,4 +1,5 @@
 from .geometry import (
+    build_multiresolution_region,
     HRImageIndex,
     MultiResolutionIndex,
     split_image_regions,
@@ -14,6 +15,7 @@ __all__ = [
     "LRPatch",
     "MultiResolutionIndex",
     "create_dynamic_patch",
+    "build_multiresolution_region",
     "read_jsonl_records",
     "split_image_regions",
     "split_multiresolution_regions",

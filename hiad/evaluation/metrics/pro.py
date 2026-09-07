@@ -1,10 +1,27 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 from scipy import ndimage
 
 from .common import validate_mask_pairs
 
 
-def _counts_at_thresholds(values, ascending_thresholds):
+def _counts_at_thresholds(
+    values: ArrayLike,
+    ascending_thresholds: NDArray[np.float64],
+) -> NDArray[np.int64]:
+    """批量统计每个升序阈值下大于等于阈值的元素数量。
+
+    Args:
+        values (ArrayLike): 待统计的任意形状数值数组。
+        ascending_thresholds (NDArray[np.float64]): 严格按升序排列的阈值向量。
+
+    Returns:
+        NDArray[np.int64]: 与阈值等长、按调用方原阈值方向排列的累计数量。
+    """
     bucket_indexes = np.searchsorted(
         ascending_thresholds,
         np.asarray(values).reshape(-1),
@@ -19,14 +36,28 @@ def _counts_at_thresholds(values, ascending_thresholds):
 
 
 def compute_pro(
-    prediction_masks,
-    gt_masks,
+    prediction_masks: Sequence[ArrayLike],
+    gt_masks: Sequence[ArrayLike],
     *,
     fpr_limit: float = 0.3,
     num_thresholds: int = 200,
-    **kwargs,
-):
-    """Compute native-resolution AUPRO for variable-size mask pairs."""
+    **_: object,
+) -> dict[str, float]:
+    """在可变原生分辨率掩码上计算有界 FPR 区间的 AUPRO。
+
+    Args:
+        prediction_masks (Sequence[ArrayLike]): 每张图的二维有限异常分数图。
+        gt_masks (Sequence[ArrayLike]): 与预测逐项同形状的二维二值真值掩码。
+        fpr_limit (float): 积分使用的最大假阳性率，范围 ``(0, 1]``。
+        num_thresholds (int): 从最大分数到最小分数采样的阈值数量，至少为 ``2``。
+
+    Returns:
+        dict[str, float]: 包含归一化到 ``[0, 1]`` 的 ``pixel_pro``。
+
+    Raises:
+        TypeError: ``num_thresholds`` 不是整数或是布尔值。
+        ValueError: 参数、掩码不合法，或数据没有背景像素/异常连通区域。
+    """
     if not 0 < fpr_limit <= 1:
         raise ValueError("fpr_limit must be in (0, 1]")
     if isinstance(num_thresholds, bool) or not isinstance(num_thresholds, int):

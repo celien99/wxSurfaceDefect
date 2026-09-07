@@ -1,5 +1,10 @@
 # Dinomaly training and calibration defaults.
 backbone_name: vit_base_patch16_dinov3.lvd1689m
+# Local DINOv3 backbone weights (.pth) exported by runs/export_backbone.py.
+# Industrial machines are offline: ship this file with the deployment package and
+# point at it here. Leave empty only for networked development, which falls back
+# to timm downloading the pretrained weights on first use.
+backbone_weights_path: ""
 total_iters: 300
 thumbnail_total_iters: 100
 log_per_steps: 10
@@ -13,15 +18,34 @@ encoder_amp: true
 decoder_amp: true
 allow_tf32: true
 
+# Thumbnail prior weight in the refinement routing map.
+global_routing_weight: 0.25
+
 # Maximum sampled patches contributed by each training image per epoch.
 patches_per_source: 16
 
 score_top_k: 4
 normal_score_percentile: 0.99
+# With a small normal set, 99% is effectively controlled by one tail image.
+# Keep component calibration sensitive, then tune this on a held-out normal set.
+normal_component_percentile: 0.95
 # Pixel localization is calibrated only from normal training anomaly maps.
 normal_pixel_percentile: 0.9999
 # Aggregate per-image normal statistics without letting one outlier set the threshold.
 normal_pixel_image_percentile: 0.95
+# Bridge small gaps between strong candidates so enclosed weak defects enter refinement.
+refinement_bridge_gap_tiles: 1
 # Keep full-resolution anomaly-map memory bounded during post-training calibration.
 calibration_batch_size: 1
 map_gaussian_sigma: 0.0
+
+# Generic acquisition quality gate. Production recipes should tune these on
+# representative normal images before deployment.
+min_mean_luminance: 0.05
+max_mean_luminance: 0.95
+max_clipped_fraction: 0.50
+min_focus_variance: 10.0
+
+# P1 推理解码器 FP16（autocast）开关；训练机 parity+安全门通过（2026-08-28）翻为 true。
+inference:
+  decoder_amp: true

@@ -1,71 +1,66 @@
+from __future__ import annotations
+
 import os
+from collections.abc import Mapping, Sequence
+from typing import cast
 
 import torch
 
-from hiad.detectors.config import detector_config_for_task
+from hiad.detectors.base import BaseDetector
+from hiad.detectors.config import DetectorConfig, detector_config_for_task
+from hiad.task.contracts import TaskDefinition
 
 
 class ModelManager:
+    """管理单个 CUDA 设备上的任务模型及其检查点生命周期。
+
+    Attributes:
+        detectors (dict[str, BaseDetector]): 任务名称到已加载检测器的映射；每个
+            检测器均驻留在构造时指定的 CUDA 设备上。
+    """
+
     def __init__(
         self,
-        tasks,
-        detector_class,
-        config,
-        checkpoint_root: str,
+        tasks: Sequence[TaskDefinition],
+        detector_class: type[BaseDetector],
+        config: DetectorConfig,
+        checkpoint_root: str | os.PathLike[str],
         gpu_id: int,
-        models_per_gpu: int,
-    ):
-        self.tasks = tasks
-        self.detector_class = detector_class
-        self.config = config
-        self.gpu_device = torch.device(f"cuda:{gpu_id}")
-        self.models_per_gpu = models_per_gpu
-        if self.models_per_gpu <= 0:
-            raise ValueError("models_per_gpu must be positive")
-        if self.models_per_gpu < len(self.tasks):
-            raise ValueError(
-                "Production inference requires every assigned model to remain on GPU; "
-                f"models_per_gpu={self.models_per_gpu}, assigned_tasks={len(self.tasks)}"
-            )
-        self.models = []
+    ) -> None:
+        gpu_device = torch.device(f"cuda:{gpu_id}")
+        self.detectors: dict[str, BaseDetector] = {}
 
-        for task in self.tasks:
-            task_name = task['name']
+        for task in tasks:
+            task_name = task["name"]
             detector_config = detector_config_for_task(config, task)
 
             detector = detector_class(
-                **detector_config,
-                device=self.gpu_device,
+                **cast(Mapping[str, object], detector_config),
+                device=gpu_device,
                 logger=None,
                 seed=0,
             )
-            checkpoint_path = os.path.join(checkpoint_root, f'{task_name}_weight.pkl')
+            checkpoint_path = os.path.join(
+                checkpoint_root,
+                f"{task_name}_weight.pkl",
+            )
             detector.load_checkpoint(checkpoint_path)
-            self.models.append({
-                "name": task_name,
-                "detector": detector,
-                "gpu": True,
-            })
+            self.detectors[task_name] = detector
 
-    def get_detector(self, task_name, must_in_gpu=True):
-        for model in self.models:
-            if model['name'] != task_name:
-                continue
-            detector = model['detector']
-            if must_in_gpu and (
-                not model['gpu']
-                or getattr(detector, "device", None) is None
-                or detector.device.type != "cuda"
-            ):
-                raise RuntimeError(f"Task {task_name} is not resident on GPU")
-            return detector
-        raise KeyError(f"Unknown task: {task_name}")
+    def get_detector(self, task_name: str) -> BaseDetector:
+        """按任务名称获取已加载的检测器。
 
-    def get_device_task_names(self, gpu: bool):
-        return [model["name"] for model in self.models if model["gpu"] == gpu]
+        Args:
+            task_name (str): 任务定义中的稳定名称。
 
-    def score_top_k_values(self) -> set[int]:
-        return {model["detector"].score_top_k for model in self.models}
+        Returns:
+            BaseDetector: 对应任务的检测器实例。
+
+        Raises:
+            KeyError: 当前设备没有加载该任务。
+        """
+        return self.detectors[task_name]
 
     def close(self) -> None:
-        self.models.clear()
+        """释放管理器持有的检测器引用，允许框架回收模型和显存。"""
+        self.detectors.clear()

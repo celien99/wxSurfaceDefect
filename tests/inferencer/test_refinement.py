@@ -1,0 +1,254 @@
+import numpy as np
+import pytest
+
+from hiad.data import HRImageIndex, build_multiresolution_region
+from hiad.inferencer.refinement import (
+    build_routing_map,
+    merge_refinement_maps,
+    refinement_tile_statistics,
+    select_refinement_regions,
+)
+
+
+def test_select_refinement_regions_tiles_connected_candidates():
+    anomaly_map = np.zeros((8, 12), dtype=np.float32)
+    anomaly_map[2:5, 7:10] = 0.9
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=4,
+        safety_fraction=0.25,
+    )
+
+    assert any(
+        region.x <= 8 < region.x + region.width
+        and region.y <= 3 < region.y + region.height
+        for region in regions
+    )
+
+
+def test_select_refinement_regions_clips_bottom_right_tile_to_native_bounds():
+    anomaly_map = np.zeros((6, 10), dtype=np.float32)
+    anomaly_map[4:, 8:] = 1.0
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=1,
+        safety_fraction=0.5,
+    )
+
+    assert HRImageIndex(x=6, y=2, width=4, height=4) in regions
+
+
+def test_select_refinement_regions_covers_large_component_with_multiple_tiles():
+    anomaly_map = np.zeros((16, 16), dtype=np.float32)
+    anomaly_map[2:14, 2:14] = 1.0
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=1,
+        safety_fraction=0.01,
+    )
+
+    component_tiles = [
+        region
+        for region in regions
+        if region.x < 14 and region.y < 14 and region.x + 4 > 2 and region.y + 4 > 2
+    ]
+    assert len(component_tiles) >= 9
+
+
+def test_select_refinement_regions_bridges_the_gap_between_strong_candidates():
+    anomaly_map = np.zeros((16, 16), dtype=np.float32)
+    anomaly_map[0:4, 4:8] = 1.0
+    anomaly_map[8:12, 4:8] = 1.0
+    anomaly_map[4:8, 0:4] = 1.0
+    anomaly_map[4:8, 8:12] = 1.0
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=1,
+        safety_fraction=0.01,
+        max_bridge_gap_tiles=1,
+    )
+
+    assert HRImageIndex(x=4, y=4, width=4, height=4) in regions
+
+
+def test_select_refinement_regions_keeps_a_small_high_peak():
+    anomaly_map = np.zeros((12, 12), dtype=np.float32)
+    anomaly_map[1, 1] = 1.0
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=4,
+        safety_fraction=0.01,
+    )
+
+    assert HRImageIndex(x=0, y=0, width=4, height=4) in regions
+
+
+def test_select_refinement_regions_keeps_strongest_tile_below_route_threshold():
+    anomaly_map = np.full((8, 8), 0.2, dtype=np.float32)
+    anomaly_map[6, 6] = 0.4
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=4,
+        safety_fraction=0.01,
+    )
+
+    assert HRImageIndex(x=4, y=4, width=4, height=4) in regions
+
+
+def test_refinement_tile_statistics_deduplicates_native_tile_origins():
+    regions = [
+        HRImageIndex(x=4, y=4, width=4, height=4),
+        HRImageIndex(x=4, y=4, width=4, height=4),
+    ]
+
+    statistics = refinement_tile_statistics((8, 8), 4, regions)
+
+    assert statistics == {
+        "total_tiles": 4,
+        "selected_tiles": 1,
+        "coverage_ratio": 0.25,
+    }
+
+
+def test_select_refinement_regions_adds_deterministic_safety_coverage():
+    anomaly_map = np.zeros((6, 10), dtype=np.float32)
+
+    first = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=1,
+        safety_fraction=0.25,
+    )
+    second = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=1,
+        safety_fraction=0.25,
+    )
+
+    assert first == second
+    assert len(first) == 2
+    assert len({region.x for region in first}) == 2
+    assert len({region.y for region in first}) == 2
+
+
+def test_select_refinement_regions_does_not_fill_sparse_component_bbox():
+    anomaly_map = np.zeros((16, 16), dtype=np.float32)
+    np.fill_diagonal(anomaly_map, 1.0)
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=0.5,
+        tile_size=4,
+        min_area=4,
+        safety_fraction=0.01,
+    )
+
+    assert len(regions) <= 5
+    assert sum(region.x == region.y for region in regions) >= 4
+
+
+def test_select_refinement_regions_keeps_a_top_quantile_plateau():
+    anomaly_map = np.zeros((20, 20), dtype=np.float32)
+    anomaly_map[18:, 18:] = 1.0
+    threshold = float(np.quantile(anomaly_map, 0.995))
+
+    regions = select_refinement_regions(
+        anomaly_map,
+        threshold=threshold,
+        tile_size=4,
+        min_area=1,
+        safety_fraction=0.01,
+    )
+
+    assert threshold == 1.0
+    assert any(region.x == 16 and region.y == 16 for region in regions)
+
+
+def test_select_refinement_regions_rejects_zero_safety_coverage():
+    with pytest.raises(ValueError, match="safety_fraction"):
+        select_refinement_regions(
+            np.zeros((4, 4), dtype=np.float32),
+            threshold=0.5,
+            tile_size=4,
+            min_area=1,
+            safety_fraction=0.0,
+        )
+
+
+def test_merge_refinement_maps_blends_native_edge_extent():
+    base_map = np.full((6, 8), 0.2, dtype=np.float32)
+    refinement_map = np.full((5, 5), 0.8, dtype=np.float32)
+
+    merged = merge_refinement_maps(
+        base_map,
+        [(HRImageIndex(x=4, y=2, width=5, height=5), refinement_map)],
+        image_size=(8, 6),
+    )
+
+    assert merged.shape == (6, 8)
+    assert np.all(merged[:2, :] == 0.2)
+    assert np.all(merged[2:, :4] == 0.2)
+    assert np.all(merged[2:, 4:] > 0.2)
+    assert merged[4, 6] == 0.8
+
+
+def test_merge_refinement_maps_preserves_coarse_anomaly_evidence():
+    base_map = np.full((7, 7), 0.8, dtype=np.float32)
+    refinement_map = np.full((5, 5), 0.2, dtype=np.float32)
+
+    merged = merge_refinement_maps(
+        base_map,
+        [(HRImageIndex(x=1, y=1, width=5, height=5), refinement_map)],
+        image_size=(7, 7),
+    )
+
+    assert merged[3, 3] == 0.8
+    assert merged[0, 0] == 0.8
+    assert np.all(merged >= base_map)
+
+
+def test_refinement_region_keeps_nested_multiscale_context_at_image_edge():
+    region = build_multiresolution_region(
+        image_size=(100, 80),
+        main_index=HRImageIndex(x=84, y=64, width=16, height=16),
+        ds_factors=[0, 1],
+    )
+
+    assert region.main_index == HRImageIndex(x=84, y=64, width=16, height=16)
+    assert region.low_resolution_indexes == [
+        HRImageIndex(x=68, y=48, width=32, height=32)
+    ]
+
+
+def test_routing_map_uses_global_context_without_replacing_local_evidence():
+    local = np.zeros((4, 4), dtype=np.float32)
+    local[0, 0] = 1.0
+    global_context = np.zeros((4, 4), dtype=np.float32)
+    global_context[3, 3] = 1.0
+
+    routing = build_routing_map(local, global_context, global_weight=0.25)
+
+    assert routing[0, 0] > routing[1, 1]
+    assert routing[3, 3] > routing[1, 1]
+    assert routing[0, 0] > routing[3, 3]

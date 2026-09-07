@@ -88,3 +88,58 @@ def test_pixel_masks_are_not_gated_by_image_decisions():
     )
 
     assert masks[0].tolist() == [[0, 1]]
+
+
+def test_save_predictions_serializes_binary_decision_and_components(tmp_path):
+    samples = [
+        SimpleNamespace(
+            image=SimpleNamespace(image_path="a.bmp"),
+            clsname="part",
+            label=0,
+            label_name="good",
+        )
+    ]
+    output = tmp_path / "predictions.jsonl"
+    component_summary = {
+        "component_count": 1,
+        "anomalous_pixel_count": 4,
+        "largest_component_area": 4,
+        "strongest_component": {
+            "area": 4,
+            "area_fraction": 0.25,
+            "mean_score": 0.4,
+            "max_score": 0.72,
+            "score": 0.6,
+            "bbox_xywh": [1, 2, 2, 2],
+        },
+    }
+
+    save_predictions(
+        output,
+        samples,
+        {
+            "image_scores": [0.6],
+            "is_defect": [True],
+            "decisions": ["NG"],
+            "decision_thresholds": [0.55],
+            "decision_reasons": ["score_above_threshold"],
+            "component_scores": [0.6],
+            "component_summaries": [component_summary],
+            "refinement_statistics": [
+                {"total_tiles": 16, "selected_tiles": 3, "coverage_ratio": 0.1875}
+            ],
+        },
+    )
+
+    record = json.loads(output.read_text())
+    assert record["is_defect"] is True
+    assert record["decision"] == "NG"
+    assert record["decision_threshold"] == 0.55
+    assert record["decision_reason"] == "score_above_threshold"
+    assert record["component_score"] == 0.6
+    assert record["component_summary"] == component_summary
+    assert record["refinement"] == {
+        "total_tiles": 16,
+        "selected_tiles": 3,
+        "coverage_ratio": 0.1875,
+    }

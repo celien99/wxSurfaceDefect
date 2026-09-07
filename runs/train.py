@@ -1,12 +1,13 @@
+from __future__ import annotations
+
 import argparse
-import copy
 import json
+import math
 import os
 import shutil
 import sys
 
 import yaml
-from easydict import EasyDict
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if parent_dir not in sys.path:
@@ -20,16 +21,24 @@ from hiad.trainer import HRTrainer
 from hiad.trainer.sources import load_unified_training_samples
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """解析并校验训练尺寸、复核路由、输出路径和 GPU 参数。
+
+    Returns:
+        argparse.Namespace: 通过 DINO 尺寸整除及复核参数范围校验的参数对象。
+    """
     parser = argparse.ArgumentParser(description="HiAD Dinomaly training")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--config", default="configs/dinomaly.yaml")
     parser.add_argument("--patch-size", default=512, type=int)
     parser.add_argument("--stride", default=-1, type=int)
     parser.add_argument("--ds-factors", default=[0, 1], nargs="+", type=int)
-    parser.add_argument("--fusion-weights", default=None, nargs="+", type=float)
     parser.add_argument("--batch-size", default=16, type=int)
     parser.add_argument("--thumbnail-size", default=512, type=int)
+    parser.add_argument("--micro-patch-size", default=256, type=int)
+    parser.add_argument("--refinement-quantile", default=0.995, type=float)
+    parser.add_argument("--refinement-min-area", default=4, type=int)
+    parser.add_argument("--refinement-safety-fraction", default=0.02, type=float)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--checkpoint-root", default="results/dinomaly_checkpoints")
     parser.add_argument("--log-root", default="results/dinomaly_logs")
@@ -40,22 +49,31 @@ def parse_args():
         parser.error(f"--patch-size must be a positive multiple of {DINO_PATCH_SIZE}")
     if args.stride != -1 and (args.stride <= 0 or args.stride > args.patch_size):
         parser.error("--stride must be -1 or in [1, patch-size]")
-    if not args.ds_factors or args.ds_factors[0] != 0 or args.ds_factors != sorted(set(args.ds_factors)):
-        parser.error("--ds-factors must be unique, sorted, non-negative, and start with 0")
-    if args.fusion_weights is not None and (
-        len(args.fusion_weights) != len(args.ds_factors)
-        or any(weight < 0 for weight in args.fusion_weights)
-        or sum(args.fusion_weights) <= 0
+    if (
+        not args.ds_factors
+        or args.ds_factors[0] != 0
+        or args.ds_factors != sorted(set(args.ds_factors))
     ):
-        parser.error("--fusion-weights must match --ds-factors and have a positive sum")
+        parser.error("--ds-factors must be unique, sorted, non-negative, and start with 0")
     if args.batch_size <= 0 or args.thumbnail_size <= 0:
         parser.error("--batch-size and --thumbnail-size must be positive")
     if args.thumbnail_size % DINO_PATCH_SIZE:
         parser.error(f"--thumbnail-size must be a multiple of {DINO_PATCH_SIZE}")
+    if args.micro_patch_size <= 0 or args.micro_patch_size % DINO_PATCH_SIZE:
+        parser.error(
+            f"--micro-patch-size must be a positive multiple of {DINO_PATCH_SIZE}"
+        )
+    if not math.isfinite(args.refinement_quantile) or not 0 < args.refinement_quantile < 1:
+        parser.error("--refinement-quantile must be in the range (0, 1)")
+    if args.refinement_min_area <= 0:
+        parser.error("--refinement-min-area must be positive")
+    if not 0 < args.refinement_safety_fraction <= 1:
+        parser.error("--refinement-safety-fraction must be in the range (0, 1]")
     return args
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """加载统一正常样本，创建三类任务并启动多 GPU 训练。"""
     args = parse_args()
     gpu_ids = [int(value.strip()) for value in args.gpus.split(",") if value.strip()]
     if not gpu_ids:
@@ -72,10 +90,6 @@ if __name__ == "__main__":
     if not isinstance(loaded_config, dict):
         raise TypeError("Training config must be a mapping")
 
-    patch_config = EasyDict(copy.deepcopy(loaded_config))
-    thumbnail_config = EasyDict(copy.deepcopy(loaded_config))
-    config = EasyDict(patch=patch_config, thumbnail=thumbnail_config)
-
     main_logger = create_logger(
         "main",
         os.path.join(args.log_root, "main.log"),
@@ -90,18 +104,27 @@ if __name__ == "__main__":
         patch_size=args.patch_size,
         ds_factors=args.ds_factors,
         stride=None if args.stride == -1 else args.stride,
-    ).create_tasks(thumbnail_size=args.thumbnail_size)
+    ).create_tasks(
+        thumbnail_size=args.thumbnail_size,
+        micro_patch_size=args.micro_patch_size,
+        refinement_quantile=args.refinement_quantile,
+        refinement_min_area=args.refinement_min_area,
+        refinement_safety_fraction=args.refinement_safety_fraction,
+    )
     print_task_summary(tasks)
 
     trainer = HRTrainer(
         detector_class=HRDinomaly,
-        config=config,
+        config=loaded_config,
         batch_size=args.batch_size,
         checkpoint_root=args.checkpoint_root,
         log_root=args.log_root,
         tasks=tasks,
         seed=args.seed,
-        fusion_weights=args.fusion_weights,
     )
     trainer.train(train_samples=train_samples, gpu_ids=gpu_ids, main_logger=main_logger)
     main_logger.info("Training done. Checkpoints saved to %s", args.checkpoint_root)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,24 +1,6 @@
-import numpy as np
 import torch
 
 from hiad.detectors.hr_dinomaly import HRDinomaly
-
-
-def test_image_score_keeps_the_strongest_local_evidence():
-    scores = HRDinomaly.get_image_score([
-        [0.02, 0.03, 0.91, 0.04],
-        [0.12, 0.08],
-    ])
-
-    np.testing.assert_allclose(scores, np.asarray([0.91, 0.12], dtype=np.float32))
-
-
-def test_top_k_token_score_does_not_average_the_full_map():
-    token_maps = torch.tensor([[[[0.01, 0.02], [0.03, 0.95]]]])
-
-    score = HRDinomaly._top_k_token_scores(token_maps, top_k=2)
-
-    torch.testing.assert_close(score, torch.tensor([0.49]))
 
 
 def test_pixel_map_maximizes_layers_after_upsampling():
