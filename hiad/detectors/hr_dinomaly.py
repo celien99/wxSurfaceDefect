@@ -415,16 +415,28 @@ class HRDinomaly(BaseDetector):
         self.model.eval()
 
     @torch.inference_mode()
-    def inference_batch(self, data: DetectorBatch) -> tuple[torch.Tensor, torch.Tensor]:
+    def inference_batch(
+        self,
+        data: DetectorBatch,
+        *,
+        return_anchor: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         """在检测器设备上计算异常图与 token 图，不做任何 CPU 往返。
 
         批次中的 ``global_anchor``（可选）为该图所属源图的整图缩略全局锚；
         缺失时（整图缩略单次前向）模型使用自身 cls，与官方语义一致。
 
+        Args:
+            data (DetectorBatch): 模型输入批次。
+            return_anchor (bool): 整图缩略前向时请求回传本次实际使用的全局锚，
+                供同图补丁 recenter 复用，避免每图额外一次整图编码。
+
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: ``(anomaly_map, token_map)``，
-            均为设备驻留张量；前者形状 ``(batch, 1, patch_h, patch_w)``，后者
-            为编码器 token 分辨率。由调用方决定何时拷贝回 CPU。
+            ``(anomaly_map, token_map)`` 或三元组（``return_anchor`` 为真）：
+            前两者均为设备驻留张量，形状 ``(batch, 1, patch_h, patch_w)`` 与
+            token 分辨率；第三项为 ``(batch, len(groups), embed_dim)`` 全局锚。
         """
         self.model.eval()
         image = data["image"].to(self.device, non_blocking=True)
@@ -436,8 +448,14 @@ class HRDinomaly(BaseDetector):
             dtype=torch.float16,
             enabled=self.decoder_inference_amp and self.device.type == "cuda",
         ):
-            en, de = self.model(image, global_anchor=anchor)
+            output = self.model(image, global_anchor=anchor, return_anchor=return_anchor)
+        if return_anchor:
+            en, de, used_anchor = output
+        else:
+            en, de = output
         anomaly_map, token_map = self.cal_anomaly_maps(en, de, self.patch_size)
+        if return_anchor:
+            return anomaly_map, token_map, used_anchor
         return anomaly_map, token_map
 
     @staticmethod

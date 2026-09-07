@@ -94,7 +94,11 @@ class Dinomaly(nn.Module):
         self,
         x: torch.Tensor,
         global_anchor: torch.Tensor | None = None,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        *,
+        return_anchor: bool = False,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]] | tuple[
+        list[torch.Tensor], list[torch.Tensor], torch.Tensor
+    ]:
         """在补丁（或整图）上执行重构，返回每组的教师/学生 patch-token 图。
 
         Args:
@@ -103,11 +107,15 @@ class Dinomaly(nn.Module):
             global_anchor (torch.Tensor | None): 每组 recenter 锚，形状
                 ``(batch, len(groups), embed_dim)`` 或 ``(len(groups), embed_dim)``；
                 ``None`` 时使用本前向自身的组 cls（整图单次前向的官方语义）。
+            return_anchor (bool): 是否把本次实际使用的全局锚一并返回，便于整图
+                缩略前向把锚复用于同一源图的补丁 recenter。
 
         Returns:
-            tuple[list[torch.Tensor], list[torch.Tensor]]: ``(en, de)`` 各含
-            ``len(fuse_layer_encoder)`` 个 ``(batch, embed_dim, side, side)``
-            patch-token 图；``en`` 已 recenter + LayerNorm，``de`` 为学生原始输出。
+            tuple[list[torch.Tensor], list[torch.Tensor]] 或三元组:
+            ``(en, de)`` 各含 ``len(fuse_layer_encoder)`` 个
+            ``(batch, embed_dim, side, side)`` patch-token 图；``en`` 已
+            recenter + LayerNorm，``de`` 为学生原始输出。``return_anchor`` 为真时
+            第三项为 ``(batch, len(groups), embed_dim)`` 实际使用的全局锚。
         """
         if x.ndim != 4:
             raise ValueError(f"Expected a BCHW image, got shape {tuple(x.shape)}")
@@ -184,6 +192,8 @@ class Dinomaly(nn.Module):
                 .reshape(batch, embed_dim, side, side)
                 .contiguous()
             )
+        if return_anchor:
+            return en_maps, de_maps, global_anchor
         return en_maps, de_maps
 
     @staticmethod
