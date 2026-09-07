@@ -33,6 +33,8 @@ _BOTTLENECK_DIM = 256
 # 训练平台期早停常量：连续多少个完整 epoch 无相对改善即停（内联，不进入配置）。
 _PLATEAU_PATIENCE_EPOCHS = 3
 _PLATEAU_MIN_DELTA = 1e-3
+# 训练前整图缩略锚前向的批量大小（源图画布，embed 维度固定）。
+_ANCHOR_BATCH = 16
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -224,21 +226,29 @@ class HRDinomaly(BaseDetector):
             list[torch.Tensor]: 与 ``samples`` 同序的每源图 ``(groups, embed_dim)``
             CPU 常驻锚。
         """
-        anchors: list[torch.Tensor] = []
-        self.model.eval()
+        canvases: list[torch.Tensor] = []
         for sample in samples:
             sample.open()
             try:
                 image = sample.image.image
                 if image is None:
                     raise RuntimeError("Training sample image was not decoded")
-                canvas = square_canvas_tensor(image, ANCHOR_CANVAS)
+                canvases.append(square_canvas_tensor(image, ANCHOR_CANVAS))
             finally:
                 sample.close()
-            anchor = (
-                self.model.global_anchor(canvas.to(self.device))[0].detach().cpu()
+        if not canvases:
+            return []
+
+        anchors: list[torch.Tensor] = []
+        self.model.eval()
+        for start in range(0, len(canvases), _ANCHOR_BATCH):
+            chunk = torch.cat(canvases[start:start + _ANCHOR_BATCH], dim=0).to(
+                self.device
             )
-            anchors.append(anchor)
+            group = self.model.global_anchor(chunk)
+            anchors.extend(
+                group[index].detach().cpu() for index in range(group.shape[0])
+            )
         return anchors
 
     @staticmethod
