@@ -13,7 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
-from .geometry import HRImageIndex, MultiResolutionIndex
+from .geometry import HRImageIndex
 
 
 UInt8Array: TypeAlias = NDArray[np.uint8]
@@ -129,7 +129,7 @@ class HRImage:
 
 @dataclass
 class LRPatch:
-    """保存送入模型的补丁、标签及其原图空间上下文。
+    """保存送入模型的补丁及其标签与原图坐标。
 
     Attributes:
         image (UInt8Array): ``(H, W, 3)`` RGB 补丁，通常为 ``uint8``。
@@ -140,10 +140,6 @@ class LRPatch:
         main_index (HRImageIndex | None): 主补丁在原图中的 ``xywh`` 坐标。
         valid_source_hw (tuple[int, int] | None): 边界填充前的有效源区域
             ``(height, width)``。
-        low_resolution_images (list[UInt8Array] | None): 已缩放到主补丁尺寸的
-            多尺度 RGB 上下文图像。
-        low_resolution_indexes (list[HRImageIndex] | None): 主补丁在各上下文
-            图像坐标系中的映射区域，与上下文图像逐项对应。
     """
 
     image: UInt8Array
@@ -153,44 +149,6 @@ class LRPatch:
     clsname: str | None = None
     main_index: HRImageIndex | None = None
     valid_source_hw: tuple[int, int] | None = None
-    low_resolution_images: list[UInt8Array] | None = None
-    low_resolution_indexes: list[HRImageIndex] | None = None
-
-    def add_low_resolution_images(
-        self,
-        low_resolution_index: HRImageIndex,
-        image: HRImage,
-    ) -> None:
-        """提取上下文图像并记录主补丁在缩放后上下文中的位置。
-
-        Args:
-            low_resolution_index (HRImageIndex): 上下文在原图中的 ``xywh`` 区域。
-            image (HRImage): 已打开的 RGB 原图。
-
-        Raises:
-            RuntimeError: 当前补丁没有 ``main_index``，无法建立坐标映射。
-        """
-        if self.main_index is None:
-            raise RuntimeError("Main patch index is required before adding context images")
-        main_height, main_width = self.image.shape[:2]
-        low_resolution_image = image[low_resolution_index]
-        low_height, low_width = low_resolution_image.shape[:2]
-        low_resolution_image = cv2.resize(
-            low_resolution_image,
-            (main_width, main_height),
-        )
-        mapped_index = HRImageIndex(
-            x=int((self.main_index.x - low_resolution_index.x) / low_width * main_width),
-            y=int((self.main_index.y - low_resolution_index.y) / low_height * main_height),
-            width=int(self.main_index.width / low_resolution_index.width * main_width),
-            height=int(self.main_index.height / low_resolution_index.height * main_height),
-        )
-        if self.low_resolution_indexes is None:
-            self.low_resolution_indexes = []
-        if self.low_resolution_images is None:
-            self.low_resolution_images = []
-        self.low_resolution_images.append(low_resolution_image)
-        self.low_resolution_indexes.append(mapped_index)
 
 
 class HRSample:
@@ -389,15 +347,15 @@ class HRSample:
         )
 
 
-def create_dynamic_patch(sample: HRSample, index: MultiResolutionIndex) -> LRPatch:
+def create_dynamic_patch(sample: HRSample, index: HRImageIndex) -> LRPatch:
     """从已打开的原图提取主补丁，并记录边界填充前的有效区域。
 
     Args:
         sample (HRSample): 原图已经解码到内存的样本。
-        index (MultiResolutionIndex): 主补丁及可选上下文的原图 ``xywh`` 索引。
+        index (HRImageIndex): 主补丁在原图中的 ``xywh`` 索引。
 
     Returns:
-        LRPatch: RGB 主补丁、可选掩码、上下文及原图坐标元数据。
+        LRPatch: RGB 主补丁、可选掩码及原图坐标元数据。
 
     Raises:
         RuntimeError: ``sample`` 的原图尚未打开。
@@ -405,12 +363,9 @@ def create_dynamic_patch(sample: HRSample, index: MultiResolutionIndex) -> LRPat
     source_image = sample.image.image
     if source_image is None:
         raise RuntimeError("Sample image must be open before creating a dynamic patch")
-    patch = sample[index.main_index]
+    patch = sample[index]
     patch.valid_source_hw = (
-        min(index.main_index.height, source_image.shape[0] - index.main_index.y),
-        min(index.main_index.width, source_image.shape[1] - index.main_index.x),
+        min(index.height, source_image.shape[0] - index.y),
+        min(index.width, source_image.shape[1] - index.x),
     )
-    if index.low_resolution_indexes is not None:
-        for low_resolution_index in index.low_resolution_indexes:
-            patch.add_low_resolution_images(low_resolution_index, sample.image)
     return patch

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from PIL import Image
 from torch.utils.data import Dataset
@@ -15,10 +16,8 @@ from hiad.constants import (
 from hiad.data import (
     HRImageIndex,
     HRSample,
-    MultiResolutionIndex,
-    build_multiresolution_region,
     create_dynamic_patch,
-    split_multiresolution_regions,
+    split_image_regions,
 )
 from hiad.datasets.patch_dataset import PatchDataset, PatchItem
 from hiad.runtime.contracts import TaskInputRecord
@@ -41,6 +40,9 @@ class StreamingTaskDataset(Dataset[PatchItem]):
             指定的原图 ``xywh`` 区域；``None`` 表示规则滑窗。
         records (list[TaskInputRecord]): 与每个数据集条目一一对应的坐标、尺寸和
             任务元数据。
+        global_anchors (list[torch.Tensor] | None): 可选每源图全局 recenter 锚，
+            与 ``samples`` 同序；由训练 worker 计算后附加。补丁条目会带上对应
+            锚，缩略图条目不带。
     """
 
     def __init__(
@@ -69,11 +71,12 @@ class StreamingTaskDataset(Dataset[PatchItem]):
         self.regions_by_path: dict[str, list[HRImageIndex]] | None = (
             self._validate_regions_by_path(regions_by_path, paths)
         )
-        self._entries: list[tuple[int, MultiResolutionIndex | None]] = []
+        self._entries: list[tuple[int, HRImageIndex | None]] = []
         self.records: list[TaskInputRecord] = []
         # 相邻补丁复用同一解码原图，但绝不跨源图保留多份大图。
         self._cached_path: str | None = None
         self._cached_image: NDArray[np.uint8] | None = None
+        self.global_anchors: list[torch.Tensor] | None = None
         self._patch_converter = PatchDataset(
             patches=[],
             training=training,
@@ -182,26 +185,17 @@ class StreamingTaskDataset(Dataset[PatchItem]):
                 image_size = self._read_image_size(path)
                 image_width, image_height = image_size
                 if self.regions_by_path is None:
-                    indexes = split_multiresolution_regions(
+                    indexes = split_image_regions(
                         image_size=image_size,
                         patch_size=patch_task["patch_size"],
-                        ds_factors=patch_task["ds_factors"],
                         stride=patch_task["stride"],
                     )
                 else:
-                    indexes = [
-                        build_multiresolution_region(
-                            image_size,
-                            region,
-                            patch_task["ds_factors"],
-                        )
-                        for region in self.regions_by_path.get(path, [])
-                    ]
-                for region in indexes:
-                    source = region.main_index
+                    indexes = self.regions_by_path.get(path, [])
+                for source in indexes:
                     valid_height = min(source.height, image_height - source.y)
                     valid_width = min(source.width, image_width - source.x)
-                    self._entries.append((sample_index, region))
+                    self._entries.append((sample_index, source))
                     self.records.append({
                         "task_name": task_name,
                         "task_type": task_type,
@@ -287,7 +281,10 @@ class StreamingTaskDataset(Dataset[PatchItem]):
                 patch = sample.down_sampling_to_LR(thumbnail_task["thumbnail_size"])
             else:
                 patch = create_dynamic_patch(sample, region)
-            return self._patch_converter.transform_patch(patch)
+            item = self._patch_converter.transform_patch(patch)
+            if region is not None and self.global_anchors is not None:
+                item["global_anchor"] = self.global_anchors[sample_index]
+            return item
         finally:
             sample.image.image = None
             if sample.mask is not None:

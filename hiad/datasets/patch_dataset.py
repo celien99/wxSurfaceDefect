@@ -16,7 +16,7 @@ class PatchDataset(Dataset[PatchItem]):
     """将内存补丁转换为 ImageNet 标准化的模型输入字典。
 
     Attributes:
-        patches (list[LRPatch]): 待转换的 RGB 补丁及可选上下文。
+        patches (list[LRPatch]): 待转换的 RGB 补丁。
         training (bool): 是否用于训练；保留该状态供任务管线识别。
         task_name (str): 产生这些补丁的任务名称。
         mean (torch.Tensor): ``(3, 1, 1)`` ImageNet RGB 均值。
@@ -99,17 +99,6 @@ class PatchDataset(Dataset[PatchItem]):
             item["clsname"] = patch.clsname
         if patch.label is not None:
             item["label"] = patch.label
-        if patch.low_resolution_images is not None:
-            if patch.low_resolution_indexes is None:
-                raise RuntimeError("Context images and indexes must be aligned")
-            for i, (low_image, low_index) in enumerate(
-                zip(patch.low_resolution_images, patch.low_resolution_indexes)
-            ):
-                item[f"low_resolution_image_{i}"] = self._image_to_tensor(
-                    low_image,
-                    f"patch.low_resolution_images[{i}]",
-                )
-                item[f"low_resolution_index_{i}"] = str(low_index)
         return item
 
     def __len__(self) -> int:

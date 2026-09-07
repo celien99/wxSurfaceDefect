@@ -32,7 +32,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/dinomaly.yaml")
     parser.add_argument("--patch-size", default=512, type=int)
     parser.add_argument("--stride", default=-1, type=int)
-    parser.add_argument("--ds-factors", default=[0, 1], nargs="+", type=int)
     parser.add_argument("--batch-size", default=16, type=int)
     parser.add_argument("--thumbnail-size", default=512, type=int)
     parser.add_argument("--micro-patch-size", default=256, type=int)
@@ -49,12 +48,6 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--patch-size must be a positive multiple of {DINO_PATCH_SIZE}")
     if args.stride != -1 and (args.stride <= 0 or args.stride > args.patch_size):
         parser.error("--stride must be -1 or in [1, patch-size]")
-    if (
-        not args.ds_factors
-        or args.ds_factors[0] != 0
-        or args.ds_factors != sorted(set(args.ds_factors))
-    ):
-        parser.error("--ds-factors must be unique, sorted, non-negative, and start with 0")
     if args.batch_size <= 0 or args.thumbnail_size <= 0:
         parser.error("--batch-size and --thumbnail-size must be positive")
     if args.thumbnail_size % DINO_PATCH_SIZE:
@@ -102,7 +95,6 @@ def main() -> None:
 
     tasks = DynamicTaskGenerator(
         patch_size=args.patch_size,
-        ds_factors=args.ds_factors,
         stride=None if args.stride == -1 else args.stride,
     ).create_tasks(
         thumbnail_size=args.thumbnail_size,

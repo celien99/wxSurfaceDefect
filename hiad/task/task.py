@@ -51,14 +51,12 @@ class DynamicTaskGenerator:
     Attributes:
         patch_size (int): 粗扫正方形补丁边长，必须能被 DINO patch 大小整除。
         stride (int | None): 粗扫滑窗步长；``None`` 表示无重叠切分。
-        ds_factors (list[int]): 唯一、升序、从 ``0`` 开始的上下文尺度指数。
     """
 
     def __init__(
         self,
         patch_size: int,
         stride: int | None = None,
-        ds_factors: list[int] | None = None,
     ) -> None:
         patch_size = _validate_model_size(patch_size, "patch_size")
         if stride is not None and (
@@ -68,22 +66,8 @@ class DynamicTaskGenerator:
             or stride > patch_size
         ):
             raise ValueError("stride must be in the range [1, patch_size]")
-        ds_factors = [0] if ds_factors is None else list(ds_factors)
-        if (
-            not ds_factors
-            or any(
-                isinstance(factor, bool)
-                or not isinstance(factor, int)
-                or factor < 0
-                for factor in ds_factors
-            )
-            or ds_factors[0] != 0
-            or ds_factors != sorted(set(ds_factors))
-        ):
-            raise ValueError("ds_factors must be unique, sorted, non-negative, and start with 0")
         self.patch_size: int = patch_size
         self.stride: int | None = stride
-        self.ds_factors: list[int] = ds_factors
 
     def create_tasks(
         self,
@@ -117,7 +101,6 @@ class DynamicTaskGenerator:
             "type": TASK_TYPE_DYNAMIC_PATCH,
             "patch_size": self.patch_size,
             "stride": self.stride,
-            "ds_factors": self.ds_factors,
         }
         tasks: list[TaskDefinition] = [dynamic_task]
         refinement_values = (
@@ -135,7 +118,6 @@ class DynamicTaskGenerator:
             "type": TASK_TYPE_REFINEMENT_PATCH,
             "patch_size": micro_patch_size,
             "stride": micro_patch_size,
-            "ds_factors": self.ds_factors,
             "refinement_quantile": cast(float, refinement_quantile),
             "refinement_min_area": cast(int, refinement_min_area),
             "refinement_safety_fraction": cast(float, refinement_safety_fraction),
@@ -169,7 +151,6 @@ def _validate_refinement_task(task: Mapping[str, object]) -> None:
     DynamicTaskGenerator(
         patch_size=cast(int, task["patch_size"]),
         stride=cast(int, task["stride"]),
-        ds_factors=cast(list[int], task["ds_factors"]),
     )
     threshold = task.get("refinement_quantile")
     if (
@@ -245,7 +226,6 @@ def validate_tasks(tasks: object) -> list[TaskDefinition]:
     DynamicTaskGenerator(
         patch_size=cast(int, dynamic["patch_size"]),
         stride=cast(int | None, dynamic["stride"]),
-        ds_factors=cast(list[int], dynamic["ds_factors"]),
     )
 
     _validate_refinement_task(refinement_tasks[0])

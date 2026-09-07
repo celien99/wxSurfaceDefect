@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 
 from hiad.constants import TASK_TYPE_DYNAMIC_PATCH, TASK_TYPE_THUMBNAIL
-from hiad.data import HRSample, split_multiresolution_regions
+from hiad.data import HRSample, split_image_regions
 from hiad.datasets.streaming_dataset import StreamingTaskDataset
 
 def _write_png(path, width: int, height: int, value: int = 128) -> None:
@@ -18,7 +18,6 @@ def _dynamic_task(**overrides):
         "type": TASK_TYPE_DYNAMIC_PATCH,
         "patch_size": 16,
         "stride": 16,
-        "ds_factors": [0],
     }
     task.update(overrides)
     return task
@@ -39,10 +38,9 @@ def test_streaming_dataset_len_matches_regions(tmp_path):
         with Image.open(path) as image_file:
             image_size = image_file.size
         expected += len(
-            split_multiresolution_regions(
+            split_image_regions(
                 image_size=image_size,
                 patch_size=task["patch_size"],
-                ds_factors=task["ds_factors"],
                 stride=task["stride"],
             )
         )
