@@ -214,12 +214,15 @@ class HRDinomaly(BaseDetector):
     ) -> list[torch.Tensor]:
         """为每个源图计算一次全局锚（训练前一次性调用）。
 
+        锚为 CPU 常驻张量：形状小，训练 DataLoader ``pin_memory`` 阶段要求输入
+        tensor 为 CPU；每 batch 在 ``train_step`` 里搬到设备开销可忽略。
+
         Args:
             samples (Sequence[HRSample]): 按数据集源图顺序排列的样本列表。
 
         Returns:
             list[torch.Tensor]: 与 ``samples`` 同序的每源图 ``(groups, embed_dim)``
-            设备驻留锚。
+            CPU 常驻锚。
         """
         anchors: list[torch.Tensor] = []
         self.model.eval()
@@ -232,7 +235,9 @@ class HRDinomaly(BaseDetector):
                 canvas = square_canvas_tensor(image, ANCHOR_CANVAS)
             finally:
                 sample.close()
-            anchor = self.model.global_anchor(canvas.to(self.device))[0].detach()
+            anchor = (
+                self.model.global_anchor(canvas.to(self.device))[0].detach().cpu()
+            )
             anchors.append(anchor)
         return anchors
 
