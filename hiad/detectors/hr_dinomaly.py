@@ -13,17 +13,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from hiad.constants import ANCHOR_CANVAS
+from hiad.data import HRSample
+from hiad.data.patch_builder import square_canvas_tensor
 from hiad.models import TimmDinoV3Encoder
 
 from .base import BaseDetector
-from .dinomaly.models.uad import ViTill
+from .dinomaly.models.uad import Dinomaly
 from .dinomaly.models.vision_transformer import Block as VitBlock
-from .dinomaly.models.vision_transformer import LinearAttention2, bMlp
+from .dinomaly.models.vision_transformer import LinearAttention2
 from .dinomaly.optimizers import StableAdamW
 from .dinomaly.utils import WarmCosineScheduler, global_cosine_hm_percent
 
 FeatureLayers: TypeAlias = Sequence[torch.Tensor]
 DetectorBatch: TypeAlias = Mapping[str, Any]
+
+# 官方 Dinomaly2 的两段式窄噪声瓶颈中间维（embed_dim → 256 → embed_dim）。
+_BOTTLENECK_DIM = 256
+# 训练平台期早停常量：连续多少个完整 epoch 无相对改善即停（内联，不进入配置）。
+_PLATEAU_PATIENCE_EPOCHS = 3
+_PLATEAU_MIN_DELTA = 1e-3
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -34,11 +43,12 @@ def _positive_int(value: object, name: str) -> int:
 
 
 class HRDinomaly(BaseDetector):
-    """DINOv3 + Dinomaly 高分辨率检测器。
+    """DINOv3 + 官方 Dinomaly2 语义的高分辨率重建检测器。
 
-    用冻结的 DINOv3 编码器配合可训练瓶颈与解码器做重建，异常证据为逐层
-    ``1 - cosine_similarity`` 的跨层最大值；多尺度上下文特征按 ``fusion_weights``
-    加权融合后进入重建，图像分数取最高 ``score_top_k`` 个 token 的均值。
+    冻结编码器在含 cls/register 前缀的完整 token 序列上重构；两段式窄噪声瓶颈
+    限制学生容量以记忆正常域；教师侧按组做 context-aware recentering（减整图
+    全局锚 + LayerNorm）。异常证据为逐层 ``1 - cosine_similarity`` 的跨层最大值，
+    图像分数取最高 ``score_top_k`` 个 token 的均值。
     """
 
     def __init__(
@@ -50,11 +60,10 @@ class HRDinomaly(BaseDetector):
         logger: logging.Logger | None,
         device: torch.device,
         seed: int = 0,
-        fusion_weights: Sequence[float] | None = None,
-        bottleneck_dropout: float = 0.1,
+        bottleneck_dropout: float = 0.3,
         grad_clip_norm: float = 1.0,
-        hard_mining_final: float = 0.0,
-        hard_mining_warmup_iters: int = 1000,
+        hard_mining_final: float = 0.8,
+        hard_mining_warmup_iters: int = 100,
         easy_grad_factor: float = 0.1,
         score_top_k: int = 4,
         encoder_amp: bool = True,
@@ -65,13 +74,7 @@ class HRDinomaly(BaseDetector):
     ) -> None:
         total_iters = _positive_int(total_iters, "total_iters")
         log_per_steps = _positive_int(log_per_steps, "log_per_steps")
-        super().__init__(
-            patch_size,
-            device,
-            logger=logger,
-            seed=seed,
-            fusion_weights=fusion_weights,
-        )
+        super().__init__(patch_size, device, logger=logger, seed=seed)
 
         bottleneck_dropout = float(bottleneck_dropout)
         grad_clip_norm = float(grad_clip_norm)
@@ -118,6 +121,8 @@ class HRDinomaly(BaseDetector):
         self.target_layers: list[int] = [2, 3, 4, 5, 6, 7, 8, 9]
         self.fuse_layer_encoder: list[list[int]] = [[0, 1, 2, 3], [4, 5, 6, 7]]
         self.fuse_layer_decoder: list[list[int]] = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        self.fuse_layer_bottleneck: list[int] = [0, 1, 2, 3, 4, 5, 6, 7]
+
         self.encoder: TimmDinoV3Encoder = TimmDinoV3Encoder(
             model_name=backbone_name,
             intermediate_layers=self.target_layers,
@@ -134,12 +139,25 @@ class HRDinomaly(BaseDetector):
         else:
             raise ValueError(f"Unsupported DINOv3 embedding dimension: {embed_dim}")
 
+        # 官方两段式窄噪声瓶颈：先降到 _BOTTLENECK_DIM，再还原到 embed_dim。
         self.bottleneck: nn.ModuleList = nn.ModuleList(
-            [bMlp(embed_dim, embed_dim * 4, embed_dim, drop=bottleneck_dropout)]
+            [
+                nn.Sequential(
+                    nn.Linear(embed_dim, _BOTTLENECK_DIM),
+                    nn.Dropout(p=bottleneck_dropout),
+                ),
+                nn.Sequential(
+                    nn.Linear(_BOTTLENECK_DIM, embed_dim * 4),
+                    nn.GELU(),
+                    nn.Dropout(p=bottleneck_dropout),
+                    nn.Linear(embed_dim * 4, embed_dim),
+                    nn.Dropout(p=bottleneck_dropout),
+                ),
+            ]
         )
 
         decoder_blocks: list[nn.Module] = []
-        for _ in range(8):
+        for _ in range(len(self.target_layers)):
             blk = VitBlock(
                 dim=embed_dim,
                 num_heads=num_heads,
@@ -151,20 +169,18 @@ class HRDinomaly(BaseDetector):
             decoder_blocks.append(blk)
         self.decoder: nn.ModuleList = nn.ModuleList(decoder_blocks)
 
-        self.model: ViTill = ViTill(
+        self.model: Dinomaly = Dinomaly(
             encoder=self.encoder,
             bottleneck=self.bottleneck,
             decoder=self.decoder,
+            target_layers=self.target_layers,
             fuse_layer_encoder=self.fuse_layer_encoder,
             fuse_layer_decoder=self.fuse_layer_decoder,
+            fuse_layer_bottleneck=self.fuse_layer_bottleneck,
+            num_prefix_tokens=self.encoder.num_prefix_tokens,
         )
         self.to_device(device)
         self.log_per_steps: int = log_per_steps
-
-    @torch.no_grad()
-    def embedding(self, input_tensor: torch.Tensor) -> list[torch.Tensor]:
-        """在检测器设备上提取冻结编码器的多层 BCHW 特征。"""
-        return self.model.encoder_image(input_tensor.to(self.device))
 
     def to_device(self, device: torch.device) -> None:
         """把重建模型移动到目标设备。"""
@@ -180,18 +196,67 @@ class HRDinomaly(BaseDetector):
             raise TypeError("amp must be a boolean")
         self.decoder_inference_amp = amp
 
-    def train_step(self, train_dataloader: DataLoader[Any], task_name: str) -> None:
-        """训练当前任务的瓶颈与解码器重建模块。"""
-        trainable = nn.ModuleList([self.bottleneck, self.decoder])
+    def global_anchor(self, canvas_tensor: torch.Tensor) -> torch.Tensor:
+        """编码整图缩略画布并返回每组的全局 cls 锚。
 
-        for m in trainable.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.01, a=-0.03, b=0.03)
-                if isinstance(m, nn.Linear) and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
+        Args:
+            canvas_tensor (torch.Tensor): ImageNet 标准化的
+                ``(batch, 3, canvas, canvas)`` 整图缩略画布。
+
+        Returns:
+            torch.Tensor: ``(batch, len(groups), embed_dim)`` 每组全局锚。
+        """
+        return self.model.global_anchor(canvas_tensor.to(self.device))
+
+    def source_global_anchors(
+        self,
+        samples: Sequence[HRSample],
+    ) -> list[torch.Tensor]:
+        """为每个源图计算一次全局锚（训练前一次性调用）。
+
+        Args:
+            samples (Sequence[HRSample]): 按数据集源图顺序排列的样本列表。
+
+        Returns:
+            list[torch.Tensor]: 与 ``samples`` 同序的每源图 ``(groups, embed_dim)``
+            设备驻留锚。
+        """
+        anchors: list[torch.Tensor] = []
+        self.model.eval()
+        for sample in samples:
+            sample.open()
+            try:
+                image = sample.image.image
+                if image is None:
+                    raise RuntimeError("Training sample image was not decoded")
+                canvas = square_canvas_tensor(image, ANCHOR_CANVAS)
+            finally:
+                sample.close()
+            anchor = self.model.global_anchor(canvas.to(self.device))[0].detach()
+            anchors.append(anchor)
+        return anchors
+
+    @staticmethod
+    def _init_reconstruction(trainable: nn.ModuleList) -> None:
+        """对瓶颈与解码器的线性/归一化层做官方同款初始化。"""
+        for module in trainable.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.01, a=-0.03, b=0.03)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.bias, 0)
+                nn.init.constant_(module.weight, 1.0)
+
+    def train_step(self, train_dataloader: DataLoader[Any], task_name: str) -> None:
+        """训练当前任务的瓶颈与解码器重建模块。
+
+        吸收官方 Dinomaly2“记忆正常域”的意图：逐 epoch 轮换采样窗口（采样器
+        跨 epoch 自动轮换各源图补丁），在迭代预算内一直训练到 epoch 均值损失
+        进入平台期为止。
+        """
+        trainable = nn.ModuleList([self.bottleneck, self.decoder])
+        self._init_reconstruction(trainable)
 
         optimizer = StableAdamW(
             [{"params": trainable.parameters()}],
@@ -202,23 +267,23 @@ class HRDinomaly(BaseDetector):
             eps=1e-10,
         )
         batches_per_epoch = len(train_dataloader)
-        training_iters = max(self.total_iters, batches_per_epoch)
-        warmup_iters = min(100, max(training_iters - 1, 0))
+        ceiling_iters = max(self.total_iters, batches_per_epoch)
+        warmup_iters = min(100, max(ceiling_iters - 1, 0))
         lr_scheduler = WarmCosineScheduler(
             optimizer,
             base_value=2e-3,
             final_value=2e-4,
-            total_iters=training_iters,
+            total_iters=ceiling_iters,
             warmup_iters=warmup_iters,
         )
         if self.logger is not None:
             self.logger.info(
-                "Task %s effective training iterations: %d "
-                "(configured=%d, sampled_epoch_batches=%d)",
+                "Task %s iteration budget: %d (configured=%d, batches_per_epoch=%d); "
+                "early stop when epoch loss plateaus",
                 task_name,
-                training_iters,
+                ceiling_iters,
                 self.total_iters,
-                len(train_dataloader),
+                batches_per_epoch,
             )
 
         decoder_amp_enabled = self.decoder_amp and self.device.type == "cuda"
@@ -226,26 +291,35 @@ class HRDinomaly(BaseDetector):
         self.model.train()
         self.model.encoder.eval()
         it = 0
+        epoch = 0
+        best_epoch_loss: float | None = None
+        stale_epochs = 0
         step_started = time.perf_counter()
-        for _epoch in range(int(np.ceil(training_iters / batches_per_epoch))):
+        while it < ceiling_iters:
+            epoch_loss_sum = 0.0
+            epoch_steps = 0
             for data in train_dataloader:
-                if it >= training_iters:
+                if it >= ceiling_iters:
                     break
-
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.float16,
                     enabled=decoder_amp_enabled,
                 ):
-                    en = self.get_multi_resolution_fusion_embeddings(data)
-                    en, de = self.model.distillation(en)
+                    image = data["image"].to(self.device, non_blocking=True)
+                    anchor = data.get("global_anchor")
+                    if anchor is not None:
+                        anchor = anchor.to(self.device)
+                    en, de = self.model(image, global_anchor=anchor)
 
                     if self.hard_mining_warmup_iters == 0:
                         p = self.hard_mining_final
                     else:
                         p = min(
-                            self.hard_mining_final * it / self.hard_mining_warmup_iters,
+                            self.hard_mining_final
+                            * it
+                            / self.hard_mining_warmup_iters,
                             self.hard_mining_final,
                         )
                     loss = global_cosine_hm_percent(
@@ -284,24 +358,59 @@ class HRDinomaly(BaseDetector):
                     optimizer.step()
                 lr_scheduler.step()
                 it += 1
+                epoch_loss_sum += float(loss.item())
+                epoch_steps += 1
 
-                if it == 1 or it % self.log_per_steps == 0 or it == training_iters:
+                if it == 1 or it % self.log_per_steps == 0 or it == ceiling_iters:
                     elapsed = time.perf_counter() - step_started
                     step_time = elapsed / it
                     log_message = "iter [{}/{}], loss:{:.4f}, avg_step_sec:{:.2f}".format(
-                        it, training_iters, loss.item(), step_time
+                        it, ceiling_iters, loss.item(), step_time
                     )
                     if grad_norm is not None:
                         log_message += ", grad_norm:{:.4f}".format(grad_norm.item())
                     if self.logger is not None:
                         self.logger.info(log_message)
 
-                if it >= training_iters:
+                if it >= ceiling_iters:
                     break
+            epoch += 1
+
+            if epoch_steps == batches_per_epoch and epoch >= 1:
+                epoch_mean = epoch_loss_sum / epoch_steps
+                if (
+                    best_epoch_loss is None
+                    or epoch_mean < best_epoch_loss * (1.0 - _PLATEAU_MIN_DELTA)
+                ):
+                    best_epoch_loss = epoch_mean
+                    stale_epochs = 0
+                else:
+                    stale_epochs += 1
+                if self.logger is not None:
+                    self.logger.info(
+                        "Task %s epoch %d mean_loss:%.6f best:%.6f stale:%d",
+                        task_name,
+                        epoch,
+                        epoch_mean,
+                        best_epoch_loss,
+                        stale_epochs,
+                    )
+                if stale_epochs >= _PLATEAU_PATIENCE_EPOCHS:
+                    if self.logger is not None:
+                        self.logger.info(
+                            "Task %s early stop: epoch loss plateaued after %d iterations",
+                            task_name,
+                            it,
+                        )
+                    break
+        self.model.eval()
 
     @torch.inference_mode()
     def inference_batch(self, data: DetectorBatch) -> tuple[torch.Tensor, torch.Tensor]:
         """在检测器设备上计算异常图与 token 图，不做任何 CPU 往返。
+
+        批次中的 ``global_anchor``（可选）为该图所属源图的整图缩略全局锚；
+        缺失时（整图缩略单次前向）模型使用自身 cls，与官方语义一致。
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]: ``(anomaly_map, token_map)``，
@@ -309,13 +418,16 @@ class HRDinomaly(BaseDetector):
             为编码器 token 分辨率。由调用方决定何时拷贝回 CPU。
         """
         self.model.eval()
-        en = self.get_multi_resolution_fusion_embeddings(data)
+        image = data["image"].to(self.device, non_blocking=True)
+        anchor = data.get("global_anchor")
+        if anchor is not None:
+            anchor = anchor.to(self.device)
         with torch.autocast(
             device_type=self.device.type,
             dtype=torch.float16,
             enabled=self.decoder_inference_amp and self.device.type == "cuda",
         ):
-            en, de = self.model.distillation(en)
+            en, de = self.model(image, global_anchor=anchor)
         anomaly_map, token_map = self.cal_anomaly_maps(en, de, self.patch_size)
         return anomaly_map, token_map
 
@@ -324,7 +436,7 @@ class HRDinomaly(BaseDetector):
         encoder_features: FeatureLayers,
         decoder_features: FeatureLayers,
     ) -> list[torch.Tensor]:
-        """计算逐层编码/重建特征的非负余弦距离 token 图。"""
+        """计算逐组编码/重建特征的非负余弦距离 token 图。"""
         if not encoder_features or len(encoder_features) != len(decoder_features):
             raise ValueError("Encoder and decoder feature lists must be non-empty and aligned")
         return [
@@ -342,7 +454,7 @@ class HRDinomaly(BaseDetector):
         decoder_features: FeatureLayers,
         output_size: Sequence[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """把逐层语义 token 距离聚合为 token 图和模型像素图。"""
+        """把逐组语义 token 距离聚合为 token 图和模型像素图。"""
         token_layer_maps = self._layer_anomaly_token_maps(
             encoder_features,
             decoder_features,
@@ -375,7 +487,6 @@ class HRDinomaly(BaseDetector):
             {
                 "bottleneck": self.bottleneck.state_dict(),
                 "decoder": self.decoder.state_dict(),
-                "fusion_weights": self.fusion_weights,
                 "score_top_k": self.score_top_k,
                 "layer_aggregation": "max",
                 "encoder_amp": self.encoder_amp,
@@ -390,7 +501,6 @@ class HRDinomaly(BaseDetector):
         state_dict = torch.load(checkpoint_path, map_location=self.device)
         self.bottleneck.load_state_dict(state_dict["bottleneck"])
         self.decoder.load_state_dict(state_dict["decoder"])
-        self.fusion_weights = state_dict.get("fusion_weights")
         aggregation = state_dict.get("layer_aggregation", "max")
         if aggregation != "max":
             raise ValueError(f"Unsupported checkpoint layer aggregation: {aggregation}")

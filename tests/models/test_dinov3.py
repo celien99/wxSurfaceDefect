@@ -21,6 +21,7 @@ class _FakeBackbone:
     def __init__(self) -> None:
         self.patch_embed = _PatchEmbed()
         self.num_features = 768
+        self.num_prefix_tokens = 5
         self.loaded_state = None
 
     def parameters(self):

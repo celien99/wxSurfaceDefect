@@ -73,7 +73,6 @@ def test_detector_config_derives_task_fields_from_single_config():
             "type": TASK_TYPE_DYNAMIC_PATCH,
             "patch_size": 512,
             "stride": 512,
-            "ds_factors": [0, 1],
         },
     )
     thumbnail_config = detector_config_for_task(
@@ -101,7 +100,6 @@ def test_checkpoint_save_persists_inference_state(monkeypatch):
     detector = object.__new__(HRDinomaly)
     detector.bottleneck = Module()
     detector.decoder = Module()
-    detector.fusion_weights = None
     detector.score_top_k = 4
     detector.encoder_amp = True
     detector.decoder_amp = True
@@ -117,7 +115,6 @@ def test_checkpoint_save_persists_inference_state(monkeypatch):
     assert captured == {
         "bottleneck": {"state": "present"},
         "decoder": {"state": "present"},
-        "fusion_weights": None,
         "score_top_k": 4,
         "layer_aggregation": "max",
         "encoder_amp": True,
@@ -136,7 +133,6 @@ def test_checkpoint_load_restores_inference_state(monkeypatch):
     payload = {
         "bottleneck": {"bottleneck": 3},
         "decoder": {"decoder": 4},
-        "fusion_weights": [0.5, 0.5],
         "score_top_k": 8,
         "layer_aggregation": "max",
         "encoder_amp": True,
@@ -150,5 +146,4 @@ def test_checkpoint_load_restores_inference_state(monkeypatch):
 
     assert detector.bottleneck.loaded_state == {"bottleneck": 3}
     assert detector.decoder.loaded_state == {"decoder": 4}
-    assert detector.fusion_weights == [0.5, 0.5]
     assert detector.score_top_k == 8
